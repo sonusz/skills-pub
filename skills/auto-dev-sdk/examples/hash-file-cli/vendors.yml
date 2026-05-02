@@ -1,0 +1,36 @@
+# vendors.yml — v2 schema, scoped to the hash-file-cli reference example.
+#
+# G17 uses this file to drive a real end-to-end run: scope → plan →
+# build → spec → review against live vendor CLIs. Chosen models aim for
+# fast turnaround (<10 min per run) on a small, well-specified feature.
+
+stages:
+  scope:
+    vendor: claude
+    model: claude-sonnet-4-6
+    timeout_sec: 600
+
+  plan:
+    vendor: claude
+    model: claude-sonnet-4-6
+    timeout_sec: 600
+
+  build:
+    vendor: claude
+    model: claude-sonnet-4-6
+    timeout_sec: 1200
+    flags: ["--effort", "high"]
+
+  spec:
+    vendor: claude
+    model: claude-sonnet-4-6
+    timeout_sec: 600
+
+  review:
+    vendor: claude
+    model: claude-sonnet-4-6
+    timeout_sec: 600
+
+# Panel-review (prd-review, architecture-review, test-plan-review,
+# close-approval) uses the default three-reviewer + synthesizer config
+# from autodev/vendors/config.py unless overridden here.

@@ -1,0 +1,92 @@
+# vendors.yml — default harness vendor configuration for auto-dev-sdk.
+#
+# This SDK-root file controls harness-owned LLM calls by default:
+# coding stages, Ralph review, panel reviewers, panel synthesizer, and the
+# idle-timeout probe. Target repos should not need their own vendor config
+# unless they intentionally override the harness defaults with
+# `--vendors-yml`, `AUTODEV_VENDORS_YML`, or a legacy repo-root vendors.yml.
+#
+# Required: `stages` mapping with every coding stage below.
+# Allowed coding vendors: claude, codex, openai. Gemini is panel-review-only.
+# Vendor labels are case-insensitive and normalized to lowercase.
+# `codex` and `openai` both route through the Codex CLI.
+# `timeout_sec` is the shared-vendors per-call timeout in seconds.
+# `effort` uses the shared scale min|low|medium|high|xhigh|max; shared/vendors
+# maps it to the nearest supported native effort for the selected vendor.
+# `flags` is optional and restricted by autodev/vendors/allowlist.py.
+# Harness-owned write/approval scope controls such as yolo, tool allowlists,
+# and extra write directories are intentionally not configurable here.
+# All LLM calls route through the packaged shared/vendors module and its
+# `<id>/out`, `<id>/status`, `<id>/log` contract.
+
+stages:
+  # Produces the design packet from PRD and repo context.
+  # Context: largest stage; reads PRD, repo structure, prior completed specs,
+  # and panel feedback during rework. Effort: highest.
+  design:
+    vendor: claude
+    model: claude-opus-4-7
+    timeout_sec: 1200
+    effort: max
+
+  # Implements the accepted design and writes target artifacts/code.
+  # Context: large and repo-heavy; needs enough room for design packet,
+  # current source, failures, and test output. Effort: high.
+  build:
+    vendor: codex
+    model: gpt-5.5
+    timeout_sec: 3600
+    effort: max
+
+  # Builds implementation evidence/spec after code exists.
+  # Context: medium; mostly accepted design, implementation index, and changed
+  # files. Effort: medium-high.
+  spec:
+    vendor: codex
+    model: gpt-5.5
+    timeout_sec: 900
+    effort: medium
+
+  # Ralph close/review pass over implementation/spec/checklist.
+  # Context: medium; checks consistency and release readiness, not broad design
+  # exploration. Effort: medium-high.
+  review:
+    vendor: codex
+    model: gpt-5.5
+    timeout_sec: 900
+    effort: high
+
+panel:
+  # Independent design/close-gate reviewers. Each sees the primary artifact and
+  # consulted docs, then returns findings; they should not generate new design.
+  # Context: medium-large, bounded to attached context files. Effort: high.
+  reviewers:
+    # Claude: strong natural-language critique and ambiguity detection.
+    - vendor: claude
+      model: claude-opus-4-7
+      effort: high
+    # Gemini: independent second vendor for divergence signal.
+    - vendor: gemini
+      model: gemini-3-flash-preview
+      effort: high
+    # Codex: code-aware reviewer, useful for implementation/design feasibility.
+    - vendor: codex
+      model: gpt-5.5
+      effort: high
+  # Synthesizes reviewer outputs only; does not re-review the artifact.
+  # Context: medium; reviewer outputs plus schema. Effort: high enough for
+  # faithful extraction, lower than design generation.
+  synthesizer:
+    vendor: claude
+    model: claude-sonnet-4-6
+    effort: high
+  reviewer_timeout_sec: 600
+  synthesizer_timeout_sec: 300
+
+  # Short idle-timeout arbiter. It reads process tree and log tails, then says
+  # extend or kill; it never develops artifacts. Context: small. Effort: low.
+probe:
+  vendor: claude
+  model: claude-sonnet-4-6
+  timeout_sec: 60
+  effort: low

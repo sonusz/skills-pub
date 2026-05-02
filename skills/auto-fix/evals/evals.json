@@ -1,0 +1,115 @@
+{
+  "skill_name": "auto-fix",
+  "evals": [
+    {
+      "id": 1,
+      "name": "bot-fail-open-to-fail-closed-regression",
+      "prompt": "Invoke auto-fix with this review-comment input from a Copilot bot on PR #842. File: aegis/query/prefix_check.go (go). Comment: 'Fail-closed: falling back to the full query so detection coverage is not silently reduced during Athena throttling. Consider returning queryFallback(...) instead of the synthetic no-match response on rate_limited.' The affected switch branch currently returns a synthetic no-match result with CanNotResume=true. Git blame on the affected lines shows commit abc1234: 'feat(query): prefixCheck returns synthetic no-match on rate_limited to avoid blocking queries when Athena throttles. Fail-open is deliberate — throttling is self-healing.' No feature docs exist for this file. Return auto-fix's structured result.",
+      "expected_output": "ESCALATED with category='behavioral'. The `conflict` field must state that the suggestion reverses a deliberate fail-open decision. The `evidence` field must quote the commit message about fail-open being deliberate. The `recommendation` must cite the conflict with documented intent and ask for human review. MUST NOT apply the change regardless of LOC.",
+      "assertions": [
+        "status is 'escalated'",
+        "category is 'behavioral'",
+        "evidence quotes the commit message phrase 'fail-open is deliberate' or similar",
+        "conflict field mentions that the change would reverse the documented fail-open decision",
+        "no commit_sha field is present (no code change was applied)"
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "typo-in-docstring-no-docs-minimum-guard-allows",
+      "prompt": "Invoke auto-fix with this review-comment input from a human reviewer on PR #715. File: athena/scape-connectors/connector.py. Comment: 'Small typo in the docstring below — \"recieve\" should be \"receive\".' Git blame on the line shows commit 'feat: initial connector framework'. No feature docs exist for the connectors module. The fix is a one-character change in a docstring. Return auto-fix's result.",
+      "expected_output": "APPLIED. The fix is a typo in a comment/docstring, which falls within the minimum-guard hygiene whitelist. Absence of feature docs does NOT block typo fixes. Summary: 'Fix typo in connector.py docstring (recieve → receive)'.",
+      "assertions": [
+        "status is 'applied'",
+        "category is 'applied'",
+        "commit_sha field is non-empty",
+        "summary mentions the typo correction"
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "logic-change-no-docs-minimum-guard-blocks",
+      "prompt": "Invoke auto-fix with review-comment input from a CodeRabbit bot on PR #903. File: hermes/pii/detector.py. Comment: 'Consider short-circuiting early when the input length is below MIN_PII_LENGTH to avoid unnecessary work on trivially-short inputs.' No feature docs exist for hermes/pii/. Git blame on the affected loop shows only 'initial commit' — no rationale. The change adds an early-return branch to skip the detection loop for short inputs (~3 lines). Return auto-fix's result.",
+      "expected_output": "ESCALATED with category='behavioral'. The change adds a short-circuit path — that is a control-flow change, not hygiene. Minimum-guard triggers: no docs + non-hygiene change = escalate. Recommendation should ask for a design doc (feature-spec) for hermes/pii before auto-fixing control-flow changes.",
+      "assertions": [
+        "status is 'escalated'",
+        "category is 'behavioral'",
+        "evidence field is 'none found' or equivalent",
+        "recommendation mentions creating design docs or feature-spec for the module",
+        "no commit_sha field is present"
+      ],
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "oversized-refactor-above-minor",
+      "prompt": "Invoke auto-fix with review-comment input from a human reviewer on PR #1102. Affected files: aegis/parser/decoder.go, aegis/parser/encoder.go, aegis/parser/types.go, aegis/parser/errors.go, aegis/parser/compat.go (5 files). Comment: 'This pattern could be cleaned up by introducing a ParserContext type and threading it through the decoder, encoder, and type conversions. Would reduce duplication across the files.' The suggested change is approximately 80 lines total. docs/features/parser/README.md exists and documents the current interface. Return auto-fix's result.",
+      "expected_output": "ESCALATED with category='above-minor'. The change exceeds both file count (>3) and line count (>20) caps. Conflict field should state this is a refactor rather than a fix. Recommendation should hand off to the developer for a proper design review — this is work for auto-dev's update flow, not auto-fix.",
+      "assertions": [
+        "status is 'escalated'",
+        "category is 'above-minor'",
+        "conflict mentions size / refactor / scope",
+        "recommendation suggests deferring to developer or auto-dev",
+        "no commit_sha field is present"
+      ],
+      "files": []
+    },
+    {
+      "id": 5,
+      "name": "pre-existing-issue-not-from-pr",
+      "prompt": "Invoke auto-fix with review-comment input on PR #788 (a small refactoring PR that only renames log formats in pkg/observability/). Human reviewer left a comment on pkg/identity/oauth.go (NOT touched by this PR): 'The token refresh path here doesn't handle ExpiredRefreshToken errors — looks like a latent bug.' Git blame on those lines shows the code predates the PR's base commit by 4 months. The current PR does not modify oauth.go. Return auto-fix's result.",
+      "expected_output": "ESCALATED with category='pre-existing'. Conflict field must state the issue predates this PR. Evidence should cite git blame / git log showing the code is older than the PR's base. Recommendation: 'Track separately; not introduced by this change.'",
+      "assertions": [
+        "status is 'escalated'",
+        "category is 'pre-existing'",
+        "evidence cites git blame or commit age relative to PR base",
+        "conflict states the issue was not introduced by this PR",
+        "no commit_sha field is present"
+      ],
+      "files": []
+    },
+    {
+      "id": 6,
+      "name": "ci-failure-missing-import-evidence-backed",
+      "prompt": "Invoke auto-fix with CI-failure input: attempt_number=1, branch='feat/metrics', affected_files=['maestro/conversion/pdf_service.py']. Error log: 'NameError: name \"logger\" is not defined. Traceback: pdf_service.py:47 in handle_request.' Git blame on line 47 shows recent commit 'feat(pdf): add structured logging to handle_request path'. The file already imports `structlog` but does not bind `logger = structlog.get_logger()`. Return auto-fix's result.",
+      "expected_output": "APPLIED. The fix adds `logger = structlog.get_logger()` near the imports (1 line, 1 file) — within the size gate and backed by evidence (the referenced commit explicitly adds structured logging). Summary should reference the commit providing the evidence.",
+      "assertions": [
+        "status is 'applied'",
+        "category is 'applied'",
+        "commit_sha field is non-empty",
+        "summary references the structlog / logger import fix",
+        "summary cites the source-of-truth commit that introduced structured logging"
+      ],
+      "files": []
+    },
+    {
+      "id": 7,
+      "name": "bot-exception-handling-no-evidence-asymmetry",
+      "prompt": "Invoke auto-fix with review-comment input from a Sourcery bot on PR #1040. File: ai-infra/pylib/auraconfig.py. Comment: 'Catching bare `Exception` here is too broad; consider catching `ConfigParseError` specifically instead.' Current code: `except Exception as e: log.warning(f'failed to parse: {e}'); return DEFAULT_CONFIG`. Git blame shows commit 'fix: make config parsing resilient to malformed input' — no specific mention of which exception types should be caught. No design doc exists for this util module. Return auto-fix's result.",
+      "expected_output": "ESCALATED. Author-asymmetry rule (§3) applies: bot-authored comment on exception-handling semantics without supporting doc evidence. Category should be 'above-minor' or 'behavioral' — both acceptable depending on interpretation. Recommendation should note that narrowing exception scope is a semantic change and the bot suggestion lacks supporting evidence; human review needed to confirm.",
+      "assertions": [
+        "status is 'escalated'",
+        "category is 'above-minor' or 'behavioral'",
+        "recommendation mentions bot-authored suggestion OR author asymmetry OR lack of supporting evidence",
+        "conflict mentions exception handling narrowing or semantic change",
+        "no commit_sha field is present"
+      ],
+      "files": []
+    },
+    {
+      "id": 8,
+      "name": "human-commenter-with-clear-doc-support",
+      "prompt": "Invoke auto-fix with review-comment input from a human reviewer on PR #960. File: scape-go-libs/identity/provider.go. Comment: 'The field name should be `externalID` not `external_id` to match the convention used everywhere else in this package.' docs/features/identity/README.md exists and points to docs/features/identity/conventions.md which explicitly says: 'All field names in identity/* follow camelCase (externalID, tenantID, etc.) to match Go idiom.' The change renames one field in one file (~3 lines). Return auto-fix's result.",
+      "expected_output": "APPLIED. The fix aligns with an explicit convention documented in docs/features/identity/conventions.md. Within size gate. Evidence should quote the conventions doc. Summary should reference the documented convention.",
+      "assertions": [
+        "status is 'applied'",
+        "category is 'applied'",
+        "commit_sha field is non-empty",
+        "summary references the documented naming convention (camelCase, or the conventions.md file)"
+      ],
+      "files": []
+    }
+  ]
+}

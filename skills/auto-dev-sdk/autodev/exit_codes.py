@@ -1,0 +1,6 @@
+"""CLI exit codes (PRD R6 + SC1-SC9)."""
+
+OK = 0
+ERROR = 1
+GATE_PENDING = 2
+LOCK_CONFLICT = 3

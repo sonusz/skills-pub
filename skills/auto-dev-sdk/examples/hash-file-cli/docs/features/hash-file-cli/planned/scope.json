@@ -1,0 +1,48 @@
+{
+  "source": "docs/features/hash-file-cli/planned/prd.md",
+  "source_hash": "sha256:e102f81534a970e5f44b84925782a43801760cba7633b48f2283b86c473ce8ae",
+  "written": "2026-04-19",
+
+  "feature": "hash-file-cli",
+  "mode": "fresh",
+  "diff_base": "main",
+
+  "in_scope": [
+    {
+      "id": "hfc-1",
+      "description": "CLI reads argv[1] and prints `sha256:<64-hex>` + newline to stdout on success.",
+      "prd_ref": "R1",
+      "status": "active"
+    },
+    {
+      "id": "hfc-2",
+      "description": "Error paths: missing arg, missing file, unreadable file → exit 1 + stderr message.",
+      "prd_ref": "R2",
+      "status": "active"
+    },
+    {
+      "id": "hfc-3",
+      "description": "Raw-bytes digest (no normalization); trailing newlines affect the hash.",
+      "prd_ref": "R3, Constraints",
+      "status": "active"
+    },
+    {
+      "id": "hfc-4",
+      "description": "Stream file in 64 KB chunks — no whole-file memory load.",
+      "prd_ref": "Constraints",
+      "status": "active"
+    },
+    {
+      "id": "hfc-5",
+      "description": "Unit tests: empty file, hello no-newline, hello with-newline (distinct digests), missing-file error.",
+      "prd_ref": "R5",
+      "status": "active"
+    }
+  ],
+  "excluded": [
+    { "id": "hfc-x1", "description": "Directory recursion", "reason": "PRD §6" },
+    { "id": "hfc-x2", "description": "Alternative digest algorithms", "reason": "PRD §6" },
+    { "id": "hfc-x3", "description": "Stdin input mode", "reason": "PRD §6" },
+    { "id": "hfc-x4", "description": "pyproject.toml / install target", "reason": "PRD §6" }
+  ]
+}

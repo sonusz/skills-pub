@@ -1,0 +1,782 @@
+"""G15 panel runner — internal panel-review implementation.
+
+Flow:
+  1. Compose per-reviewer prompt (gate-specific review-<gate>.md +
+     file manifest with paths + hashes for the artifact and consulted docs).
+  2. Dispatch the configured reviewers (claude / gemini / codex/openai, per
+     vendors.yml panel config) in parallel.
+  3. Invoke the configured synthesizer with the three reviewer
+     outputs under a pinned synthesize.md prompt and the pinned JSON
+     schema. Parse structured output.
+  4. Build PanelVerdict (with per_vendor_raw audit field) and write
+     panel-verdict.json atomically.
+
+Failure modes and their handling:
+  - Reviewer timeout / empty output → that reviewer's slot is empty;
+    synthesizer is told which vendors responded. If <2 reviewers
+    responded, the synthesizer's prompt forces needs_revision with a
+    harness-originating finding.
+  - Synthesizer timeout / non-JSON / schema-invalid output →
+    mechanical fallback: any explicit reviewer fail → fail, any
+    invariant_violation in reviewer output (keyword scan) → fail, else
+    needs_revision. The verdict always includes a
+    `synthesizer_failed` opinion-severity finding in this path.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from autodev import __version__ as HARNESS_VERSION
+from autodev.artifacts.revision_state import load_state
+from autodev.artifacts.verdict import (
+    PanelFinding,
+    PanelVerdict,
+    ReviewDecision,
+    write_verdict,
+)
+from autodev.errors import ConfigError, SchemaError
+from autodev.panel.anchor_filter import filter_anchor_findings
+from autodev.panel.precheck import run_precheck
+from autodev.panel.schemas import synthesizer_output_schema_json
+from autodev.state.hashing import hash_file
+from autodev.state.log import JsonlLog
+from autodev.vendors.config import (
+    PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
+)
+from autodev.vendors.shared_call import SHARED_VENDORS_DIR, call_shared_vendor
+
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+REVIEW_PROMPT_FILE = {
+    "design-review": "review-design-review.md",
+    "close-approval": "review-close-approval.md",
+}
+SYNTHESIZE_PROMPT_FILENAME = "synthesize.md"
+
+# Minimum healthy reviewers required before we'll run the synthesizer.
+# With fewer than 2, there is no panel — just a single-model opinion —
+# and we fail fast pointing the operator at doctor.sh.
+MIN_HEALTHY_REVIEWERS = 2
+
+DOCTOR_SCRIPT = SHARED_VENDORS_DIR / "scripts" / "doctor.sh"
+
+# Override: path to a fake invoker script used by tests. When set, both
+# reviewer and synthesizer calls route through the fake instead of the
+# real shared-vendors call. The fake receives (vendor, role, prompt) via env vars
+# + stdin and writes markdown or JSON to stdout.
+FAKE_INVOKER_ENV = "AUTODEV_PANEL_FAKE_INVOKER"
+
+
+def _doctor_hint() -> str:
+    """Human-readable pointer to the bundled shared-vendors doctor."""
+    if DOCTOR_SCRIPT.exists():
+        return f"run `{DOCTOR_SCRIPT}` to probe shared vendor calls"
+    return (
+        f"install shared/vendors at `{SHARED_VENDORS_DIR}`, "
+        "or probe each vendor CLI manually"
+    )
+
+
+@dataclass
+class ReviewerResult:
+    vendor: str
+    model: str
+    ok: bool
+    output: str
+    elapsed_sec: float
+    failure_detail: str = ""
+
+
+def review_prompt_path(gate: str) -> Path:
+    if gate not in REVIEW_PROMPT_FILE:
+        raise ConfigError(f"unknown panel gate: {gate!r}")
+    return PROMPTS_DIR / REVIEW_PROMPT_FILE[gate]
+
+
+def synthesize_prompt_path() -> Path:
+    return PROMPTS_DIR / SYNTHESIZE_PROMPT_FILENAME
+
+
+def _hash_or_missing(path: Path) -> str:
+    if not path.exists():
+        return "MISSING"
+    return hash_file(path)
+
+
+def _file_ref_line(*, label: str, path: Path, hash_value: str | None = None) -> str:
+    exists = path.exists()
+    size = path.stat().st_size if exists else 0
+    h = hash_value or _hash_or_missing(path)
+    return f"- {label}: `{path}` hash=`{h}` size_bytes={size}"
+
+
+def _compose_reviewer_prompt(
+    *, gate: str, artifact_path: Path, consulted_docs: list[dict],
+    feature_active: Path | None = None, repo_root: Path | None = None,
+) -> str:
+    """Build the full prompt sent to each reviewer.
+
+    Large review inputs are passed by file reference, not inlined. The
+    verdict records the same paths + hashes, so the harness can invalidate
+    stale panel results without relying on prompt-sized document snapshots.
+    """
+    prompt_text = review_prompt_path(gate).read_text(encoding="utf-8")
+    prompt_text += "\n\n---\n\n## Orchestrator context\n\n"
+    if feature_active is not None:
+        prompt_text += f"- FEATURE_ACTIVE: `{feature_active}`\n"
+    if repo_root is not None:
+        prompt_text += f"- REPO_ROOT: `{repo_root}`\n"
+    prompt_text += f"- GATE: `{gate}`\n"
+    prompt_text += "\n## Required file inputs\n\n"
+    prompt_text += (
+        "Read the exact files listed here before judging. Use whatever "
+        "file-reading mechanism your CLI provides, such as a Read tool or "
+        "read-only shell commands. Do not infer from this manifest alone. "
+        "When this prompt includes attached context files, treat those "
+        "inlined sections as the exact file contents for the listed paths. "
+        "If a required file cannot be read, report a `risk` finding "
+        "targeting the inaccessible file.\n\n"
+    )
+    prompt_text += _file_ref_line(label="PRIMARY_ARTIFACT", path=artifact_path) + "\n"
+    if consulted_docs:
+        prompt_text += "\n### Consulted documents\n\n"
+        for doc_meta in consulted_docs:
+            d = Path(doc_meta["path"])
+            priority = doc_meta.get("priority", "consulted")
+            prompt_text += _file_ref_line(
+                label=f"{priority.upper()}:{d.name}",
+                path=d,
+                hash_value=doc_meta.get("hash"),
+            ) + "\n"
+    return prompt_text
+
+
+def _reviewer_context_files(
+    *, primary_artifact: Path, consulted_docs: list[dict],
+) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for path in (
+        primary_artifact,
+        *(Path(d["path"]) for d in consulted_docs if d.get("path")),
+    ):
+        if path.exists() and path.is_file() and path not in paths:
+            paths.append(path)
+    return tuple(paths)
+
+
+def _read_only_native_args(vendor: str) -> tuple[str, ...]:
+    """Caller-owned read-only hints; shared vendors only maps model/effort/yolo."""
+    raw = vendor.strip().lower()
+    if raw in {"openai", "codex", "gpt"}:
+        return ("--sandbox", "read-only")
+    if raw in {"claude", "anthropic"}:
+        return ("--allowedTools", "Read,Glob,Grep,LS")
+    if raw in {"gemini", "google"}:
+        return ("--approval-mode", "plan")
+    return ()
+
+
+def _invoke_reviewer(
+    spec: PanelReviewerSpec, prompt: str, timeout_sec: int,
+    *, cwd: Path | None = None,
+    context_files: tuple[Path, ...] = (),
+) -> ReviewerResult:
+    """Run one reviewer CLI. Captures stdout; empty on failure."""
+    import time
+    fake = os.environ.get(FAKE_INVOKER_ENV)
+    t0 = time.monotonic()
+    try:
+        if fake:
+            env = os.environ.copy()
+            env["AUTODEV_PANEL_FAKE_ROLE"] = "reviewer"
+            env["AUTODEV_PANEL_FAKE_VENDOR"] = spec.vendor
+            env["AUTODEV_PANEL_FAKE_MODEL"] = spec.model
+            proc = subprocess.run(
+                [fake], input=prompt, capture_output=True, text=True,
+                env=env, timeout=timeout_sec,
+            )
+        else:
+            result = call_shared_vendor(
+                vendor=spec.vendor,
+                model=spec.model,
+                prompt=prompt,
+                output_id=f"reviewer-{spec.vendor}",
+                timeout_sec=timeout_sec,
+                cwd=cwd,
+                effort=spec.effort,
+                context_files=context_files,
+                native_args=_read_only_native_args(spec.vendor),
+            )
+            elapsed = time.monotonic() - t0
+            if result.returncode != 0:
+                detail = (
+                    f"timeout after {timeout_sec}s"
+                    if result.timed_out
+                    else f"exit {result.returncode}: "
+                         f"{(result.log or result.summary_stderr)[-500:]}"
+                )
+                return ReviewerResult(
+                    vendor=spec.vendor, model=spec.model, ok=False, output="",
+                    elapsed_sec=elapsed,
+                    failure_detail=detail,
+                )
+            output = result.output.strip()
+            if not output:
+                return ReviewerResult(
+                    vendor=spec.vendor, model=spec.model, ok=False, output="",
+                    elapsed_sec=elapsed, failure_detail="empty stdout",
+                )
+            return ReviewerResult(
+                vendor=spec.vendor, model=spec.model, ok=True, output=output,
+                elapsed_sec=elapsed,
+            )
+        elapsed = time.monotonic() - t0
+        if proc.returncode != 0:
+            return ReviewerResult(
+                vendor=spec.vendor, model=spec.model, ok=False, output="",
+                elapsed_sec=elapsed,
+                failure_detail=f"exit {proc.returncode}: {proc.stderr[-500:]}",
+            )
+        output = proc.stdout.strip()
+        if not output:
+            return ReviewerResult(
+                vendor=spec.vendor, model=spec.model, ok=False, output="",
+                elapsed_sec=elapsed, failure_detail="empty stdout",
+            )
+        return ReviewerResult(
+            vendor=spec.vendor, model=spec.model, ok=True, output=output,
+            elapsed_sec=elapsed,
+        )
+    except subprocess.TimeoutExpired:
+        return ReviewerResult(
+            vendor=spec.vendor, model=spec.model, ok=False, output="",
+            elapsed_sec=time.monotonic() - t0,
+            failure_detail=f"timeout after {timeout_sec}s",
+        )
+    except FileNotFoundError as e:
+        return ReviewerResult(
+            vendor=spec.vendor, model=spec.model, ok=False, output="",
+            elapsed_sec=time.monotonic() - t0,
+            failure_detail=str(e),
+        )
+
+
+def _compose_synthesizer_prompt(
+    *, gate: str, artifact_path: Path, reviewer_results: list[ReviewerResult],
+) -> str:
+    """Build the prompt for the synthesizer given reviewer outputs."""
+    base = synthesize_prompt_path().read_text(encoding="utf-8")
+    responded = [r.vendor for r in reviewer_results if r.ok]
+    missing = [r.vendor for r in reviewer_results if not r.ok]
+
+    out = base + "\n\n---\n\n"
+    out += f"## Context for this synthesis\n\n"
+    out += f"- **Gate**: `{gate}`\n"
+    out += f"- **Artifact path**: `{artifact_path}`\n"
+    if artifact_path.exists():
+        out += f"- **Artifact hash**: `{hash_file(artifact_path)}`\n"
+    out += f"- **Reviewers who responded**: {', '.join(responded) if responded else '(none)'}\n"
+    if missing:
+        out += f"- **Reviewers who did NOT respond**: {', '.join(missing)}\n"
+    out += (
+        "\nThe synthesizer is an extractor, not a reviewer. Do not re-review "
+        "the artifact and do not add findings absent from reviewer outputs.\n"
+    )
+    out += "\n## Reviewer outputs\n\n"
+    for r in reviewer_results:
+        if r.ok:
+            out += f"### Reviewer: {r.vendor} ({r.model})\n\n{r.output}\n\n"
+        else:
+            out += f"### Reviewer: {r.vendor} — NO RESPONSE ({r.failure_detail})\n\n"
+    return out
+
+def _invoke_synthesizer(
+    spec: PanelSynthesizerSpec, prompt: str, timeout_sec: int,
+    *, cwd: Path | None = None,
+    debug_dir: Path | None = None,
+) -> tuple[bool, dict | None, str]:
+    """Run the synthesizer CLI with native JSON-schema output.
+
+    Returns (ok, parsed_dict, failure_detail). parsed_dict is the
+    schema-validated synthesizer output, or None on failure.
+    """
+    fake = os.environ.get(FAKE_INVOKER_ENV)
+    schema_json = synthesizer_output_schema_json()
+    try:
+        if fake:
+            env = os.environ.copy()
+            env["AUTODEV_PANEL_FAKE_ROLE"] = "synthesizer"
+            env["AUTODEV_PANEL_FAKE_VENDOR"] = spec.vendor
+            env["AUTODEV_PANEL_FAKE_MODEL"] = spec.model
+            env["AUTODEV_PANEL_FAKE_SCHEMA"] = schema_json
+            proc = subprocess.run(
+                [fake], input=prompt, capture_output=True, text=True,
+                env=env, timeout=timeout_sec,
+            )
+            if proc.returncode != 0:
+                return False, None, f"fake synth exit {proc.returncode}: {proc.stderr[-500:]}"
+            try:
+                raw = json.loads(proc.stdout.strip())
+            except json.JSONDecodeError as e:
+                return False, None, f"fake synth non-JSON: {e}"
+            # Allow fake to emit either envelope-form (with structured_output)
+            # or the bare schema payload.
+            parsed = raw.get("structured_output") if isinstance(raw, dict) and "structured_output" in raw else raw
+            return True, parsed, ""
+
+        if spec.vendor == "gemini":
+            return False, None, (
+                "synthesizer vendor 'gemini' not supported: gemini CLI has no "
+                "native JSON-schema enforcement"
+            )
+        result = call_shared_vendor(
+            vendor=spec.vendor,
+            model=spec.model,
+            prompt=prompt,
+            output_id="synthesizer",
+            timeout_sec=timeout_sec,
+            cwd=cwd,
+            effort=spec.effort,
+            schema_json=schema_json,
+            native_args=_read_only_native_args(spec.vendor),
+        )
+        if result.returncode != 0:
+            if result.timed_out:
+                return False, None, f"timeout after {timeout_sec}s"
+            return False, None, (
+                f"exit {result.returncode}: "
+                f"{(result.log or result.summary_stderr)[-500:]}"
+            )
+        try:
+            envelope = json.loads(result.output.strip())
+        except json.JSONDecodeError as e:
+            # Persist all available diagnostics for debugging — by the
+            # time the caller writes the failure verdict, the tempfile
+            # dir is gone, so we'd have nothing to inspect post-halt.
+            if debug_dir is not None:
+                try:
+                    (debug_dir / "panel-synthesizer-raw.txt").write_text(
+                        f"--- synthesizer raw output ({len(result.output)} chars) ---\n"
+                        f"{result.output}\n"
+                        f"--- end raw ---\n\n"
+                        f"--- shared-call returncode: {result.returncode} ---\n"
+                        f"--- timed_out: {result.timed_out} ---\n\n"
+                        f"--- shared-call status ({len(repr(result.status))} chars) ---\n"
+                        f"{result.status!r}\n"
+                        f"--- end status ---\n\n"
+                        f"--- shared-call log ({len(result.log)} chars) ---\n"
+                        f"{result.log}\n"
+                        f"--- end log ---\n\n"
+                        f"--- summary_stderr ({len(result.summary_stderr)} chars) ---\n"
+                        f"{result.summary_stderr}\n"
+                        f"--- end stderr ---\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            return False, None, f"envelope non-JSON: {e}"
+        # shared/vendors envelope: {"structured_output": {...}}.
+        # Claude returns it natively; for codex, vendor-launch.sh wraps the
+        # --output-schema JSON into the same shape so callers see one contract.
+        if not isinstance(envelope, dict):
+            return False, None, "envelope not object"
+        parsed = envelope.get("structured_output")
+        if parsed is None:
+            return False, None, "envelope missing structured_output"
+        return True, parsed, ""
+    except subprocess.TimeoutExpired:
+        return False, None, f"timeout after {timeout_sec}s"
+    except FileNotFoundError as e:
+        return False, None, str(e)
+
+
+def _derive_overall_verdict(per_vendor_verdicts: list[str]) -> str:
+    """Harness-side, deterministic: worst-verdict-wins across reviewers.
+
+    The synthesizer extracts per-reviewer verdicts verbatim; the harness
+    derives the overall verdict from them. No LLM judgment involved here.
+    """
+    if not per_vendor_verdicts:
+        return "fail"
+    if any(v == "fail" for v in per_vendor_verdicts):
+        return "fail"
+    if any(v == "needs_revision" for v in per_vendor_verdicts):
+        return "needs_revision"
+    if all(v == "pass" for v in per_vendor_verdicts):
+        return "pass"
+    return "needs_revision"
+
+
+def _decision_outcome_to_legacy_verdict(outcome: str) -> str:
+    if outcome == "pass":
+        return "pass"
+    if outcome == "retry_design":
+        return "needs_revision"
+    if outcome == "halt_for_human":
+        return "fail"
+    raise SchemaError(f"unsupported design-review decision outcome {outcome!r}")
+
+
+def _validate_design_review_targets(findings: list[PanelFinding]) -> None:
+    for finding in findings:
+        for target in finding.targets:
+            if target == "anchor.architecture-proposal.md":
+                raise SchemaError(
+                    "design-review target label 'anchor.architecture-proposal.md' is not supported"
+                )
+
+
+def _normalize_design_review_decision(
+    *,
+    feature_active: Path,
+    decision_payload: dict,
+    findings: list[PanelFinding],
+) -> ReviewDecision:
+    node = decision_payload.get("node")
+    outcome = decision_payload.get("outcome")
+    blocking = decision_payload.get("blocking")
+    severity = decision_payload.get("severity")
+    summary = decision_payload.get("summary")
+    prd_targeted = any(
+        target in {"anchor.prd.md", "primary_pair.prd.md"}
+        for finding in findings
+        for target in finding.targets
+    )
+    decision = ReviewDecision(
+        node=node,
+        outcome=outcome,
+        blocking=blocking,
+        severity=severity,
+        summary=summary,
+        prd_targeted=prd_targeted,
+    )
+    # Reuse verdict-layer validation so runner and loader agree.
+    decision_dict = decision.to_dict()
+    from autodev.artifacts.verdict import _validate_decision  # local import avoids widening public API
+
+    _validate_decision(decision_dict, "design-review")
+    _validate_design_review_targets(findings)
+
+    if decision.outcome == "halt_for_human" and prd_targeted:
+        streak = load_state(feature_active).prd_target_streak.get("design-review", 0)
+        if streak == 0:
+            return ReviewDecision(
+                node="design_review",
+                outcome="retry_design",
+                blocking=False,
+                severity=decision.severity,
+                summary=decision.summary,
+                prd_targeted=True,
+            )
+    return decision
+
+
+def _mechanical_fallback(
+    reviewer_results: list[ReviewerResult],
+) -> tuple[str, list[PanelFinding], str]:
+    """Conservative union rule when synthesizer fails.
+
+    Scans each reviewer's markdown for obvious verdict / severity
+    keywords. Intentionally crude — the whole point of G15 is to not
+    rely on this path, but we still need *some* result if the
+    synthesizer is down.
+    """
+    import re
+
+    responded = [r for r in reviewer_results if r.ok]
+    if not responded:
+        return "fail", [PanelFinding(
+            severity="invariant_violation", vendor="harness",
+            summary="no panel reviewer produced output",
+        )], "no reviewers responded"
+
+    per_vendor_verdict: dict[str, str] = {}
+    findings: list[PanelFinding] = []
+    for r in responded:
+        low = r.output.lower()
+        # Verdict keyword
+        m = re.search(
+            r"verdict[^a-z0-9]{0,100}?\b(pass|fail|proceed|reject|revise|needs[-_]revision)\b",
+            low, re.DOTALL,
+        )
+        if m:
+            kw = m.group(1)
+            mapped = {"pass": "pass", "proceed": "pass",
+                      "fail": "fail", "reject": "fail",
+                      "revise": "needs_revision",
+                      "needs_revision": "needs_revision",
+                      "needs-revision": "needs_revision"}.get(kw, "needs_revision")
+            per_vendor_verdict[r.vendor] = mapped
+        else:
+            per_vendor_verdict[r.vendor] = "needs_revision"
+        # Severity keyword scan (invariant_violation only — others would
+        # be too noisy without structure).
+        for vm in re.finditer(
+            r"invariant[_\- ]violation[:\s\-\u2014]+([^\n]{10,300})",
+            r.output, re.IGNORECASE,
+        ):
+            findings.append(PanelFinding(
+                severity="invariant_violation", vendor=r.vendor,
+                summary=vm.group(1).strip()[:300],
+            ))
+
+    if any(v == "fail" for v in per_vendor_verdict.values()) or any(
+        f.severity == "invariant_violation" for f in findings
+    ):
+        overall = "fail"
+    elif all(v == "pass" for v in per_vendor_verdict.values()):
+        overall = "pass"
+    else:
+        overall = "needs_revision"
+
+    findings.append(PanelFinding(
+        severity="opinion", vendor="harness",
+        summary="synthesizer_failed — mechanical fallback used",
+    ))
+    return overall, findings, "mechanical fallback"
+
+
+def run_panel_gate_internal(
+    *,
+    gate: str,
+    feature_active: Path,
+    primary_artifact: Path,
+    prompt_file_for_audit: Path,
+    consulted_docs: list[dict],
+    panel_config: PanelConfig,
+    repo_root: Path | None = None,
+) -> PanelVerdict:
+    """G15 main entry: dispatch reviewers, synthesize, write verdict.
+
+    `prompt_file_for_audit` is hashed and recorded in the verdict for
+    SC3 change-control. For G15 this is the gate-specific review prompt.
+    """
+    cfg = panel_config
+
+    # v3-core R5 — mechanical pre-check. Halt before any vendor dispatch.
+    # Test override: AUTODEV_PANEL_SKIP_PRECHECK=1 for tests that stub
+    # run_panel_gate_internal with synthetic artifacts.
+    skip_precheck = os.environ.get("AUTODEV_PANEL_SKIP_PRECHECK") == "1"
+    pre = None if skip_precheck else run_precheck(gate, feature_active, consulted_docs)
+    if pre is not None and not pre.ok:
+        finding = PanelFinding(
+            severity="invariant_violation", vendor="harness",
+            summary=pre.message,
+        )
+        v = PanelVerdict(
+            gate=gate, verdict="needs_revision",  # type: ignore[arg-type]
+            findings=[finding],
+            source=str(primary_artifact),
+            source_hash=hash_file(primary_artifact),
+            prompt_file=str(prompt_file_for_audit),
+            prompt_hash=hash_file(prompt_file_for_audit),
+            harness_version=HARNESS_VERSION,
+            run_ts=datetime.now(timezone.utc).isoformat(),
+            consulted_docs=consulted_docs,
+        )
+        out_path = feature_active / f"panel-{gate}.json"
+        write_verdict(out_path, v)
+        return v
+
+    reviewer_prompt = _compose_reviewer_prompt(
+        gate=gate, artifact_path=primary_artifact, consulted_docs=consulted_docs,
+        feature_active=feature_active, repo_root=repo_root,
+    )
+    vendor_cwd = repo_root or feature_active
+    reviewer_context_files = _reviewer_context_files(
+        primary_artifact=primary_artifact,
+        consulted_docs=consulted_docs,
+    )
+
+    reviewer_results: list[ReviewerResult] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(len(cfg.reviewers), 1)
+    ) as pool:
+        futs = {
+            pool.submit(
+                _invoke_reviewer,
+                r,
+                reviewer_prompt,
+                cfg.reviewer_timeout_sec,
+                cwd=vendor_cwd,
+                context_files=reviewer_context_files,
+            ): r
+            for r in cfg.reviewers
+        }
+        for fut in concurrent.futures.as_completed(futs):
+            reviewer_results.append(fut.result())
+    # Preserve reviewer order as declared in config (stable audit).
+    order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
+    reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+
+    healthy = [r for r in reviewer_results if r.ok]
+    per_vendor_raw = {r.vendor: r.output for r in reviewer_results if r.ok}
+    for r in reviewer_results:
+        if not r.ok:
+            per_vendor_raw[r.vendor] = f"[NO RESPONSE — {r.failure_detail}]"
+
+    # Panel degraded: fewer than MIN_HEALTHY_REVIEWERS responded. Without
+    # divergence, there is no panel — just a single-vendor opinion. Stop
+    # and point the operator at doctor.sh. Do NOT synthesize.
+    if len(healthy) < MIN_HEALTHY_REVIEWERS:
+        missing = [r.vendor for r in reviewer_results if not r.ok]
+        finding = PanelFinding(
+            severity="invariant_violation", vendor="harness",
+            summary=(
+                f"panel degraded: only {len(healthy)} of {len(reviewer_results)} "
+                f"reviewers responded (missing: {', '.join(missing) or 'n/a'}). "
+                f"Divergence signal requires ≥{MIN_HEALTHY_REVIEWERS}. "
+                f"Debug: {_doctor_hint()}. Do not skip-gate — fix the vendor(s) "
+                f"or `autodev escalate` the feature for human review."
+            ),
+        )
+        v = PanelVerdict(
+            gate=gate, verdict="fail",  # type: ignore[arg-type]
+            findings=[finding],
+            source=str(primary_artifact),
+            source_hash=hash_file(primary_artifact),
+            prompt_file=str(prompt_file_for_audit),
+            prompt_hash=hash_file(prompt_file_for_audit),
+            harness_version=HARNESS_VERSION,
+            run_ts=datetime.now(timezone.utc).isoformat(),
+            consulted_docs=consulted_docs,
+            per_vendor_raw=per_vendor_raw,
+        )
+        out_path = feature_active / f"panel-{gate}.json"
+        write_verdict(out_path, v)
+        return v
+
+    synth_prompt = _compose_synthesizer_prompt(
+        gate=gate, artifact_path=primary_artifact,
+        reviewer_results=reviewer_results,
+    )
+
+    synth_ok, synth_parsed, synth_detail = _invoke_synthesizer(
+        cfg.synthesizer, synth_prompt, cfg.synthesizer_timeout_sec,
+        cwd=vendor_cwd,
+        debug_dir=feature_active,
+    )
+
+    findings: list[PanelFinding] = []
+    coverage_map: dict[str, list[dict]] = {}
+    decision: ReviewDecision | None = None
+    synth_infra_error: str | None = None
+    if synth_ok and synth_parsed:
+        per_reviewer = synth_parsed.get("per_reviewer", [])
+        per_vendor_verdicts: list[str] = []
+        for entry in per_reviewer:
+            vendor = entry.get("vendor", "unknown")
+            per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
+            if entry.get("coverage"):
+                coverage_map[vendor] = list(entry.get("coverage", []))
+            for f in entry.get("findings", []):
+                findings.append(PanelFinding(
+                    severity=f.get("severity", "opinion"),
+                    vendor=vendor,
+                    summary=f.get("summary", ""),
+                    targets=list(f.get("targets", [])),
+                ))
+        if gate == "design-review" and isinstance(synth_parsed.get("decision"), dict):
+            decision = _normalize_design_review_decision(
+                feature_active=feature_active,
+                decision_payload=synth_parsed["decision"],
+                findings=findings,
+            )
+            verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
+        else:
+            verdict_str = _derive_overall_verdict(per_vendor_verdicts)
+    else:
+        # Synthesizer non-JSON / timeout / exit-nonzero is a HARNESS
+        # infrastructure error, not a content judgment. We cannot
+        # determine whether the artifact is OK because the synthesizer
+        # crashed. Write the fail verdict for audit, then raise
+        # PreflightError so the orchestrator halts the run cleanly
+        # instead of letting revision_loop dispatch a fallback rerun
+        # (which would burn L cycles on a fake panel rejection).
+        findings = [
+            PanelFinding(
+                severity="invariant_violation",
+                vendor="harness",
+                summary=(
+                    f"synthesizer_failed: {synth_detail[:300]}. The "
+                    f"harness cannot determine a verdict because the "
+                    f"synthesizer's output was not parseable JSON. "
+                    f"Re-running the producer will not help — fix the "
+                    f"synthesizer prompt, the synthesizer model "
+                    f"choice, or `autodev escalate` for human review."
+                ),
+                targets=[],
+            ),
+        ]
+        verdict_str = "fail"
+        synth_infra_error = synth_detail or "synthesizer call failed"
+
+    # v3-core R3 — anchor-filter post-processing. Findings whose targets
+    # are all-anchor move to dropped_findings[]; unknown/malformed target
+    # strings default to primary_pair and are logged as warnings.
+    feature_log = JsonlLog(feature_active / "log.jsonl")
+    warnings: list[str] = []
+    kept_findings, dropped = filter_anchor_findings(
+        findings, warn=warnings.append,
+    )
+    if decision is not None:
+        _validate_design_review_targets(kept_findings + [  # keep invariant after audit-only filtering
+            PanelFinding(
+                severity=df.severity,
+                vendor=df.vendor,
+                summary=df.summary,
+                targets=df.targets,
+            )
+            for df in dropped
+        ])
+    for w in warnings:
+        feature_log.emit(stage="gate", event="anchor-filter-warning",
+                         feature=feature_active.parent.name,
+                         detail={"gate": gate, "message": w})
+    # After filter, derive top-level verdict (R4): `pass` if no
+    # invariant_violation or risk findings in kept_findings; else
+    # needs_revision. `fail` reserved for synthesizer errors (already
+    # set above when synth_ok was False).
+    if synth_ok and synth_parsed and decision is None:
+        has_blocking = any(
+            f.severity in ("invariant_violation", "risk") for f in kept_findings
+        )
+        verdict_str = "needs_revision" if has_blocking else "pass"
+
+    v = PanelVerdict(
+        gate=gate, verdict=verdict_str,  # type: ignore[arg-type]
+        findings=kept_findings,
+        source=str(primary_artifact),
+        source_hash=hash_file(primary_artifact),
+        prompt_file=str(prompt_file_for_audit),
+        prompt_hash=hash_file(prompt_file_for_audit),
+        harness_version=HARNESS_VERSION,
+        run_ts=datetime.now(timezone.utc).isoformat(),
+        consulted_docs=consulted_docs,
+        per_vendor_raw=per_vendor_raw,
+        dropped_findings=dropped,
+        coverage_map=coverage_map,
+        decision=decision,
+    )
+    out_path = feature_active / f"panel-{gate}.json"
+    write_verdict(out_path, v)
+    if synth_infra_error is not None:
+        # Synthesizer infrastructure error: verdict written for audit,
+        # but the run cannot proceed. Raise so the orchestrator halts
+        # instead of letting revision_loop's indeterminate-target
+        # fallback dispatch a fresh producer rerun.
+        from autodev.errors import PreflightError
+        raise PreflightError(
+            f"panel {gate}: synthesizer infrastructure error — "
+            f"{synth_infra_error[:200]}. Verdict written to {out_path}. "
+            f"Cannot determine content verdict; halting run. Fix the "
+            f"synthesizer prompt/model or `autodev escalate`."
+        )
+    return v

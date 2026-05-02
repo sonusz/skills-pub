@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-dev-sdk"
+version = "2.0.0"
+description = "Python harness for AI-driven feature pipelines using a shared vendor adapter and panel review gates."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pyyaml>=6.0",
+  "jsonschema>=4.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+  "pytest-mock>=3.12",
+]
+
+[project.scripts]
+autodev = "autodev.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["autodev*", "shared"]
+
+[tool.setuptools.package-data]
+autodev = ["prompts/*.md", "panel/prompts/*.md"]
+shared = ["vendors/*", "vendors/scripts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+  "live: opt-in tests that invoke live vendor CLIs (claude/gemini/codex); skipped by default. Run with `pytest -m live`.",
+]
+addopts = "-m 'not live'"

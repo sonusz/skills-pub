@@ -1,0 +1,26 @@
+# Four vendor calls made by panel-review.
+#
+# The three entries under `panel` receive the same review prompt in parallel.
+# The `synthesis` entry receives the original prompt plus panel outputs and
+# produces the final comparative report.
+# Effort uses the shared vendor scale: min, low, medium, high, xhigh, max.
+
+panel:
+  - id: openai
+    vendor: openai
+    effort: medium
+    model: gpt-5.5
+  - id: claude
+    vendor: claude
+    effort: medium
+    model: claude-opus-4-7
+  - id: gemini
+    vendor: gemini
+    effort: medium
+    model: gemini-3.1-pro-preview
+
+synthesis:
+  id: synthesis
+  vendor: claude
+  effort: medium
+  model: claude-sonnet-4-6
