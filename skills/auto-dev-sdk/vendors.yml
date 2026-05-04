@@ -26,7 +26,7 @@ stages:
   design:
     vendor: claude
     model: claude-opus-4-7
-    timeout_sec: 1200
+    timeout_sec: 2400
     effort: max
 
   # Implements the accepted design and writes target artifacts/code.
@@ -64,15 +64,15 @@ panel:
     # Claude: strong natural-language critique and ambiguity detection.
     - vendor: claude
       model: claude-opus-4-7
-      effort: high
+      effort: max
     # Gemini: independent second vendor for divergence signal.
     - vendor: gemini
-      model: gemini-3-flash-preview
-      effort: high
+      model: gemini-3.1-pro-preview
+      effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
       model: gpt-5.5
-      effort: high
+      effort: max
   # Synthesizes reviewer outputs only; does not re-review the artifact.
   # Context: medium; reviewer outputs plus schema. Effort: high enough for
   # faithful extraction, lower than design generation.

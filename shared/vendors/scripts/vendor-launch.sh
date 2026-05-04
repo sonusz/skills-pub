@@ -201,7 +201,7 @@ vendors_native_arg_present() {
   local arg=""
 
   for arg in "${VENDORS_NATIVE_ARGS[@]}"; do
-    if [ "$arg" = "$needle" ]; then
+    if [ "$arg" = "$needle" ] || [[ "$arg" == "$needle="* ]]; then
       return 0
     fi
   done
@@ -288,6 +288,38 @@ def write_usage(payload):
     usage_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def gemini_stats_total(stats):
+    models = stats.get("models", {}) if isinstance(stats, dict) else {}
+    total = 0
+    if isinstance(models, dict):
+        for model_stats in models.values():
+            if not isinstance(model_stats, dict):
+                continue
+            model_total = parse_int(model_stats.get("total_tokens"))
+            if model_total > 0:
+                total += model_total
+                continue
+            tokens = model_stats.get("tokens", {})
+            if isinstance(tokens, dict):
+                model_total = parse_int(tokens.get("total"))
+                if model_total > 0:
+                    total += model_total
+                    continue
+            roles = model_stats.get("roles", {})
+            role_total = 0
+            if isinstance(roles, dict):
+                for role_stats in roles.values():
+                    if not isinstance(role_stats, dict):
+                        continue
+                    role_tokens = role_stats.get("tokens", {})
+                    if isinstance(role_tokens, dict):
+                        role_total += parse_int(role_tokens.get("total"))
+            total += role_total
+    if total <= 0 and isinstance(stats, dict):
+        total = parse_int(stats.get("total_tokens"))
+    return total or None
+
+
 payload = {
     "provider": vendor,
     "model": model or None,
@@ -306,15 +338,22 @@ if vendor == "claude":
     except Exception:
         data = None
     if not isinstance(data, dict):
-        for line in reversed(raw_out.splitlines()):
+        last_json_event = None
+        last_result_event = None
+        for line in raw_out.splitlines():
             candidate = line.strip()
             if not (candidate.startswith("{") and candidate.endswith("}")):
                 continue
             try:
-                data = json.loads(candidate)
-                break
+                event = json.loads(candidate)
             except Exception:
                 continue
+            if not isinstance(event, dict):
+                continue
+            last_json_event = event
+            if event.get("type") == "result":
+                last_result_event = event
+        data = last_result_event or last_json_event
     if isinstance(data, dict):
         # When Claude is invoked with `--json-schema`, the schema-conforming
         # JSON lands under `structured_output` and `result` is empty. When
@@ -327,7 +366,17 @@ if vendor == "claude":
                 json.dumps({"structured_output": data["structured_output"]})
             )
         elif "result" in data:
-            output.write_text(str(data.get("result", "")))
+            result = data.get("result", "")
+            structured = None
+            if schema_file and isinstance(result, str) and result.strip():
+                try:
+                    structured = json.loads(result)
+                except Exception:
+                    structured = None
+            if structured is not None:
+                output.write_text(json.dumps({"structured_output": structured}))
+            else:
+                output.write_text(str(result))
         raw_usage = data.get("usage")
         total = usage_total(raw_usage)
         if isinstance(raw_usage, dict) and total is not None:
@@ -346,33 +395,41 @@ elif vendor == "gemini":
         data = json.loads(raw_out)
     except Exception:
         data = None
+    if not isinstance(data, dict):
+        last_result_event = None
+        delta_parts = []
+        last_full_message = None
+        for line in raw_out.splitlines():
+            candidate = line.strip()
+            if not (candidate.startswith("{") and candidate.endswith("}")):
+                continue
+            try:
+                event = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "result":
+                last_result_event = event
+                continue
+            if event.get("type") == "message" and event.get("role") == "assistant":
+                content = event.get("content")
+                if isinstance(content, str):
+                    if event.get("delta") is True:
+                        delta_parts.append(content)
+                    else:
+                        last_full_message = content
+        data = last_result_event
+        if delta_parts:
+            output.write_text("".join(delta_parts))
+        elif last_full_message is not None:
+            output.write_text(last_full_message)
     if isinstance(data, dict):
         if "response" in data:
             output.write_text(str(data.get("response", "")))
         stats = data.get("stats")
-        models = stats.get("models", {}) if isinstance(stats, dict) else {}
-        total = 0
-        if isinstance(models, dict):
-            for model_stats in models.values():
-                if not isinstance(model_stats, dict):
-                    continue
-                tokens = model_stats.get("tokens", {})
-                if isinstance(tokens, dict):
-                    model_total = parse_int(tokens.get("total"))
-                    if model_total > 0:
-                        total += model_total
-                        continue
-                roles = model_stats.get("roles", {})
-                role_total = 0
-                if isinstance(roles, dict):
-                    for role_stats in roles.values():
-                        if not isinstance(role_stats, dict):
-                            continue
-                        role_tokens = role_stats.get("tokens", {})
-                        if isinstance(role_tokens, dict):
-                            role_total += parse_int(role_tokens.get("total"))
-                total += role_total
-        if total > 0:
+        total = gemini_stats_total(stats)
+        if total is not None:
             payload.update({
                 "available": True,
                 "source": "gemini_stats",
@@ -607,7 +664,7 @@ vendors_run_claude() {
     command+=(--system-prompt "$VENDORS_SYSTEM_PROMPT")
   fi
   if ! vendors_native_arg_present "--output-format"; then
-    command+=(--output-format json)
+    command+=(--output-format stream-json --include-partial-messages --verbose)
   fi
   if [ -n "${VENDORS_SCHEMA_FILE:-}" ] \
       && ! vendors_native_arg_present "--json-schema"; then
@@ -652,7 +709,7 @@ vendors_run_gemini() {
     command+=(--model "$VENDORS_RESOLVED_MODEL")
   fi
   if ! vendors_native_arg_present "--output-format"; then
-    command+=(--output-format json)
+    command+=(--output-format stream-json)
   fi
   if [ "${VENDORS_YOLO:-0}" = "1" ]; then
     command+=(--yolo)

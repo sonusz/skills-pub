@@ -53,13 +53,26 @@ FAKE_CODEX
 
 cat > "$BIN_DIR/claude" <<'FAKE_CLAUDE'
 #!/usr/bin/env bash
-json=0
+format=""
+verbose=0
+include_partials=0
+schema=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-format)
-      if [ "${2-}" = "json" ]; then
-        json=1
-      fi
+      format="${2-}"
+      shift 2
+      ;;
+    --verbose)
+      verbose=1
+      shift
+      ;;
+    --include-partial-messages)
+      include_partials=1
+      shift
+      ;;
+    --json-schema)
+      schema=1
       shift 2
       ;;
     *)
@@ -73,7 +86,39 @@ if printf "%s" "$prompt" | grep -qi 'single word READY'; then
 else
   response="claude received: $prompt"
 fi
-if [ "$json" = "1" ]; then
+if [ "$schema" = "1" ]; then
+  response='{"answer":"READY"}'
+fi
+if [ "$format" = "stream-json" ]; then
+  if [ "$verbose" != "1" ]; then
+    printf "stream-json requires --verbose\n" >&2
+    exit 2
+  fi
+  python3 - "$response" "$include_partials" <<'PY'
+import json
+import sys
+
+response = sys.argv[1]
+include_partials = sys.argv[2] == "1"
+print(json.dumps({"type": "system", "subtype": "init"}))
+if include_partials:
+    print(json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": response[:7]}]},
+    }))
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "result": response,
+    "usage": {
+        "input_tokens": 103,
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 13,
+        "output_tokens": 9,
+    },
+}))
+PY
+elif [ "$format" = "json" ]; then
   python3 - "$response" <<'PY'
 import json
 import sys
@@ -95,7 +140,7 @@ FAKE_CLAUDE
 cat > "$BIN_DIR/gemini" <<'FAKE_GEMINI'
 #!/usr/bin/env bash
 prompt=""
-json=0
+format=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --prompt|-p)
@@ -103,9 +148,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --output-format)
-      if [ "${2-}" = "json" ]; then
-        json=1
-      fi
+      format="${2-}"
       shift 2
       ;;
     *)
@@ -129,7 +172,35 @@ OUT
 else
   response="gemini received: $prompt"
 fi
-if [ "$json" = "1" ]; then
+if [ "$format" = "stream-json" ]; then
+  python3 - "$response" <<'PY'
+import json
+import sys
+
+response = sys.argv[1]
+print(json.dumps({"type": "init", "model": "fake-gemini"}))
+print(json.dumps({
+    "type": "message",
+    "role": "assistant",
+    "content": response,
+    "delta": True,
+}))
+print(json.dumps({
+    "type": "result",
+    "status": "success",
+    "stats": {
+        "total_tokens": 127,
+        "models": {
+            "fake-gemini": {
+                "total_tokens": 127,
+                "input_tokens": 111,
+                "output_tokens": 16,
+            }
+        },
+    },
+}))
+PY
+elif [ "$format" = "json" ]; then
   python3 - "$response" <<'PY'
 import json
 import sys
@@ -230,6 +301,30 @@ if ! grep -q -- '--permission-mode bypassPermissions' "$dry_dir/claude-yolo/log"
   cat "$dry_dir/claude-yolo/log" >&2
   exit 1
 fi
+if ! grep -q -- '--output-format stream-json' "$dry_dir/claude-yolo/log" \
+    || ! grep -q -- '--include-partial-messages' "$dry_dir/claude-yolo/log" \
+    || ! grep -q -- '--verbose' "$dry_dir/claude-yolo/log"; then
+  printf "FAIL: expected Claude default dry-run to use stream-json with partials and verbose\n" >&2
+  cat "$dry_dir/claude-yolo/log" >&2
+  exit 1
+fi
+
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor Claude \
+  --prompt "dry run claude explicit json output" \
+  --output-dir "$dry_dir" \
+  --id claude-json-output \
+  --native-arg --output-format \
+  --native-arg json \
+  --dry-run >/dev/null
+
+if ! grep -q -- '--output-format json' "$dry_dir/claude-json-output/log" \
+    || grep -q -- '--output-format stream-json' "$dry_dir/claude-json-output/log" \
+    || grep -q -- '--include-partial-messages' "$dry_dir/claude-json-output/log"; then
+  printf "FAIL: expected explicit Claude output-format json to suppress stream-json defaults\n" >&2
+  cat "$dry_dir/claude-json-output/log" >&2
+  exit 1
+fi
 
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
   --vendor Gemini \
@@ -242,6 +337,27 @@ PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
 if ! grep -q -- '--yolo' "$dry_dir/gemini-yolo/log"; then
   printf "FAIL: expected Gemini yolo dry-run to use --yolo\n" >&2
   cat "$dry_dir/gemini-yolo/log" >&2
+  exit 1
+fi
+if ! grep -q -- '--output-format stream-json' "$dry_dir/gemini-yolo/log"; then
+  printf "FAIL: expected Gemini default dry-run to use stream-json\n" >&2
+  cat "$dry_dir/gemini-yolo/log" >&2
+  exit 1
+fi
+
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor Gemini \
+  --prompt "dry run gemini explicit json output" \
+  --output-dir "$dry_dir" \
+  --id gemini-json-output \
+  --native-arg --output-format \
+  --native-arg json \
+  --dry-run >/dev/null
+
+if ! grep -q -- '--output-format json' "$dry_dir/gemini-json-output/log" \
+    || grep -q -- '--output-format stream-json' "$dry_dir/gemini-json-output/log"; then
+  printf "FAIL: expected explicit Gemini output-format json to suppress stream-json defaults\n" >&2
+  cat "$dry_dir/gemini-json-output/log" >&2
   exit 1
 fi
 
@@ -337,6 +453,35 @@ if ! grep -q 'BEGIN CONTEXT FILE:' "$context_dir/claude-context/out" \
     || ! grep -q 'CONTEXT_SENTINEL_' "$context_dir/claude-context/out"; then
   printf "FAIL: expected context-file contents to be inlined into prompt\n" >&2
   cat "$context_dir/claude-context/out" >&2
+  exit 1
+fi
+
+schema_file="$WORK/response-schema.json"
+cat > "$schema_file" <<'JSON'
+{
+  "type": "object",
+  "properties": {
+    "answer": {"type": "string"}
+  },
+  "required": ["answer"],
+  "additionalProperties": false
+}
+JSON
+
+schema_dir="$RUN_ROOT/claude-schema"
+mkdir -p "$schema_dir"
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor Claude \
+  --prompt "return schema output" \
+  --schema-file "$schema_file" \
+  --output-dir "$schema_dir" \
+  --id claude-schema \
+  --min-success 1 >/dev/null
+
+if ! grep -q '"structured_output"' "$schema_dir/claude-schema/out" \
+    || ! grep -q '"answer": "READY"' "$schema_dir/claude-schema/out"; then
+  printf "FAIL: expected Claude stream-json schema output to preserve structured_output envelope\n" >&2
+  cat "$schema_dir/claude-schema/out" >&2
   exit 1
 fi
 
