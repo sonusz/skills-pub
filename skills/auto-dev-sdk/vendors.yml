@@ -38,6 +38,15 @@ stages:
     timeout_sec: 3600
     effort: max
 
+  # Ralph close/review pass over implementation/spec/checklist.
+  # Context: medium; checks consistency and release readiness, not broad design
+  # exploration. Effort: medium-high.
+  review:
+    vendor: claude
+    model: claude-opus-4-7
+    timeout_sec: 900
+    effort: high
+
   # Builds implementation evidence/spec after code exists.
   # Context: medium; mostly accepted design, implementation index, and changed
   # files. Effort: medium-high.
@@ -46,15 +55,6 @@ stages:
     model: gpt-5.5
     timeout_sec: 900
     effort: medium
-
-  # Ralph close/review pass over implementation/spec/checklist.
-  # Context: medium; checks consistency and release readiness, not broad design
-  # exploration. Effort: medium-high.
-  review:
-    vendor: codex
-    model: gpt-5.5
-    timeout_sec: 900
-    effort: high
 
 panel:
   # Independent design/close-gate reviewers. Each sees the primary artifact and
@@ -87,6 +87,6 @@ panel:
   # extend or kill; it never develops artifacts. Context: small. Effort: low.
 probe:
   vendor: claude
-  model: claude-sonnet-4-6
+  model: claude-haiku-4-5
   timeout_sec: 60
   effort: low
