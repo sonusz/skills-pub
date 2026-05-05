@@ -15,16 +15,25 @@ from typing import Callable
 
 from autodev.artifacts.failure import FailureReport, write_failure
 from autodev.vendors.config import ProbeConfig, StageSpec
-from autodev.vendors.shared_call import call_shared_vendor, split_common_vendor_flags
+from autodev.vendors.probe_agent import ProbeVerdict, run_idle_probe
+from autodev.vendors.shared_call import (
+    IdleAction,
+    call_shared_vendor,
+    split_common_vendor_flags,
+)
 
 SIGKILL_GRACE_SEC = 30
 STDERR_TAIL_BYTES = 4096
 # Idle-timeout semantics: `timeout_sec` is interpreted as the maximum
-# wall-clock interval between stdout/stderr updates. A subagent that
-# keeps streaming (reading repo files, emitting tool calls, etc.) runs
-# indefinitely; one that wedges for `timeout_sec` without any output is
-# killed. Poll every IDLE_POLL_INTERVAL_SEC seconds.
-IDLE_POLL_INTERVAL_SEC = 1
+# wall-clock interval between stream-output activity (the streaming
+# token file written by the vendor CLI). A subagent that keeps
+# streaming runs indefinitely; one whose stream output file has been
+# silent for at least IDLE_PROBE_THRESHOLD_SEC triggers an LLM probe,
+# which decides extend vs kill. Polling cadence is set by
+# IDLE_POLL_INTERVAL_SEC and the callback is consulted at every poll
+# whether or not idle has crossed the threshold.
+IDLE_POLL_INTERVAL_SEC = 5
+IDLE_PROBE_THRESHOLD_SEC = 60
 
 
 @dataclass
@@ -101,6 +110,18 @@ def run_stage_subprocess(
     failure_kind: str | None = None
     failure_detail = ""
 
+    idle_callback = (
+        _build_idle_callback(
+            stage=stage,
+            stage_timeout_sec=stage_spec.timeout_sec,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            probe_config=probe_config,
+            log_emit=log_emit,
+        )
+        if probe_config is not None
+        else None
+    )
     try:
         result = call_shared_vendor(
             vendor=stage_spec.vendor,
@@ -113,6 +134,8 @@ def run_stage_subprocess(
             yolo=True,
             native_args=native_args,
             env_overrides=env_overrides,
+            idle_callback=idle_callback,
+            idle_check_interval_sec=IDLE_POLL_INTERVAL_SEC,
         )
         exit_code = _exit_code_from_status(result.status, result.returncode)
         stdout_path.write_text(
@@ -201,3 +224,69 @@ def run_stage_subprocess(
         subprocess_reaped=subprocess_reaped,
         elapsed_sec=elapsed,
     )
+
+
+def _build_idle_callback(
+    *,
+    stage: str,
+    stage_timeout_sec: int,
+    stdout_path: Path,
+    stderr_path: Path,
+    probe_config: ProbeConfig,
+    log_emit: Callable[[dict], None] | None,
+) -> Callable[..., IdleAction]:
+    """Construct the idle-watch callback `call_shared_vendor` will poll.
+
+    Behavior:
+    - When the stream output file has been silent < IDLE_PROBE_THRESHOLD_SEC,
+      return "continue" without spending a probe call.
+    - When the threshold is crossed, ask `run_idle_probe`. A `kill`
+      verdict returns "kill" (call_shared_vendor unwinds the proc);
+      an `extend` verdict returns "continue" and we wait at least
+      `extend_sec` before invoking the probe again, so we honor the
+      probe's grace grant without hammering it.
+    """
+    state: dict[str, float] = {"next_probe_at": 0.0}
+
+    def cb(*, stream_file: Path, idle_sec: float, elapsed_sec: float, pid: int) -> IdleAction:
+        if idle_sec < IDLE_PROBE_THRESHOLD_SEC:
+            return "continue"
+        now = time.monotonic()
+        if now < state["next_probe_at"]:
+            # Probe previously granted an extension that has not
+            # elapsed yet; keep waiting silently.
+            return "continue"
+        try:
+            verdict: ProbeVerdict = run_idle_probe(
+                stage=stage,
+                pid=pid,
+                idle_sec=int(idle_sec),
+                idle_cap_sec=stage_timeout_sec,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                probe_config=probe_config,
+                stream_output_file=stream_file,
+            )
+        except Exception:
+            # Defensive: if the probe itself errors (transient OS
+            # failure reading process tree, exec error, etc.), we keep
+            # the run alive. The hard wall-clock backstop in
+            # call_shared_vendor still bounds total runtime.
+            return "continue"
+        if log_emit is not None:
+            log_emit({
+                "event": "idle-probe",
+                "stage": stage,
+                "action": verdict.action,
+                "extend_sec": verdict.extend_sec,
+                "idle_sec": int(idle_sec),
+                "elapsed_sec": int(elapsed_sec),
+                "rationale": verdict.rationale[:200],
+            })
+        if verdict.action == "kill":
+            return "kill"
+        # extend: wait at least the granted seconds before the next probe.
+        state["next_probe_at"] = now + max(verdict.extend_sec or 1, 1)
+        return "continue"
+
+    return cb

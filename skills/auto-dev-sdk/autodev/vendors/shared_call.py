@@ -14,6 +14,13 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Literal
+
+
+# Action returned by an idle_callback to call_shared_vendor.
+# - "continue": keep waiting; we'll poll again next interval.
+# - "kill": SIGTERM the subprocess group now and unwind.
+IdleAction = Literal["continue", "kill"]
 
 
 SDK_ROOT = Path(__file__).resolve().parents[2]
@@ -176,6 +183,8 @@ def call_shared_vendor(
     binary_override: str | None = None,
     output_dir: Path | None = None,
     schema_json: str | None = None,
+    idle_callback: Callable[..., IdleAction] | None = None,
+    idle_check_interval_sec: int = 10,
 ) -> SharedVendorResult:
     if not SHARED_CALL_SCRIPT.exists():
         raise FileNotFoundError(
@@ -230,39 +239,137 @@ def call_shared_vendor(
 
         call_dir = actual_output_dir / output_id
         start = time.monotonic()
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
-        try:
-            summary_stdout, summary_stderr = proc.communicate(
-                timeout=max(timeout_sec, 0) + 30 if timeout_sec else None,
+        wallclock_start = time.time()
+
+        if idle_callback is None:
+            # Original blocking-communicate path. Single hard wall-clock
+            # cap, no probe interaction.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                start_new_session=True,
             )
-            elapsed = time.monotonic() - start
-            returncode = proc.returncode
-            outer_timed_out = False
-        except subprocess.TimeoutExpired as e:
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                summary_stdout, summary_stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
+                summary_stdout, summary_stderr = proc.communicate(
+                    timeout=max(timeout_sec, 0) + 30 if timeout_sec else None,
+                )
+                elapsed = time.monotonic() - start
+                returncode = proc.returncode
+                outer_timed_out = False
+            except subprocess.TimeoutExpired as e:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                summary_stdout, summary_stderr = proc.communicate()
-            elapsed = time.monotonic() - start
-            returncode = -1
-            summary_stdout = summary_stdout or e.stdout or ""
-            summary_stderr = summary_stderr or e.stderr or ""
-            outer_timed_out = True
+                try:
+                    summary_stdout, summary_stderr = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    summary_stdout, summary_stderr = proc.communicate()
+                elapsed = time.monotonic() - start
+                returncode = -1
+                summary_stdout = summary_stdout or e.stdout or ""
+                summary_stderr = summary_stderr or e.stderr or ""
+                outer_timed_out = True
+        else:
+            # Idle-callback path. Redirect summary stdout/stderr to
+            # files (so we can call proc.wait() repeatedly without
+            # blocking on a PIPE buffer) and poll the stream output
+            # file's mtime each interval, asking the callback whether
+            # to keep waiting or kill the subprocess group.
+            summary_out_path = work_dir / "summary.out"
+            summary_err_path = work_dir / "summary.err"
+            stream_file = call_dir / "out"
+            outer_timed_out = False
+            with open(summary_out_path, "w") as so_f, open(summary_err_path, "w") as se_f:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=so_f,
+                    stderr=se_f,
+                    env=env,
+                    start_new_session=True,
+                )
+                hard_deadline = (
+                    start + (timeout_sec + 30)
+                    if timeout_sec and timeout_sec > 0
+                    else None
+                )
+                while True:
+                    try:
+                        proc.wait(timeout=max(idle_check_interval_sec, 1))
+                        break  # natural exit
+                    except subprocess.TimeoutExpired:
+                        # Still running: gather stream-file state and ask callback.
+                        if stream_file.exists():
+                            try:
+                                last_mtime = stream_file.stat().st_mtime
+                            except OSError:
+                                last_mtime = wallclock_start
+                        else:
+                            last_mtime = wallclock_start
+                        idle_sec = max(0.0, time.time() - last_mtime)
+                        elapsed_now = time.monotonic() - start
+                        try:
+                            action: IdleAction = idle_callback(
+                                stream_file=stream_file,
+                                idle_sec=idle_sec,
+                                elapsed_sec=elapsed_now,
+                                pid=proc.pid,
+                            )
+                        except Exception:
+                            # Defensive: if the callback explodes, treat
+                            # as "continue" so we don't lose the run for
+                            # an observability bug; the hard deadline
+                            # still backstops us.
+                            action = "continue"
+                        if action == "kill":
+                            try:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                try:
+                                    os.killpg(proc.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                proc.wait()
+                            outer_timed_out = True
+                            break
+                        if hard_deadline is not None and time.monotonic() >= hard_deadline:
+                            try:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                try:
+                                    os.killpg(proc.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                proc.wait()
+                            outer_timed_out = True
+                            break
+                elapsed = time.monotonic() - start
+                returncode = proc.returncode if proc.returncode is not None else -1
+            summary_stdout = (
+                summary_out_path.read_text(encoding="utf-8")
+                if summary_out_path.exists()
+                else ""
+            )
+            summary_stderr = (
+                summary_err_path.read_text(encoding="utf-8")
+                if summary_err_path.exists()
+                else ""
+            )
 
         status = _status_file_to_dict(call_dir / "status")
         output = _read_text(call_dir / "out")

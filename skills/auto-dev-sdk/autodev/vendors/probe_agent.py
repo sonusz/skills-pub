@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,11 +90,30 @@ def _tail(path: Path, max_lines: int = 200) -> str:
 def _compose_prompt(
     *, stage: str, pid: int, idle_sec: int, idle_cap_sec: int,
     stdout_path: Path, stderr_path: Path,
+    stream_output_file: Path | None = None,
 ) -> str:
     base = (PROMPTS_DIR / PROMPT_FILENAME).read_text(encoding="utf-8")
     proc_tree = _process_tree(pid)
     stdout_tail = _tail(stdout_path, 200)
     stderr_tail = _tail(stderr_path, 200)
+    stream_block = ""
+    if stream_output_file is not None:
+        if stream_output_file.exists():
+            try:
+                st = stream_output_file.stat()
+                size_bytes = st.st_size
+                seconds_since = max(0, int(time.time() - st.st_mtime))
+            except OSError:
+                size_bytes = 0
+                seconds_since = idle_sec
+        else:
+            size_bytes = 0
+            seconds_since = idle_sec
+        stream_block = (
+            f"- **Stream output file path**: `{stream_output_file}`\n"
+            f"- **Stream output file size_bytes**: `{size_bytes}`\n"
+            f"- **Stream output file seconds_since_modified**: `{seconds_since}s`\n"
+        )
     return (
         base
         + "\n\n---\n\n## Probe inputs\n\n"
@@ -102,7 +122,9 @@ def _compose_prompt(
         + f"- **Idle duration**: `{idle_sec}s`\n"
         + f"- **Configured idle cap**: `{idle_cap_sec}s`\n"
         + f"- **Stdout path**: `{stdout_path}`\n"
-        + f"- **Stderr path**: `{stderr_path}`\n\n"
+        + f"- **Stderr path**: `{stderr_path}`\n"
+        + stream_block
+        + "\n"
         + "### Process tree\n\n```\n" + proc_tree + "\n```\n\n"
         + "### Stdout tail (last 200 lines)\n\n```\n" + stdout_tail + "\n```\n\n"
         + "### Stderr tail (last 200 lines)\n\n```\n" + stderr_tail + "\n```\n"
@@ -150,6 +172,7 @@ def run_idle_probe(
     probe_timeout_sec: int | None = None,
     probe_config: ProbeConfig,
     vendor_binary: str | None = None,
+    stream_output_file: Path | None = None,
 ) -> ProbeVerdict:
     """Ask a short-lived LLM probe whether to extend or kill.
 
@@ -175,6 +198,7 @@ def run_idle_probe(
     prompt = _compose_prompt(
         stage=stage, pid=pid, idle_sec=idle_sec, idle_cap_sec=idle_cap_sec,
         stdout_path=stdout_path, stderr_path=stderr_path,
+        stream_output_file=stream_output_file,
     )
 
     fake = os.environ.get(FAKE_PROBE_ENV)

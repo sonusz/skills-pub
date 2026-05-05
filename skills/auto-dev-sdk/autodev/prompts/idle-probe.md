@@ -9,10 +9,20 @@ legitimately slow task** (extend).
 
 - **Stage**: the pipeline stage name.
 - **Subagent pid**: the root pid the harness is watching.
-- **Idle duration**: seconds since last stdout/stderr activity.
+- **Idle duration**: seconds since last stream-output activity.
 - **Configured idle cap**: current timeout threshold that just fired.
 - **Process tree**: `ps --forest` output rooted at the subagent pid.
-- **Stdout tail / stderr tail**: last ~200 lines of each log.
+- **Stdout tail / stderr tail**: last ~200 lines of each log. May be
+  empty when the subagent streams structured tokens to a file
+  instead of stdout (this is the common case for vendor LLM CLIs in
+  `--output-format stream-json` mode).
+- **Stream output file** (optional, present for stream-json subagents):
+  - **path**: filesystem path of the streaming output file.
+  - **size_bytes**: current size; nonzero size with a stale mtime is
+    a strong wedge signal because it means the subagent already
+    started producing tokens and then went silent.
+  - **seconds_since_modified**: wall-clock seconds since the stream
+    file's last `mtime` write.
 
 ## Decision rule
 
@@ -42,6 +52,11 @@ Signs of **wedged** (→ kill):
 - Stderr tail shows a Python/JS traceback or a "Connection refused" /
   "EOF" loop.
 - Vendor CLI is showing retry-loop output against a failed endpoint.
+- Stream output file has nonzero `size_bytes` AND
+  `seconds_since_modified` is large (e.g. > 2× idle cap). The
+  subagent emitted tokens, then went silent; this almost always
+  means the underlying API stream stalled mid-response and the CLI
+  is hung waiting for the next chunk that will never arrive.
 
 ## Output format
 

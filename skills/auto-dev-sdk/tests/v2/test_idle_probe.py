@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 
 from autodev.vendors.probe_agent import (
-    FAKE_PROBE_VERDICT_ENV, MAX_EXTEND_SEC, ProbeVerdict, _parse_verdict,
-    run_idle_probe,
+    FAKE_PROBE_VERDICT_ENV, MAX_EXTEND_SEC, ProbeVerdict,
+    _compose_prompt, _parse_verdict, run_idle_probe,
 )
 from autodev.vendors.config import ProbeConfig
+from autodev.vendors import subprocess_runner
 
 PROBE_CONFIG = ProbeConfig(vendor="claude", model="fake-probe")
 
@@ -241,3 +242,159 @@ def test_probe_verdict_defaults():
     assert v.extend_sec == 0
     assert v.rationale == ""
     assert v.raw_output == ""
+
+
+# ---------- compose prompt with stream output file ----------
+
+def test_compose_prompt_omits_stream_block_when_no_file(tmp_path):
+    p = _compose_prompt(
+        stage="design", pid=1234, idle_sec=120, idle_cap_sec=600,
+        stdout_path=tmp_path / "s.log", stderr_path=tmp_path / "e.log",
+        stream_output_file=None,
+    )
+    assert "Stream output file path" not in p
+    assert "Stream output file size_bytes" not in p
+    assert "Stream output file seconds_since_modified" not in p
+
+
+def test_compose_prompt_includes_stream_block_for_existing_file(tmp_path):
+    stream = tmp_path / "out"
+    stream.write_text("a" * 100, encoding="utf-8")
+    p = _compose_prompt(
+        stage="design", pid=1234, idle_sec=120, idle_cap_sec=600,
+        stdout_path=tmp_path / "s.log", stderr_path=tmp_path / "e.log",
+        stream_output_file=stream,
+    )
+    assert f"Stream output file path**: `{stream}`" in p
+    assert "Stream output file size_bytes**: `100`" in p
+    assert "Stream output file seconds_since_modified" in p
+
+
+def test_compose_prompt_includes_stream_block_for_missing_file(tmp_path):
+    # Caller may pass a path that does not yet exist (vendor CLI has
+    # not written its first chunk). The probe should still see the
+    # block so it can reason about "stream never produced anything".
+    stream = tmp_path / "no-such-out"
+    p = _compose_prompt(
+        stage="design", pid=1234, idle_sec=180, idle_cap_sec=600,
+        stdout_path=tmp_path / "s.log", stderr_path=tmp_path / "e.log",
+        stream_output_file=stream,
+    )
+    assert f"Stream output file path**: `{stream}`" in p
+    assert "Stream output file size_bytes**: `0`" in p
+
+
+# ---------- _build_idle_callback wiring ----------
+
+def _build_cb(monkeypatch, **overrides):
+    """Construct an idle-watch callback with reasonable test defaults."""
+    defaults = dict(
+        stage="design",
+        stage_timeout_sec=600,
+        stdout_path=Path("/tmp/.design.stdout.log"),
+        stderr_path=Path("/tmp/.design.stderr.log"),
+        probe_config=PROBE_CONFIG,
+        log_emit=None,
+    )
+    defaults.update(overrides)
+    return subprocess_runner._build_idle_callback(**defaults)
+
+
+def test_idle_callback_below_threshold_skips_probe(monkeypatch, tmp_path):
+    # If run_idle_probe is called we want to know — the callback is
+    # supposed to short-circuit on `idle_sec < IDLE_PROBE_THRESHOLD_SEC`.
+    called = {"n": 0}
+
+    def stub(**kwargs):
+        called["n"] += 1
+        return ProbeVerdict(action="kill", rationale="should not be called")
+
+    monkeypatch.setattr(subprocess_runner, "run_idle_probe", stub)
+    cb = _build_cb(monkeypatch)
+    action = cb(
+        stream_file=tmp_path / "out",
+        idle_sec=subprocess_runner.IDLE_PROBE_THRESHOLD_SEC - 1,
+        elapsed_sec=200.0,
+        pid=4321,
+    )
+    assert action == "continue"
+    assert called["n"] == 0
+
+
+def test_idle_callback_kill_verdict_propagates(monkeypatch, tmp_path):
+    seen_kwargs: dict = {}
+
+    def stub(**kwargs):
+        seen_kwargs.update(kwargs)
+        return ProbeVerdict(action="kill", rationale="wedged")
+
+    monkeypatch.setattr(subprocess_runner, "run_idle_probe", stub)
+    cb = _build_cb(monkeypatch)
+    stream = tmp_path / "out"
+    action = cb(
+        stream_file=stream,
+        idle_sec=subprocess_runner.IDLE_PROBE_THRESHOLD_SEC + 5,
+        elapsed_sec=400.0,
+        pid=4321,
+    )
+    assert action == "kill"
+    assert seen_kwargs["stage"] == "design"
+    assert seen_kwargs["stream_output_file"] == stream
+    assert seen_kwargs["idle_cap_sec"] == 600
+
+
+def test_idle_callback_extend_holds_grace_then_reprobes(monkeypatch, tmp_path):
+    verdicts = [
+        ProbeVerdict(action="extend", extend_sec=120, rationale="working"),
+        ProbeVerdict(action="kill", rationale="now wedged"),
+    ]
+    call_count = {"n": 0}
+
+    def stub(**kwargs):
+        call_count["n"] += 1
+        return verdicts[call_count["n"] - 1]
+
+    monkeypatch.setattr(subprocess_runner, "run_idle_probe", stub)
+
+    # Pin time.monotonic so we can step through the extend window.
+    fake_now = {"t": 1000.0}
+    monkeypatch.setattr(
+        subprocess_runner.time, "monotonic", lambda: fake_now["t"]
+    )
+
+    cb = _build_cb(monkeypatch)
+    above = subprocess_runner.IDLE_PROBE_THRESHOLD_SEC + 5
+
+    # First call: probe says extend 120s → callback returns continue.
+    a1 = cb(stream_file=tmp_path / "out", idle_sec=above, elapsed_sec=400.0, pid=1)
+    assert a1 == "continue"
+    assert call_count["n"] == 1
+
+    # 60s later: still inside the granted 120s window → no probe call.
+    fake_now["t"] += 60
+    a2 = cb(stream_file=tmp_path / "out", idle_sec=above, elapsed_sec=460.0, pid=1)
+    assert a2 == "continue"
+    assert call_count["n"] == 1
+
+    # 121s after extend granted: window elapsed → probe re-invoked, kill.
+    fake_now["t"] += 61
+    a3 = cb(stream_file=tmp_path / "out", idle_sec=above, elapsed_sec=521.0, pid=1)
+    assert a3 == "kill"
+    assert call_count["n"] == 2
+
+
+def test_idle_callback_swallows_probe_exception(monkeypatch, tmp_path):
+    # If the probe machinery itself raises (e.g. a transient OS error
+    # while reading the process tree), we must NOT abort the run.
+    def bad(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(subprocess_runner, "run_idle_probe", bad)
+    cb = _build_cb(monkeypatch)
+    action = cb(
+        stream_file=tmp_path / "out",
+        idle_sec=subprocess_runner.IDLE_PROBE_THRESHOLD_SEC + 5,
+        elapsed_sec=400.0,
+        pid=1,
+    )
+    assert action == "continue"
