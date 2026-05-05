@@ -78,8 +78,10 @@ orchestrator doesn't loop for you.
   there is an active scope item whose description or `prd_ref`
   covers the missing capability. If yes → fix the code under that
   item. If no → record a **blocking deviation with `diagnosis.
-  defective_layer="scope"`** (see Escalation rubric below) so the
-  orchestrator routes a scope/design rerun to add the missing item.
+  defective_layer="design"`** (see Escalation rubric below) so the
+  orchestrator routes a design rerun to add the missing scope item
+  (scope.json, trace.md, test-plan.md, and design.md are all
+  produced by the design stage and travel together).
 
   Example: a close-approval finding cites PRD R1 "operator can
   inspect system state" and the spec admits "CLI exposes only
@@ -147,21 +149,25 @@ orchestrator doesn't loop for you.
       "blocking": true,
       "detail": "...",
       "diagnosis": {
-        "defective_layer": "prd | scope | plan | test-plan | ambiguous",
+        "defective_layer": "prd | design | ambiguous",
         "evidence": "<concrete pointer: PRD §2.1 quote, failing test name, scope item id — ≥16 chars>",
         "proposed_rerun_from": "<layer>"
       }
     }
     ```
-    Choose `defective_layer` honestly:
-    - `scope` — a scope item is wrongly decomposed, redundant, or
-      missing; routing rebuilds scope.json.
-    - `plan` / `test-plan` — trace row has no PRD grounding, or test
-      case is mechanically un-writable against the stated behavior;
-      routing rebuilds trace.md + test-plan.md.
+    `defective_layer` MUST be one of these three literals exactly
+    (case-sensitive); any other value is rejected by the build.json
+    schema validator and will fail the stage:
+    - `design` — the design package (design.md, scope.json, trace.md,
+      test-plan.md — all produced together by the design stage) is
+      wrongly decomposed, redundant, missing a needed scope item, has
+      a trace row without PRD grounding, or has a mechanically
+      un-writable test case. Auto-routes a design rerun.
     - `prd` — PRD itself contradicts itself or omits a necessary
-      invariant. Halts for human (no auto-rerun).
-    - `ambiguous` — you see a defect but can't localize it. Halts.
+      invariant; no design rerun can fix it. Halts for human; PRD
+      amendment required via `autodev update`.
+    - `ambiguous` — you see a defect but cannot localize it to either
+      `design` or `prd`. Halts for human.
     `evidence` must be concrete (quotable, testable). Hand-wavy
     evidence ("plan feels off") will be rejected or fail to produce
     useful rerun prompts.
