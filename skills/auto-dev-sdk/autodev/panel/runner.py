@@ -47,10 +47,17 @@ from autodev.panel.precheck import run_precheck
 from autodev.panel.schemas import synthesizer_output_schema_json
 from autodev.state.hashing import hash_file
 from autodev.state.log import JsonlLog
+from typing import Callable
+
 from autodev.vendors.config import (
+    ProbeConfig,
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
 from autodev.vendors.shared_call import SHARED_VENDORS_DIR, call_shared_vendor
+from autodev.vendors.subprocess_runner import (
+    _build_idle_callback,
+    _hard_backstop_sec,
+)
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -184,14 +191,25 @@ def _read_only_native_args(vendor: str) -> tuple[str, ...]:
 
 
 def _invoke_reviewer(
-    spec: PanelReviewerSpec, prompt: str, timeout_sec: int,
+    spec: PanelReviewerSpec, prompt: str, probe_interval_sec: int,
     *, cwd: Path | None = None,
     context_files: tuple[Path, ...] = (),
+    probe_config: ProbeConfig | None = None,
+    log_emit: Callable[[dict], None] | None = None,
 ) -> ReviewerResult:
-    """Run one reviewer CLI. Captures stdout; empty on failure."""
+    """Run one reviewer CLI. Captures stdout; empty on failure.
+
+    `probe_interval_sec` is the idle-probe threshold (the same field
+    the stage subprocesses use). When `probe_config` is supplied, the
+    polling loop in `call_shared_vendor` consults `run_idle_probe`
+    after this many seconds of stream-output silence; otherwise the
+    legacy blocking path is used and the same value backs the bash
+    wall-clock timeout.
+    """
     import time
     fake = os.environ.get(FAKE_INVOKER_ENV)
     t0 = time.monotonic()
+    timeout_sec = probe_interval_sec  # for fake-mode subprocess + error messages
     try:
         if fake:
             env = os.environ.copy()
@@ -203,16 +221,34 @@ def _invoke_reviewer(
                 env=env, timeout=timeout_sec,
             )
         else:
+            idle_callback = (
+                _build_idle_callback(
+                    stage=f"panel-reviewer-{spec.vendor}",
+                    stage_probe_interval_sec=probe_interval_sec,
+                    stdout_path=Path("/dev/null"),
+                    stderr_path=Path("/dev/null"),
+                    probe_config=probe_config,
+                    log_emit=log_emit,
+                )
+                if probe_config is not None
+                else None
+            )
+            hard_backstop = (
+                _hard_backstop_sec(probe_interval_sec)
+                if probe_config is not None
+                else probe_interval_sec
+            )
             result = call_shared_vendor(
                 vendor=spec.vendor,
                 model=spec.model,
                 prompt=prompt,
                 output_id=f"reviewer-{spec.vendor}",
-                timeout_sec=timeout_sec,
+                timeout_sec=hard_backstop,
                 cwd=cwd,
                 effort=spec.effort,
                 context_files=context_files,
                 native_args=_read_only_native_args(spec.vendor),
+                idle_callback=idle_callback,
             )
             elapsed = time.monotonic() - t0
             if result.returncode != 0:
@@ -298,17 +334,24 @@ def _compose_synthesizer_prompt(
     return out
 
 def _invoke_synthesizer(
-    spec: PanelSynthesizerSpec, prompt: str, timeout_sec: int,
+    spec: PanelSynthesizerSpec, prompt: str, probe_interval_sec: int,
     *, cwd: Path | None = None,
     debug_dir: Path | None = None,
+    probe_config: ProbeConfig | None = None,
+    log_emit: Callable[[dict], None] | None = None,
 ) -> tuple[bool, dict | None, str]:
     """Run the synthesizer CLI with native JSON-schema output.
 
     Returns (ok, parsed_dict, failure_detail). parsed_dict is the
     schema-validated synthesizer output, or None on failure.
+
+    `probe_interval_sec` semantics match `_invoke_reviewer`: probe
+    consultation threshold when `probe_config` is supplied, otherwise
+    a wall-clock cap.
     """
     fake = os.environ.get(FAKE_INVOKER_ENV)
     schema_json = synthesizer_output_schema_json()
+    timeout_sec = probe_interval_sec  # for fake-mode subprocess + error messages
     try:
         if fake:
             env = os.environ.copy()
@@ -336,16 +379,34 @@ def _invoke_synthesizer(
                 "synthesizer vendor 'gemini' not supported: gemini CLI has no "
                 "native JSON-schema enforcement"
             )
+        idle_callback = (
+            _build_idle_callback(
+                stage=f"panel-synthesizer-{spec.vendor}",
+                stage_probe_interval_sec=probe_interval_sec,
+                stdout_path=Path("/dev/null"),
+                stderr_path=Path("/dev/null"),
+                probe_config=probe_config,
+                log_emit=log_emit,
+            )
+            if probe_config is not None
+            else None
+        )
+        hard_backstop = (
+            _hard_backstop_sec(probe_interval_sec)
+            if probe_config is not None
+            else probe_interval_sec
+        )
         result = call_shared_vendor(
             vendor=spec.vendor,
             model=spec.model,
             prompt=prompt,
             output_id="synthesizer",
-            timeout_sec=timeout_sec,
+            timeout_sec=hard_backstop,
             cwd=cwd,
             effort=spec.effort,
             schema_json=schema_json,
             native_args=_read_only_native_args(spec.vendor),
+            idle_callback=idle_callback,
         )
         if result.returncode != 0:
             if result.timed_out:
@@ -552,6 +613,8 @@ def run_panel_gate_internal(
     consulted_docs: list[dict],
     panel_config: PanelConfig,
     repo_root: Path | None = None,
+    probe_config: ProbeConfig | None = None,
+    log_emit: Callable[[dict], None] | None = None,
 ) -> PanelVerdict:
     """G15 main entry: dispatch reviewers, synthesize, write verdict.
 
@@ -604,9 +667,11 @@ def run_panel_gate_internal(
                 _invoke_reviewer,
                 r,
                 reviewer_prompt,
-                cfg.reviewer_timeout_sec,
+                cfg.reviewer_probe_interval_sec,
                 cwd=vendor_cwd,
                 context_files=reviewer_context_files,
+                probe_config=probe_config,
+                log_emit=log_emit,
             ): r
             for r in cfg.reviewers
         }
@@ -659,9 +724,11 @@ def run_panel_gate_internal(
     )
 
     synth_ok, synth_parsed, synth_detail = _invoke_synthesizer(
-        cfg.synthesizer, synth_prompt, cfg.synthesizer_timeout_sec,
+        cfg.synthesizer, synth_prompt, cfg.synthesizer_probe_interval_sec,
         cwd=vendor_cwd,
         debug_dir=feature_active,
+        probe_config=probe_config,
+        log_emit=log_emit,
     )
 
     findings: list[PanelFinding] = []

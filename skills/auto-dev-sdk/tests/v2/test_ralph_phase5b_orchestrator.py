@@ -221,7 +221,7 @@ def _orch(repo_root: Path, vendor_bin: Path) -> Orchestrator:
     vendors = VendorsConfig(
         path=repo_root / "vendors.yml",
         stages={
-            s: StageSpec(stage=s, vendor="claude", model="fake", timeout_sec=30)
+            s: StageSpec(stage=s, vendor="claude", model="fake", probe_interval_sec=30)
             for s in STAGES
         },
         panel=PanelConfig(

@@ -78,7 +78,12 @@ class StageSpec:
     stage: str
     vendor: str
     model: str
-    timeout_sec: int = DEFAULT_TIMEOUT_SEC
+    # Probe-check interval: how long the stream output file may be
+    # silent before the harness consults the idle probe. NOT a hard
+    # wall-clock cap on the stage; the bash watchdog and Python wait
+    # deadline are derived from this as a generous multiple in
+    # subprocess_runner.
+    probe_interval_sec: int = DEFAULT_TIMEOUT_SEC
     effort: str = ""
     flags: tuple[str, ...] = ()
 
@@ -101,8 +106,12 @@ class PanelSynthesizerSpec:
 class PanelConfig:
     reviewers: tuple[PanelReviewerSpec, ...]
     synthesizer: PanelSynthesizerSpec
-    reviewer_timeout_sec: int = DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC
-    synthesizer_timeout_sec: int = DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
+    # Probe-check intervals: how long the panel reviewer / synthesizer
+    # subprocess may be silent on its stream output before the harness
+    # consults the idle probe. Hard wall-clock backstop is derived as a
+    # generous multiple in panel/runner.
+    reviewer_probe_interval_sec: int = DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC
+    synthesizer_probe_interval_sec: int = DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
 
 
 @dataclass(frozen=True)
@@ -153,8 +162,14 @@ def _validate_raw(raw: Any, path: Path) -> dict[str, dict[str, Any]]:
             )
         if not isinstance(entry["model"], str) or not entry["model"].strip():
             raise ConfigError(f"{path}: stages.{s}.model must be non-empty string")
-        if "timeout_sec" in entry and not isinstance(entry["timeout_sec"], int):
-            raise ConfigError(f"{path}: stages.{s}.timeout_sec must be int")
+        if "probe_interval_sec" in entry and not isinstance(entry["probe_interval_sec"], int):
+            raise ConfigError(f"{path}: stages.{s}.probe_interval_sec must be int")
+        if "timeout_sec" in entry:
+            raise ConfigError(
+                f"{path}: stages.{s}.timeout_sec is deprecated; rename to "
+                f"`probe_interval_sec` (idle threshold for the probe). The "
+                f"hard wall-clock cap is derived in subprocess_runner."
+            )
         if "effort" in entry:
             entry["effort"] = _normalize_effort_value(
                 entry["effort"], path=path, field=f"stages.{s}.effort"
@@ -240,14 +255,25 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
             raise ConfigError(f"{path}: panel.{key} must be int")
         return val
 
+    for old, new in (
+        ("reviewer_timeout_sec", "reviewer_probe_interval_sec"),
+        ("synthesizer_timeout_sec", "synthesizer_probe_interval_sec"),
+    ):
+        if old in raw:
+            raise ConfigError(
+                f"{path}: panel.{old} is deprecated; rename to "
+                f"`{new}` (idle threshold for the probe). The hard "
+                f"wall-clock cap is derived in panel/runner."
+            )
+
     return PanelConfig(
         reviewers=reviewers,
         synthesizer=synthesizer,
-        reviewer_timeout_sec=_int_field(
-            "reviewer_timeout_sec", DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC
+        reviewer_probe_interval_sec=_int_field(
+            "reviewer_probe_interval_sec", DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC
         ),
-        synthesizer_timeout_sec=_int_field(
-            "synthesizer_timeout_sec", DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
+        synthesizer_probe_interval_sec=_int_field(
+            "synthesizer_probe_interval_sec", DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
         ),
     )
 
@@ -309,7 +335,7 @@ def load_vendors_config(path: Path) -> VendorsConfig:
             stage=stage_name,
             vendor=entry["vendor"],
             model=entry["model"],
-            timeout_sec=entry.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
+            probe_interval_sec=entry.get("probe_interval_sec", DEFAULT_TIMEOUT_SEC),
             effort=entry.get("effort", ""),
             flags=flags_tuple,
         )

@@ -68,7 +68,7 @@ def test_live_scope_stage_completes_fast(live_git_repo):
             s: StageSpec(
                 stage=s,
                 vendor="claude", model="claude-sonnet-4-6",
-                timeout_sec=60,
+                probe_interval_sec=60,
             ) for s in STAGES
         },
         panel=PanelConfig(

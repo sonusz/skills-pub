@@ -26,7 +26,7 @@ def _vendors_for_test(tmp_path) -> VendorsConfig:
     return VendorsConfig(
         path=tmp_path / "vendors.yml",
         stages={
-            s: StageSpec(stage=s, vendor="claude", model="fake-model", timeout_sec=30)
+            s: StageSpec(stage=s, vendor="claude", model="fake-model", probe_interval_sec=30)
             for s in STAGES
         },
         panel=PanelConfig(

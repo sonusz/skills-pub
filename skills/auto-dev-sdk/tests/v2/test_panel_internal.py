@@ -46,8 +46,8 @@ def panel_config():
             PanelReviewerSpec(vendor="codex", model="fake-codex"),
         ),
         synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake-sonnet"),
-        reviewer_timeout_sec=10,
-        synthesizer_timeout_sec=10,
+        reviewer_probe_interval_sec=10,
+        synthesizer_probe_interval_sec=10,
     )
 
 
@@ -187,7 +187,7 @@ def test_compose_synthesizer_prompt_does_not_truncate_or_inline_artifact(feature
 def test_reviewer_invocation_via_fake(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
     spec = PanelReviewerSpec(vendor="claude", model="fake")
-    r = _invoke_reviewer(spec, "test prompt", timeout_sec=10)
+    r = _invoke_reviewer(spec, "test prompt", probe_interval_sec=10)
     assert r.ok
     assert "Verdict: pass" in r.output
 
@@ -195,7 +195,7 @@ def test_reviewer_invocation_via_fake(fake_invoker, monkeypatch):
 def test_reviewer_empty_output_marked_not_ok(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
     spec = PanelReviewerSpec(vendor="gemini", model="fake")
-    r = _invoke_reviewer(spec, "test prompt", timeout_sec=10)
+    r = _invoke_reviewer(spec, "test prompt", probe_interval_sec=10)
     assert not r.ok
     assert r.output == ""
     assert "empty" in r.failure_detail.lower()
@@ -204,7 +204,7 @@ def test_reviewer_empty_output_marked_not_ok(fake_invoker, monkeypatch):
 def test_reviewer_timeout(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_timeout")
     spec = PanelReviewerSpec(vendor="codex", model="fake")
-    r = _invoke_reviewer(spec, "test prompt", timeout_sec=2)
+    r = _invoke_reviewer(spec, "test prompt", probe_interval_sec=2)
     assert not r.ok
     assert "timeout" in r.failure_detail.lower()
 
@@ -212,7 +212,7 @@ def test_reviewer_timeout(fake_invoker, monkeypatch):
 def test_synthesizer_pass(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "synth_pass")
     spec = PanelSynthesizerSpec(vendor="claude", model="fake")
-    ok, parsed, detail = _invoke_synthesizer(spec, "prompt", timeout_sec=10)
+    ok, parsed, detail = _invoke_synthesizer(spec, "prompt", probe_interval_sec=10)
     assert ok, detail
     assert "per_reviewer" in parsed
     assert all(e["verdict"] == "pass" for e in parsed["per_reviewer"])
@@ -221,7 +221,7 @@ def test_synthesizer_pass(fake_invoker, monkeypatch):
 def test_synthesizer_malformed_triggers_failure(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "synth_empty")
     spec = PanelSynthesizerSpec(vendor="claude", model="fake")
-    ok, parsed, detail = _invoke_synthesizer(spec, "prompt", timeout_sec=10)
+    ok, parsed, detail = _invoke_synthesizer(spec, "prompt", probe_interval_sec=10)
     assert not ok
     assert parsed is None
     assert "json" in detail.lower()

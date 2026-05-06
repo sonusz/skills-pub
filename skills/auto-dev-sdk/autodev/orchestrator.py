@@ -332,6 +332,13 @@ class Orchestrator:
                 feature=feature,
                 primary_artifact=primary,
                 panel_config=self.cfg.vendors.panel,
+                probe_config=self.cfg.vendors.probe,
+                log_emit=lambda d: logger.emit(
+                    stage=d.get("stage", "gate"),
+                    event=d.get("event", "panel"),
+                    feature=feature,
+                    detail=d,
+                ),
             )
         else:
             v = existing

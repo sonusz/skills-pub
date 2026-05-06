@@ -79,6 +79,8 @@ def run_panel_gate(
     feature: str,
     primary_artifact: Path,
     panel_config: PanelConfig | None = None,
+    probe_config: "ProbeConfig | None" = None,
+    log_emit: "Callable[[dict], None] | None" = None,
 ) -> PanelVerdict:
     """Invoke the panel for one gate; write panel-verdict.json."""
     p_prompt = prompt_path(gate)
@@ -172,6 +174,8 @@ def run_panel_gate(
         consulted_docs=consulted_docs,
         panel_config=panel_config,
         repo_root=repo_root,
+        probe_config=probe_config,
+        log_emit=log_emit,
     )
 
 

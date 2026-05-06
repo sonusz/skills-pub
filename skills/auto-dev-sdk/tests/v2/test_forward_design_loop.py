@@ -181,8 +181,8 @@ def _panel_config() -> PanelConfig:
             PanelReviewerSpec(vendor="codex", model="fake"),
         ),
         synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake"),
-        reviewer_timeout_sec=10,
-        synthesizer_timeout_sec=10,
+        reviewer_probe_interval_sec=10,
+        synthesizer_probe_interval_sec=10,
     )
 
 

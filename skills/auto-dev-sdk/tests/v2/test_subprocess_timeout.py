@@ -24,7 +24,7 @@ def test_subprocess_timeout_produces_failure_json(git_repo, feature_active, monk
 
     spec = StageSpec(
         stage="scope", vendor="claude", model="fake",
-        timeout_sec=2,  # very short for test
+        probe_interval_sec=2,  # very short for test
     )
 
     result = run_stage_subprocess(
@@ -89,7 +89,7 @@ def test_stage_effort_field_passed_to_shared_vendor(
 
     monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
     spec = StageSpec(
-        stage="build", vendor="claude", model="fake", timeout_sec=30, effort="xhigh"
+        stage="build", vendor="claude", model="fake", probe_interval_sec=30, effort="xhigh"
     )
 
     result = run_stage_subprocess(

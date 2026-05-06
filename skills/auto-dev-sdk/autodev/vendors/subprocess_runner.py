@@ -24,16 +24,23 @@ from autodev.vendors.shared_call import (
 
 SIGKILL_GRACE_SEC = 30
 STDERR_TAIL_BYTES = 4096
-# Idle-timeout semantics: `timeout_sec` is interpreted as the maximum
-# wall-clock interval between stream-output activity (the streaming
-# token file written by the vendor CLI). A subagent that keeps
-# streaming runs indefinitely; one whose stream output file has been
-# silent for at least IDLE_PROBE_THRESHOLD_SEC triggers an LLM probe,
-# which decides extend vs kill. Polling cadence is set by
-# IDLE_POLL_INTERVAL_SEC and the callback is consulted at every poll
-# whether or not idle has crossed the threshold.
+# Idle-timeout semantics: each StageSpec carries `probe_interval_sec`
+# (the per-stage idle threshold for probe consultation). When the
+# vendor's stream output file has been silent for that many seconds,
+# the harness invokes the idle probe LLM, which decides extend vs
+# kill. Polling cadence is set by IDLE_POLL_INTERVAL_SEC; the bash
+# watchdog and Python wait deadline are derived as a generous
+# multiple of probe_interval_sec (HARD_BACKSTOP_MULTIPLIER) with an
+# absolute floor (HARD_BACKSTOP_FLOOR_SEC) so the probe path is the
+# operative timeout mechanism and the bash side is just a last-resort
+# safety net.
 IDLE_POLL_INTERVAL_SEC = 5
-IDLE_PROBE_THRESHOLD_SEC = 60
+HARD_BACKSTOP_MULTIPLIER = 5
+HARD_BACKSTOP_FLOOR_SEC = 28800  # 8 hours
+
+
+def _hard_backstop_sec(probe_interval_sec: int) -> int:
+    return max(probe_interval_sec * HARD_BACKSTOP_MULTIPLIER, HARD_BACKSTOP_FLOOR_SEC)
 
 
 @dataclass
@@ -98,11 +105,14 @@ def run_stage_subprocess(
     effort = stage_spec.effort or flags_effort
     model = model_override or stage_spec.model
 
+    hard_backstop_sec = _hard_backstop_sec(stage_spec.probe_interval_sec)
+
     if log_emit:
         log_emit({"event": "subprocess-start", "stage": stage,
                   "vendor": stage_spec.vendor, "model": model,
                   "effort": effort or "<default>",
-                  "timeout_sec": stage_spec.timeout_sec})
+                  "probe_interval_sec": stage_spec.probe_interval_sec,
+                  "hard_backstop_sec": hard_backstop_sec})
 
     start = time.monotonic()
     subprocess_reaped = False
@@ -113,7 +123,7 @@ def run_stage_subprocess(
     idle_callback = (
         _build_idle_callback(
             stage=stage,
-            stage_timeout_sec=stage_spec.timeout_sec,
+            stage_probe_interval_sec=stage_spec.probe_interval_sec,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             probe_config=probe_config,
@@ -128,7 +138,7 @@ def run_stage_subprocess(
             model=model,
             prompt=prompt + (extra_stdin or ""),
             output_id=stage,
-            timeout_sec=stage_spec.timeout_sec,
+            timeout_sec=hard_backstop_sec,
             cwd=cwd,
             effort=effort,
             yolo=True,
@@ -153,8 +163,9 @@ def run_stage_subprocess(
         if result.timed_out:
             failure_kind = "timeout"
             failure_detail = (
-                f"vendor call timed out after {stage_spec.timeout_sec}s "
-                f"through shared vendors"
+                f"vendor call killed (probe-driven idle threshold "
+                f"{stage_spec.probe_interval_sec}s, hard backstop "
+                f"{hard_backstop_sec}s) through shared vendors"
             )
     except KeyboardInterrupt:
         failure_kind = "interrupted"
@@ -229,7 +240,7 @@ def run_stage_subprocess(
 def _build_idle_callback(
     *,
     stage: str,
-    stage_timeout_sec: int,
+    stage_probe_interval_sec: int,
     stdout_path: Path,
     stderr_path: Path,
     probe_config: ProbeConfig,
@@ -238,18 +249,23 @@ def _build_idle_callback(
     """Construct the idle-watch callback `call_shared_vendor` will poll.
 
     Behavior:
-    - When the stream output file has been silent < IDLE_PROBE_THRESHOLD_SEC,
-      return "continue" without spending a probe call.
+    - When the stream output file has been silent
+      < `stage_probe_interval_sec`, return "continue" without spending
+      a probe call.
     - When the threshold is crossed, ask `run_idle_probe`. A `kill`
       verdict returns "kill" (call_shared_vendor unwinds the proc);
       an `extend` verdict returns "continue" and we wait at least
       `extend_sec` before invoking the probe again, so we honor the
       probe's grace grant without hammering it.
+
+    The probe verdict object is logged with full raw output (truncated
+    to 800 chars) so a false-positive kill leaves enough trail to
+    diagnose without re-running.
     """
     state: dict[str, float] = {"next_probe_at": 0.0}
 
     def cb(*, stream_file: Path, idle_sec: float, elapsed_sec: float, pid: int) -> IdleAction:
-        if idle_sec < IDLE_PROBE_THRESHOLD_SEC:
+        if idle_sec < stage_probe_interval_sec:
             return "continue"
         now = time.monotonic()
         if now < state["next_probe_at"]:
@@ -261,7 +277,7 @@ def _build_idle_callback(
                 stage=stage,
                 pid=pid,
                 idle_sec=int(idle_sec),
-                idle_cap_sec=stage_timeout_sec,
+                idle_cap_sec=stage_probe_interval_sec,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 probe_config=probe_config,
@@ -282,6 +298,7 @@ def _build_idle_callback(
                 "idle_sec": int(idle_sec),
                 "elapsed_sec": int(elapsed_sec),
                 "rationale": verdict.rationale[:200],
+                "raw_output": verdict.raw_output[:800],
             })
         if verdict.action == "kill":
             return "kill"

@@ -286,11 +286,14 @@ def test_compose_prompt_includes_stream_block_for_missing_file(tmp_path):
 
 # ---------- _build_idle_callback wiring ----------
 
+_TEST_PROBE_INTERVAL_SEC = 600
+
+
 def _build_cb(monkeypatch, **overrides):
     """Construct an idle-watch callback with reasonable test defaults."""
     defaults = dict(
         stage="design",
-        stage_timeout_sec=600,
+        stage_probe_interval_sec=_TEST_PROBE_INTERVAL_SEC,
         stdout_path=Path("/tmp/.design.stdout.log"),
         stderr_path=Path("/tmp/.design.stderr.log"),
         probe_config=PROBE_CONFIG,
@@ -301,8 +304,8 @@ def _build_cb(monkeypatch, **overrides):
 
 
 def test_idle_callback_below_threshold_skips_probe(monkeypatch, tmp_path):
-    # If run_idle_probe is called we want to know — the callback is
-    # supposed to short-circuit on `idle_sec < IDLE_PROBE_THRESHOLD_SEC`.
+    # The callback short-circuits when idle_sec < the per-stage
+    # probe_interval_sec; it must NOT spend a probe call in that case.
     called = {"n": 0}
 
     def stub(**kwargs):
@@ -313,7 +316,7 @@ def test_idle_callback_below_threshold_skips_probe(monkeypatch, tmp_path):
     cb = _build_cb(monkeypatch)
     action = cb(
         stream_file=tmp_path / "out",
-        idle_sec=subprocess_runner.IDLE_PROBE_THRESHOLD_SEC - 1,
+        idle_sec=_TEST_PROBE_INTERVAL_SEC - 1,
         elapsed_sec=200.0,
         pid=4321,
     )
@@ -333,14 +336,14 @@ def test_idle_callback_kill_verdict_propagates(monkeypatch, tmp_path):
     stream = tmp_path / "out"
     action = cb(
         stream_file=stream,
-        idle_sec=subprocess_runner.IDLE_PROBE_THRESHOLD_SEC + 5,
+        idle_sec=_TEST_PROBE_INTERVAL_SEC + 5,
         elapsed_sec=400.0,
         pid=4321,
     )
     assert action == "kill"
     assert seen_kwargs["stage"] == "design"
     assert seen_kwargs["stream_output_file"] == stream
-    assert seen_kwargs["idle_cap_sec"] == 600
+    assert seen_kwargs["idle_cap_sec"] == _TEST_PROBE_INTERVAL_SEC
 
 
 def test_idle_callback_extend_holds_grace_then_reprobes(monkeypatch, tmp_path):
@@ -363,7 +366,7 @@ def test_idle_callback_extend_holds_grace_then_reprobes(monkeypatch, tmp_path):
     )
 
     cb = _build_cb(monkeypatch)
-    above = subprocess_runner.IDLE_PROBE_THRESHOLD_SEC + 5
+    above = _TEST_PROBE_INTERVAL_SEC + 5
 
     # First call: probe says extend 120s → callback returns continue.
     a1 = cb(stream_file=tmp_path / "out", idle_sec=above, elapsed_sec=400.0, pid=1)
@@ -393,7 +396,7 @@ def test_idle_callback_swallows_probe_exception(monkeypatch, tmp_path):
     cb = _build_cb(monkeypatch)
     action = cb(
         stream_file=tmp_path / "out",
-        idle_sec=subprocess_runner.IDLE_PROBE_THRESHOLD_SEC + 5,
+        idle_sec=_TEST_PROBE_INTERVAL_SEC + 5,
         elapsed_sec=400.0,
         pid=1,
     )
