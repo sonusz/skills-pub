@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test for the shared vendors module without real model calls.
 #
-# Exercises the cross-vendor fan-out contract: three separate callers each make
-# one call to all three configured vendors, for three total calls and nine
+# Exercises the cross-vendor fan-out contract: four separate callers each make
+# one call to all four configured vendors, for four total calls and sixteen
 # vendor outputs.
 set -eo pipefail
 
@@ -220,9 +220,111 @@ else
 fi
 FAKE_GEMINI
 
-chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/gemini"
+cat > "$BIN_DIR/cursor-agent" <<'FAKE_CURSOR'
+#!/usr/bin/env bash
+print=0
+format=""
+prompt=""
+seen_dashdash=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p|--print)
+      print=1
+      shift
+      ;;
+    --output-format)
+      format="${2-}"
+      shift 2
+      ;;
+    --output-format=*)
+      format="${1#*=}"
+      shift
+      ;;
+    --model|--api-key|-H|--header|--mode|--resume|--sandbox|--workspace|-w|--worktree|--worktree-base)
+      shift 2
+      ;;
+    --yolo|-f|--force|--continue|--plan|--list-models|--approve-mcps|--trust|--skip-worktree-setup|--stream-partial-output|-v|--version|-h|--help)
+      shift
+      ;;
+    --)
+      seen_dashdash=1
+      shift
+      prompt="$*"
+      break
+      ;;
+    *)
+      if [ "$seen_dashdash" = "0" ]; then
+        prompt="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+if [ -z "$prompt" ] && [ ! -t 0 ]; then
+  prompt=$(cat)
+fi
+if [ "$print" != "1" ]; then
+  printf "fake cursor-agent requires --print in headless smoke mode\n" >&2
+  exit 2
+fi
+if printf "%s" "$prompt" | grep -qi 'single word READY'; then
+  response="READY"
+else
+  response="cursor received: $prompt"
+fi
+if [ "$format" = "stream-json" ]; then
+  python3 - "$response" <<'PY'
+import json
+import sys
 
-for caller in openai claude gemini; do
+response = sys.argv[1]
+print(json.dumps({"type": "system", "subtype": "init", "model": "fake-cursor"}))
+print(json.dumps({
+    "type": "user",
+    "message": {"role": "user", "content": [{"type": "text", "text": "fake-prompt"}]},
+}))
+print(json.dumps({
+    "type": "assistant",
+    "message": {"role": "assistant", "content": [{"type": "text", "text": response}]},
+}))
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": response,
+    "usage": {
+        "inputTokens": 117,
+        "outputTokens": 23,
+        "cacheReadTokens": 5081,
+        "cacheWriteTokens": 1024,
+    },
+}))
+PY
+elif [ "$format" = "json" ]; then
+  python3 - "$response" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": sys.argv[1],
+    "usage": {
+        "inputTokens": 117,
+        "outputTokens": 23,
+        "cacheReadTokens": 5081,
+        "cacheWriteTokens": 1024,
+    },
+}))
+PY
+else
+  printf "%s\n" "$response"
+fi
+FAKE_CURSOR
+
+chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/gemini" "$BIN_DIR/cursor-agent"
+
+for caller in openai claude gemini cursor; do
   call_dir="$RUN_ROOT/$caller"
   mkdir -p "$call_dir"
 
@@ -230,11 +332,12 @@ for caller in openai claude gemini; do
     --vendor OpenAI \
     --vendor Claude \
     --vendor Gemini \
-    --prompt "caller=$caller fan out to openai, claude, gemini" \
+    --vendor Cursor \
+    --prompt "caller=$caller fan out to openai, claude, gemini, cursor" \
     --output-dir "$call_dir" \
-    --min-success 3 >/dev/null
+    --min-success 4 >/dev/null
 
-  for vendor in openai claude gemini; do
+  for vendor in openai claude gemini cursor; do
     for suffix in out status usage.json; do
       file="$call_dir/$vendor/$suffix"
       if [ ! -s "$file" ]; then
@@ -361,6 +464,43 @@ if ! grep -q -- '--output-format json' "$dry_dir/gemini-json-output/log" \
   exit 1
 fi
 
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor Cursor \
+  --prompt "dry run cursor yolo mapping" \
+  --output-dir "$dry_dir" \
+  --id cursor-yolo \
+  --yolo \
+  --dry-run >/dev/null
+
+if ! grep -q -- '--yolo' "$dry_dir/cursor-yolo/log"; then
+  printf "FAIL: expected Cursor yolo dry-run to use --yolo\n" >&2
+  cat "$dry_dir/cursor-yolo/log" >&2
+  exit 1
+fi
+if ! grep -q -- '--output-format stream-json' "$dry_dir/cursor-yolo/log" \
+    || ! grep -q -- '-p ' "$dry_dir/cursor-yolo/log" \
+    || ! grep -q -- '--trust' "$dry_dir/cursor-yolo/log"; then
+  printf "FAIL: expected Cursor default dry-run to use -p --trust + stream-json headless mode\n" >&2
+  cat "$dry_dir/cursor-yolo/log" >&2
+  exit 1
+fi
+
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor Cursor \
+  --prompt "dry run cursor explicit json output" \
+  --output-dir "$dry_dir" \
+  --id cursor-json-output \
+  --native-arg --output-format \
+  --native-arg json \
+  --dry-run >/dev/null
+
+if ! grep -q -- '--output-format json' "$dry_dir/cursor-json-output/log" \
+    || grep -q -- '--output-format stream-json' "$dry_dir/cursor-json-output/log"; then
+  printf "FAIL: expected explicit Cursor output-format json to suppress stream-json defaults\n" >&2
+  cat "$dry_dir/cursor-json-output/log" >&2
+  exit 1
+fi
+
 expected_effort() {
   case "$1:$2" in
     OpenAI:min|OpenAI:low) printf "low\n" ;;
@@ -373,6 +513,7 @@ expected_effort() {
     Claude:xhigh) printf "xhigh\n" ;;
     Claude:max) printf "max\n" ;;
     Gemini:*) printf "<default>\n" ;;
+    Cursor:*) printf "<default>\n" ;;
     *) printf "unknown\n" ;;
   esac
 }
@@ -381,7 +522,7 @@ lower() {
   printf "%s" "$1" | tr '[:upper:]' '[:lower:]'
 }
 
-for effort_vendor in OpenAI Claude Gemini; do
+for effort_vendor in OpenAI Claude Gemini Cursor; do
   for effort in min low medium high xhigh max; do
     effort_id="effort-$(lower "$effort_vendor")-$effort"
     PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
@@ -485,6 +626,26 @@ if ! grep -q '"structured_output"' "$schema_dir/claude-schema/out" \
   exit 1
 fi
 
+cursor_schema_dir="$RUN_ROOT/cursor-schema-rejected"
+mkdir -p "$cursor_schema_dir"
+cursor_schema_log="$WORK/cursor-schema-reject.log"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Cursor \
+    --prompt "schema rejection probe" \
+    --schema-file "$schema_file" \
+    --output-dir "$cursor_schema_dir" \
+    --id cursor-schema \
+    --min-success 1 >"$cursor_schema_log" 2>&1; then
+  printf "FAIL: expected --schema-file with Cursor to be rejected\n" >&2
+  cat "$cursor_schema_log" >&2
+  exit 1
+fi
+if ! grep -q -- '--schema-file is not supported on cursor' "$cursor_schema_log"; then
+  printf "FAIL: expected Cursor schema rejection message\n" >&2
+  cat "$cursor_schema_log" >&2
+  exit 1
+fi
+
 dup_dir="$RUN_ROOT/duplicate-openai"
 mkdir -p "$dup_dir"
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
@@ -505,4 +666,4 @@ for id in openai openai-2; do
   fi
 done
 
-printf "OK: vendors smoke test passed (3 calls x 3 vendors + duplicate vendor)\n"
+printf "OK: vendors smoke test passed (4 calls x 4 vendors + duplicate vendor + schema rejects)\n"

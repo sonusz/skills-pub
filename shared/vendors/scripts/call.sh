@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: call.sh --vendor openai|claude|gemini [--vendor ...] [options] [prompt]
+# Usage: call.sh --vendor openai|claude|gemini|cursor [--vendor ...] [options] [prompt]
 #
 # Unified vendor interface. A single --vendor behaves like a normal CLI call;
 # repeated --vendor values fan the same prompt out in parallel.
@@ -12,10 +12,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/call.sh --vendor openai|claude|gemini [--vendor NAME...] [options] [prompt]
+  scripts/call.sh --vendor openai|claude|gemini|cursor [--vendor NAME...] [options] [prompt]
 
 Vendor selection:
-  --vendor NAME                  openai, claude, or gemini; repeatable
+  --vendor NAME                  openai, claude, gemini, or cursor; repeatable
   --min-success N                Required successful calls. Default: all selected
 
 Output:
@@ -34,7 +34,7 @@ Selection hints:
                                  Output lands at <output-dir>/<id>/out as
                                  {"structured_output": <conforming-object>}.
                                  Supported on claude and openai (codex).
-                                 gemini does not enforce schemas natively.
+                                 gemini and cursor do not enforce schemas natively.
 
 Prompt and instruction input:
   --prompt TEXT                  Prompt text; repeatable
@@ -412,9 +412,11 @@ if [ -n "$VENDORS_SCHEMA_FILE" ]; then
   fi
   VENDORS_SCHEMA_FILE="$(cd "$(dirname "$VENDORS_SCHEMA_FILE")" && pwd)/$(basename "$VENDORS_SCHEMA_FILE")"
   for vid in "${VENDOR_IDS[@]}"; do
-    if [ "$vid" = "gemini" ]; then
-      die "--schema-file is not supported on gemini; the gemini CLI has no native schema enforcement"
-    fi
+    case "$vid" in
+      gemini|cursor)
+        die "--schema-file is not supported on $vid; the $vid CLI has no native schema enforcement"
+        ;;
+    esac
   done
   export VENDORS_SCHEMA_FILE
 fi

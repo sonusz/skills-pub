@@ -66,6 +66,12 @@ The per-vendor transport is deliberately different:
   message with `--output-last-message`.
 - Claude runs in print mode and reads the prompt from stdin.
 - Gemini receives `--prompt` and runs with stdin redirected from `/dev/null`.
+- Cursor receives the prompt as a positional argument after `--`, runs with
+  `cursor-agent -p --trust --output-format stream-json`, and has stdin
+  redirected from `/dev/null`. `--trust` is required because every fresh cwd
+  otherwise blocks on a workspace-trust prompt with no headless answer. The
+  launcher parses the terminal `result` event for the assistant text and the
+  `usage` payload.
 
 Do not pass prompts through raw native args unless you are intentionally
 debugging a vendor CLI. That bypasses the stable module contract.
@@ -109,6 +115,31 @@ Fix: the launcher passes the prompt via `--prompt` and redirects stdin from
 `/dev/null`. If this regresses, `doctor.sh` or `hello-test.sh` usually fails by
 timeout rather than producing a useful error message.
 
+### Cursor Reports `Not authenticated` Or Hangs On First Probe
+
+Cause: `cursor-agent` requires either an active local login or
+`CURSOR_API_KEY`. A fresh machine with neither will fail the doctor probe with
+an authentication error in `<output-dir>/cursor/out`; an expired interactive
+session can occasionally hang while cursor-agent attempts to refresh.
+
+Fix: run `cursor-agent login` once in a normal shell (browser-based OAuth) and
+re-run the doctor. For headless / CI environments, export
+`CURSOR_API_KEY=cursor_…` before invoking the wrapper. The shared launcher
+deliberately does not push credentials through `--api-key` per call so each
+machine's auth state stays out of source.
+
+### Cursor Model ID Was Renamed Or Removed
+
+Cause: Cursor periodically rotates model ids (a `composer-3-fast` may replace
+`composer-2-fast`, a `claude-4.7-…` may replace `claude-4.6-…`, etc.). When the
+pinned `cursor.model=` no longer resolves on the account, `cursor-agent` returns
+a model-not-found error in `<output-dir>/cursor/out`.
+
+Fix: run `cursor-agent --list-models` to see what the account currently
+exposes, update `cursor.model=` in `vendors.conf` to a current id, and re-run
+the doctor. `cursor.model=auto` lets the server pick if you would rather not
+pin; you trade a stable id in logs for resilience to renames.
+
 ### Codex Succeeds But `out` Is Empty
 
 Cause: Codex may emit a transcript without writing the
@@ -124,9 +155,9 @@ Cause: ordinary autonomous mode was not enough for the outer Codex agent to
 execute the nested command in this environment.
 
 Fix: nested real tests pass `--yolo` to the outer call. The shared launcher maps
-that to Codex approval bypass, Claude `bypassPermissions`, or Gemini `--yolo`.
-This is only appropriate for explicit nested command-execution tests, not
-routine vendor calls.
+that to Codex approval bypass, Claude `bypassPermissions`, Gemini `--yolo`, or
+Cursor `--yolo`. This is only appropriate for explicit nested command-execution
+tests, not routine vendor calls.
 
 ### Smoke Passes But Doctor Fails
 

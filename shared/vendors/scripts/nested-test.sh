@@ -16,8 +16,8 @@ Usage:
 
 Options:
   --run-real-nested        Required guard; this test makes real nested calls
-  --outer-vendor NAME      openai, claude, or gemini; repeatable. Default: all
-  --inner-vendor NAME      openai, claude, or gemini; repeatable. Default: all
+  --outer-vendor NAME      openai, claude, gemini, or cursor; repeatable. Default: all
+  --inner-vendor NAME      openai, claude, gemini, or cursor; repeatable. Default: all
   --timeout SECONDS        Timeout for each outer vendor call (default: 420)
   --inner-timeout SECONDS  Timeout each outer call passes to inner call.sh (default: 120)
   --output-dir DIR         Keep outputs in DIR. Default: temp dir kept and printed
@@ -126,10 +126,10 @@ case "$INNER_TIMEOUT_SECONDS" in
 esac
 
 if [ "${#OUTER_VENDORS[@]}" -eq 0 ]; then
-  OUTER_VENDORS=(openai claude gemini)
+  OUTER_VENDORS=(openai claude gemini cursor)
 fi
 if [ "${#INNER_VENDORS[@]}" -eq 0 ]; then
-  INNER_VENDORS=(openai claude gemini)
+  INNER_VENDORS=(openai claude gemini cursor)
 fi
 
 if [ -z "$OUTPUT_DIR" ]; then
@@ -143,6 +143,7 @@ normalize_id() {
     openai|codex|gpt) printf "openai\n" ;;
     claude|anthropic) printf "claude\n" ;;
     gemini|google) printf "gemini\n" ;;
+    cursor|cursor-agent|anysphere) printf "cursor\n" ;;
     *) return 1 ;;
   esac
 }

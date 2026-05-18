@@ -32,11 +32,13 @@ vendors_read_models() {
   VENDORS_OPENAI_MODEL=$(vendors_conf_get "$config_file" "openai.model")
   VENDORS_CLAUDE_MODEL=$(vendors_conf_get "$config_file" "claude.model")
   VENDORS_GEMINI_MODEL=$(vendors_conf_get "$config_file" "gemini.model")
+  VENDORS_CURSOR_MODEL=$(vendors_conf_get "$config_file" "cursor.model")
 
   # Backward-compatible fallback for configs created before speed was removed.
   [ -n "$VENDORS_OPENAI_MODEL" ] || VENDORS_OPENAI_MODEL=$(vendors_conf_get "$config_file" "openai.normal")
   [ -n "$VENDORS_CLAUDE_MODEL" ] || VENDORS_CLAUDE_MODEL=$(vendors_conf_get "$config_file" "claude.normal")
   [ -n "$VENDORS_GEMINI_MODEL" ] || VENDORS_GEMINI_MODEL=$(vendors_conf_get "$config_file" "gemini.normal")
+  [ -n "$VENDORS_CURSOR_MODEL" ] || VENDORS_CURSOR_MODEL=$(vendors_conf_get "$config_file" "cursor.normal")
 }
 
 vendors_normalize_vendor() {
@@ -57,8 +59,12 @@ vendors_normalize_vendor() {
       VENDORS_VENDOR_ID="gemini"
       VENDORS_VENDOR_CLI="gemini"
       ;;
+    cursor|cursor-agent|anysphere)
+      VENDORS_VENDOR_ID="cursor"
+      VENDORS_VENDOR_CLI="cursor-agent"
+      ;;
     *)
-      printf "unknown vendor: %s (expected openai, claude, or gemini)\n" "$1" >&2
+      printf "unknown vendor: %s (expected openai, claude, gemini, or cursor)\n" "$1" >&2
       return 2
       ;;
   esac
@@ -83,6 +89,9 @@ vendors_select_model() {
       ;;
     gemini)
       selected="$VENDORS_GEMINI_MODEL"
+      ;;
+    cursor)
+      selected="$VENDORS_CURSOR_MODEL"
       ;;
     *)
       printf "unknown normalized vendor: %s\n" "$vendor" >&2
@@ -128,6 +137,7 @@ vendors_supported_efforts() {
     openai) printf "low medium high xhigh\n" ;;
     claude) printf "low medium high xhigh max\n" ;;
     gemini) printf "\n" ;;
+    cursor) printf "\n" ;;
     *)
       printf "unknown vendor %s\n" "$1" >&2
       return 2
@@ -436,6 +446,64 @@ elif vendor == "gemini":
                 "total_tokens": total,
                 "raw": {"stats": stats},
             })
+elif vendor == "cursor":
+    # cursor-agent --output-format stream-json emits one JSON event per line.
+    # The terminal "result" event carries both the assistant text (`result`)
+    # and a `usage` object with cursor's camelCase token fields:
+    #   {"type":"result", ..., "result":"...", "usage":{
+    #      "inputTokens":3,"outputTokens":5,
+    #      "cacheReadTokens":15157,"cacheWriteTokens":5081}}
+    # `--output-format json` prints the same envelope as a single line.
+    last_result_event = None
+    last_assistant_text = None
+    for line in raw_out.splitlines():
+        candidate = line.strip()
+        if not (candidate.startswith("{") and candidate.endswith("}")):
+            continue
+        try:
+            event = json.loads(candidate)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result":
+            last_result_event = event
+            continue
+        if event.get("type") == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            if isinstance(text, str):
+                                parts.append(text)
+                    if parts:
+                        last_assistant_text = "".join(parts)
+    if isinstance(last_result_event, dict) and "result" in last_result_event:
+        output.write_text(str(last_result_event.get("result", "")))
+    elif last_assistant_text is not None:
+        output.write_text(last_assistant_text)
+    if isinstance(last_result_event, dict):
+        raw_usage = last_result_event.get("usage")
+        if isinstance(raw_usage, dict):
+            input_tokens = parse_int(raw_usage.get("inputTokens"))
+            output_tokens = parse_int(raw_usage.get("outputTokens"))
+            cache_read_tokens = parse_int(raw_usage.get("cacheReadTokens"))
+            cache_write_tokens = parse_int(raw_usage.get("cacheWriteTokens"))
+            total = input_tokens + output_tokens
+            payload.update({
+                "available": total > 0,
+                "source": "cursor_agent_jsonl",
+                "total_tokens": total or None,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+                "cache_creation_input_tokens": cache_write_tokens,
+                "raw": raw_usage,
+            })
 elif vendor == "openai":
     # When a schema was passed, codex writes the schema-conforming JSON to
     # output_file via --output-last-message. Wrap it in the same
@@ -737,6 +805,53 @@ vendors_run_gemini() {
   fi
 }
 
+vendors_run_cursor() {
+  local prompt_file="$1"
+  local output_file="$2"
+  local prompt
+  # cursor-agent gates every fresh workspace on a "Workspace Trust Required"
+  # prompt that breaks headless runs. `--trust` is the headless-mode opt-in
+  # that the IDE's "I trust this folder" click maps to; it does not grant any
+  # tool permission beyond what the caller already implicitly grants by
+  # invoking the wrapper from their cwd. The other vendors have no
+  # workspace-trust concept in their headless paths, so always passing this
+  # keeps cursor's baseline aligned with them.
+  local -a command=(cursor-agent -p --trust)
+
+  prompt=$(cat "$prompt_file")
+
+  if ! vendors_native_arg_present "--output-format"; then
+    command+=(--output-format stream-json)
+  fi
+  if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
+    command+=(--model "$VENDORS_RESOLVED_MODEL")
+  fi
+  if [ "${VENDORS_YOLO:-0}" = "1" ]; then
+    command+=(--yolo)
+  fi
+
+  command+=("${VENDORS_NATIVE_ARGS[@]}" -- "$prompt")
+
+  if [ "${VENDORS_DRY_RUN:-0}" = "1" ]; then
+    vendors_run_with_redirect "$prompt_file" "$output_file" "${command[@]}"
+    return 0
+  fi
+
+  if [ "${#VENDORS_ENV[@]}" -gt 0 ]; then
+    if [ -n "${VENDORS_CWD:-}" ]; then
+      ( cd "$VENDORS_CWD" && env "${VENDORS_ENV[@]}" "${command[@]}" < /dev/null ) > "$output_file" 2>&1
+    else
+      env "${VENDORS_ENV[@]}" "${command[@]}" < /dev/null > "$output_file" 2>&1
+    fi
+  else
+    if [ -n "${VENDORS_CWD:-}" ]; then
+      ( cd "$VENDORS_CWD" && "${command[@]}" < /dev/null ) > "$output_file" 2>&1
+    else
+      "${command[@]}" < /dev/null > "$output_file" 2>&1
+    fi
+  fi
+}
+
 vendors_run() {
   local vendor="$1"
   local prompt_file="$2"
@@ -746,6 +861,7 @@ vendors_run() {
     openai) vendors_run_codex "$prompt_file" "$output_file" ;;
     claude) vendors_run_claude "$prompt_file" "$output_file" ;;
     gemini) vendors_run_gemini "$prompt_file" "$output_file" ;;
+    cursor) vendors_run_cursor "$prompt_file" "$output_file" ;;
     *)
       printf "unknown normalized vendor: %s\n" "$vendor" >&2
       return 2

@@ -9,8 +9,9 @@ The stable module entrypoints are:
 - `scripts/call.sh` for one vendor call or one prompt fanned out to multiple
   vendors in parallel.
 - `scripts/doctor.sh` for readiness checks and retained diagnostics on failure.
-- `scripts/smoke-test.sh` for a fake-CLI regression test that makes three
-  separate three-vendor fan-out calls.
+- `scripts/smoke-test.sh` for a fake-CLI regression test that makes one
+  four-vendor fan-out call per caller (fake `codex`, `claude`, `gemini`, and
+  `cursor-agent` binaries are generated under a temp dir).
 - `scripts/hello-test.sh` for a real vendor call test that asks each selected
   LLM `Who are you?` and verifies non-error output.
 - `scripts/nested-test.sh` for a real nested integration test where each outer
@@ -37,10 +38,11 @@ Supported vendors:
 - `openai` maps to the local `codex` CLI.
 - `claude` maps to the local `claude` CLI.
 - `gemini` maps to the local `gemini` CLI.
+- `cursor` maps to the local `cursor-agent` CLI.
 
 Common arguments:
 
-- `--vendor openai|claude|gemini` (required, repeatable)
+- `--vendor openai|claude|gemini|cursor` (required, repeatable)
 - `--effort min|low|medium|high|xhigh|max` (optional, best effort)
 - `--prompt TEXT`, `--prompt-file FILE`, positional prompt text, or stdin
 - `--system TEXT` / `--system-file FILE`
@@ -61,7 +63,8 @@ Common arguments:
 - `--schema-file FILE` to constrain the response to a JSON Schema. Output lands
   at `<output-dir>/<id>/out` as `{"structured_output": <conforming-object>}`
   for both supported vendors. Supported on `claude` and `openai` (codex);
-  `gemini` is rejected because its CLI has no native schema enforcement.
+  `gemini` and `cursor` are rejected because their CLIs have no native schema
+  enforcement.
 
 `model`, `effort`, and `yolo` are the only vendor behavior abstractions. Prompt
 transport, output files, timeouts, context inlining, cwd, and environment
@@ -77,23 +80,26 @@ vendor CLI behavior must be passed explicitly with `--native-arg`.
 | OpenAI/Codex | `--dangerously-bypass-approvals-and-sandbox` |
 | Claude | `--permission-mode bypassPermissions` |
 | Gemini | `--yolo` |
+| Cursor | `--yolo` (alias of `--force`) |
 
 ## Effort Mapping
 
 Effort is a shared ordered scale: `min < low < medium < high < xhigh < max`.
 Each vendor receives the exact value when it supports it. Otherwise the module
 selects the nearest stronger supported effort; if no stronger value exists, it
-selects the nearest weaker supported effort. Gemini currently has no native
-effort knob, so any effort hint maps to its default behavior.
+selects the nearest weaker supported effort. Gemini and Cursor currently have
+no native effort knob, so any effort hint maps to their default behavior; pick
+a model variant in `vendors.conf` (e.g. `cursor.model=...-thinking`) when you
+need stronger reasoning from those vendors.
 
-| Input | OpenAI/Codex | Claude | Gemini |
-|-------|--------------|--------|--------|
-| `min` | `low` | `low` | default |
-| `low` | `low` | `low` | default |
-| `medium` | `medium` | `medium` | default |
-| `high` | `high` | `high` | default |
-| `xhigh` | `xhigh` | `xhigh` | default |
-| `max` | `xhigh` | `max` | default |
+| Input | OpenAI/Codex | Claude | Gemini | Cursor |
+|-------|--------------|--------|--------|--------|
+| `min` | `low` | `low` | default | default |
+| `low` | `low` | `low` | default | default |
+| `medium` | `medium` | `medium` | default | default |
+| `high` | `high` | `high` | default | default |
+| `xhigh` | `xhigh` | `xhigh` | default | default |
+| `max` | `xhigh` | `max` | default | default |
 
 ## Native Args
 
@@ -182,6 +188,7 @@ branch on vendor:
 | `claude` | `--json-schema "$(cat …)"` | Schema inlined as JSON |
 | `openai` (codex) | `--output-schema <path>` | File path passed through |
 | `gemini` | (rejected) | CLI has no native schema enforcement |
+| `cursor` | (rejected) | CLI has no native schema enforcement |
 
 `<output-dir>/<id>/out` always contains `{"structured_output": <obj>}` —
 unwrap `.structured_output` to get the schema-conforming object. The
@@ -273,6 +280,7 @@ Outputs are always written as:
 - `<output-dir>/openai/usage.json`
 - `<output-dir>/claude/out`
 - `<output-dir>/gemini/out`
+- `<output-dir>/cursor/out`
 
 For a single vendor, the same contract applies. For example, `--vendor claude`
 writes `<output-dir>/claude/out`, `<output-dir>/claude/status`,
@@ -338,8 +346,8 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/doctor.sh"
 ```
 
-By default it probes openai, claude, and gemini through `scripts/call.sh` with a
-small `READY` prompt. Use `--vendor` to check a subset:
+By default it probes openai, claude, gemini, and cursor through
+`scripts/call.sh` with a small `READY` prompt. Use `--vendor` to check a subset:
 
 ```bash
 VENDORS=${VENDORS:-/tmp/skills/vendors}
@@ -364,6 +372,17 @@ These details mirror the hard-won behavior captured in `panel-review`:
 - Gemini runs with stdin redirected from `/dev/null` in non-interactive mode.
   Without this, the CLI may open an interactive OAuth prompt and hang in
   headless runs.
+- Cursor runs `cursor-agent -p --trust --output-format stream-json` with stdin
+  redirected from `/dev/null` for the same headless-safety reason. `--trust` is
+  the headless equivalent of clicking "trust this workspace" in the IDE; the
+  launcher always passes it because every fresh cwd otherwise blocks on a
+  workspace-trust prompt that has no headless answer. The launcher parses the
+  terminal `result` event for both the assistant text and the
+  `usage:{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}` payload.
+  Authenticate once with `cursor-agent login` (or export `CURSOR_API_KEY`); the
+  CLI reuses that credential across every call, so this module does not require
+  per-call env vars. List available model ids with `cursor-agent --list-models`
+  and pin the chosen one in `vendors.conf` as `cursor.model=<id>`.
 - Doctor probes make a tiny model call. Run them after setup, auth refreshes,
   model/config changes, or vendor failures; do not pay the probe cost before
   every routine call.
@@ -382,9 +401,9 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/smoke-test.sh"
 ```
 
-It uses fake `codex`, `claude`, and `gemini` binaries and performs three calls.
-Each call selects all three vendors and verifies all nine output/status/log
-files across the run.
+It uses fake `codex`, `claude`, `gemini`, and `cursor-agent` binaries and
+performs one call per caller. Each call selects all four vendors and verifies
+the full output/status/log/usage.json contract across the run.
 
 ## Real Response Test
 
@@ -395,10 +414,10 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/hello-test.sh"
 ```
 
-It defaults to openai, claude, and gemini, asks each selected LLM `Who are you?`,
-and verifies `exit_code=0` plus non-empty output. It does not judge answer
-content. Use repeated `--vendor` flags to check a subset, or pass `--prompt` to
-ask a different short probe.
+It defaults to openai, claude, gemini, and cursor, asks each selected LLM
+`Who are you?`, and verifies `exit_code=0` plus non-empty output. It does not
+judge answer content. Use repeated `--vendor` flags to check a subset, or pass
+`--prompt` to ask a different short probe.
 
 ## Real Nested Test
 
@@ -410,14 +429,14 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/nested-test.sh" --run-real-nested
 ```
 
-By default it asks openai, claude, and gemini as outer agents to each execute one
-inner `call.sh` that fans out to openai, claude, and gemini. That is 3 outer
-model calls plus 9 inner model calls. It verifies each inner call has
-`exit_code=0` and non-empty output.
+By default it asks openai, claude, gemini, and cursor as outer agents to each
+execute one inner `call.sh` that fans out to openai, claude, gemini, and cursor.
+That is 4 outer model calls plus 16 inner model calls. It verifies each inner
+call has `exit_code=0` and non-empty output.
 
 Nested calls do not pass model permissions from the outer LLM to the inner
 vendors. The outer LLM only needs enough tool/shell permission to execute
-`call.sh`. The inner calls then use the local machine's `codex`, `claude`, and
-`gemini` CLI auth, PATH, environment, and the inner `call.sh` arguments. Keep
-each nested layer on its own `--output-dir` subtree and set timeouts at every
-layer.
+`call.sh`. The inner calls then use the local machine's `codex`, `claude`,
+`gemini`, and `cursor-agent` CLI auth, PATH, environment, and the inner
+`call.sh` arguments. Keep each nested layer on its own `--output-dir` subtree
+and set timeouts at every layer.
