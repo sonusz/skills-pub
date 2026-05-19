@@ -26,14 +26,15 @@ Modes: `alert` (default) reports CI failures only; `fix` runs `auto-fix` on CI f
 ## Workflow Overview (agent-driven)
 
 ```
-Init: preflight; snapshot { ci_sha, ci_status, unresolved_n }.
+Init: preflight; snapshot { ci_sha, ci_status, unresolved_n, active_cr_n, issue_comments_n }.
 
 Loop by precedence:
 1. failed CI + `fix` attempts remain -> evaluate via `auto-fix`, present issue + proposed fix + warning, get user confirmation; on confirm: apply + push + re-snapshot; on decline or escalation: write `/tmp/ci-needs-human-<pr>.md`, exit
 2. failed CI in `alert`, or attempts exhausted -> report, exit
 3. unresolved comments -> evaluate threads, user chooses actions, apply approved fixes, test, push, reply/resolve, re-snapshot
-4. CI passed + no unresolved comments -> print summary, write result file, exit
-5. otherwise -> `wait-for-state.sh`, re-snapshot, loop
+4. active change requests OR new issue comments -> present to user (no auto-fix path; no file scope), take user-directed action, re-snapshot
+5. CI passed + no unresolved comments + no active change requests -> print summary, write result file, exit
+6. otherwise -> `shared/github-ops/wait-for-state.sh`, re-snapshot, loop
 ```
 
 Invariants:
@@ -51,8 +52,8 @@ Two scripts enforce this server-side:
 
 | Action | Gate-time snapshot | Script |
 |---|---|---|
-| Push a CI-fix commit | Remote `head_sha` of the PR branch (= local HEAD before auto-fix commits) | `push-with-snapshot.sh --prior-head-sha <sha>` |
-| Post reply / resolve thread | Thread comment `database_id`s from `comment-check.sh` taken at gate time | `comment-resolve.sh ... --prior-comment-ids "<ids>"` |
+| Push a CI-fix commit | Remote `head_sha` of the PR branch (= local HEAD before auto-fix commits) | `scripts/push-with-snapshot.sh --prior-head-sha <sha>` |
+| Post reply / resolve thread | Thread comment `database_id`s from `shared/github-ops/comment-check.sh` taken at gate time | `shared/github-ops/comment-resolve.sh ... --prior-comment-ids "<ids>"` |
 
 Refusal exit codes: `4` = drift before the action, `5` = drift after our reply but before resolve. On refusal: fetch fresh state, show the user the diff (new comments / new commits, not just "moved"), get fresh confirmation, retry with the new snapshot.
 
@@ -70,14 +71,29 @@ Before any workflow, and again on every CI retry: clean working tree, branch mat
 
 ## Primitives
 
-The agent composes one-shot commands; only `wait-for-state.sh` blocks.
+The agent composes one-shot commands; only `shared/github-ops/wait-for-state.sh` blocks.
 
 | Intent | Command |
 |---|---|
-| Current CI status for PR/branch | `ci-check.sh [<pr-or-branch>]` |
-| Unresolved review threads | `comment-check.sh <pr-or-branch>` |
-| Block until CI or comment state changes | `wait-for-state.sh <pr-or-branch> --ci-status pending --unresolved N [--max-wait 1200]` |
-| Diagnose environment | `doctor.sh` |
+| Current CI status for PR/branch | `shared/github-ops/ci-check.sh [<pr-or-branch>]` |
+| Unresolved inline review threads | `shared/github-ops/comment-check.sh <pr-or-branch>` |
+| Active top-level change requests, review summaries, issue comments | `shared/github-ops/pr-review-check.sh <pr-or-branch>` |
+| Block until CI or comment state changes | `shared/github-ops/wait-for-state.sh <pr-or-branch> --ci-status pending --unresolved N [--max-wait 1200]` |
+| Diagnose environment | `scripts/doctor.sh` |
+
+`shared/github-ops/comment-check.sh` and
+`shared/github-ops/pr-review-check.sh` are complementary: the first covers
+inline review THREADS (line-anchored comments); the second covers everything
+else — `CHANGES_REQUESTED` reviews whose body isn't tied to a line, bot
+review summaries, and PR-level issue comments. A reviewer asking "rename the
+branch" only shows up in `shared/github-ops/pr-review-check.sh`. Always run
+both.
+
+`shared/github-ops/wait-for-state.sh` does NOT watch top-level reviews directly. New
+top-level reviews are picked up only on the next re-snapshot triggered by
+some other change (CI status flip, inline-comment count change, or
+timeout). This is acceptable because PR-level reviews are infrequent — but
+do not rely on the wait loop to wake on a new `CHANGES_REQUESTED`.
 
 Scripts auto-detect owner/repo from the git remote; default target is the current branch. Bounded retry details live in `references/troubleshooting.md`.
 
@@ -95,7 +111,7 @@ CI failures invoke `auto-fix` in `mode: "apply"`. Comment threads use `mode: "ev
 
 ### Snapshot (every iteration)
 
-`ci_sha = git rev-parse HEAD` or PR head SHA; `ci_json = ci-check.sh <target>`; `ci_status = jq -r .status` (`passed | failed | pending | error`); `unresolved_n = comment-check.sh <target> | jq -r .total_unresolved`.
+`ci_sha = git rev-parse HEAD` or PR head SHA; `ci_json = shared/github-ops/ci-check.sh <target>`; `ci_status = jq -r .status` (`passed | failed | pending | error`); `unresolved_n = shared/github-ops/comment-check.sh <target> | jq -r .total_unresolved`; `pr_review_json = shared/github-ops/pr-review-check.sh <target>`; `active_cr_n = jq -r .total_active_change_requests`; `issue_comments_n = jq -r .total_issue_comments`.
 
 Re-snapshot any time the head SHA changes (after push) — the old snapshot is stale.
 
@@ -122,7 +138,7 @@ Each attempt repeats steps 1–6; gates are per-attempt, never carried. On the f
 
 When `unresolved_n > 0`:
 
-1. Fetch threads via `comment-check.sh`. **Capture per-thread gate snapshots**: `prior_comment_ids[thread_id] = ",".join(c.database_id for c in thread.comments)` straight from this output. Do not rebuild later.
+1. Fetch threads via `shared/github-ops/comment-check.sh`. **Capture per-thread gate snapshots**: `prior_comment_ids[thread_id] = ",".join(c.database_id for c in thread.comments)` straight from this output. Do not rebuild later.
 2. For each thread, derive `author_type` (bot vs human) and `affected_files` from the comment's `path`.
 3. Invoke `auto-fix` per thread with `{ mode: "evaluate", comment_text, author_type, affected_files, pr_number, head_sha }`. **Capture `evaluate_hash` per thread.**
 4. Print one triage block per thread using `references/comment-analysis-template.md`; analysis comes from `auto-fix`'s evaluation, not a local heuristic.
@@ -130,17 +146,32 @@ When `unresolved_n > 0`:
 6. For each `apply fix` thread, invoke `auto-fix` with `{ mode: "apply", comment_text, author_type, affected_files, pr_number, head_sha, confirmed_evaluate_hash: <step-3 hash for this thread> }`. The hash satisfies auto-fix's per-thread Confirmation gate, so an "approve all" still produces one consent per fix. Hash mismatch → re-evaluate that thread, re-show, re-confirm, retry. `auto-fix` may create a local commit on `applied`.
 7. If any apply succeeded, squash the resulting commits into one (matching the last commit's format) and run tests locally.
 8. Before any remote-changing action — commit/push (use `scripts/push-with-snapshot.sh --prior-head-sha <prior_head_sha>`, where `<prior_head_sha>` is the remote head observed at gate time), posting/editing a reply, or resolving a thread — get a final confirmation immediately before execution. Decline → stop before the remote change, keep local changes local.
-9. For each reply/resolve: `scripts/comment-resolve.sh <pr> <thread_id> <reply> <comment_db_id> --prior-comment-ids "<prior_comment_ids[thread_id]>"`. Exit 4 (drift before reply) → re-triage. Exit 5 (drift after reply, before resolve) → reply is visible, thread stays open, re-evaluate. Either case: fetch fresh state, show diff, re-confirm, retry.
+9. For each reply/resolve: `shared/github-ops/comment-resolve.sh <pr> <thread_id> <reply> <comment_db_id> --prior-comment-ids "<prior_comment_ids[thread_id]>"`. Exit 4 (drift before reply) → re-triage. Exit 5 (drift after reply, before resolve) → reply is visible, thread stays open, re-evaluate. Either case: fetch fresh state, show diff, re-confirm, retry.
 10. Draft reply/resolve content from `references/comment-replies.md`; the script does post + verify + resolve atomically.
 11. Re-snapshot (including `prior_comment_ids` for unresolved threads) after any push or comment action; loop.
 
+### PR-level review action
+
+When `active_cr_n > 0` or new `issue_comments` have appeared since the prior snapshot:
+
+1. These signals are **not** routed through `auto-fix`. A top-level CHANGES_REQUESTED review or a free-form PR comment isn't anchored to a file path; `auto-fix` has no scope to evaluate, and silently inferring one is exactly the kind of pattern-matching the bot-author asymmetry rule warns against.
+2. For each active change request, print: author, `submitted_at`, full body, and "no code anchor — cannot auto-fix".
+3. For new issue comments, print author, `created_at`, and body. Mark each as informational.
+4. Ask the user what to do per signal. Typical actions and how to execute them:
+   - **Reply with a comment** → post via `https://api.github.com/repos/<owner>/<repo>/issues/<pr>/comments` (issue comment, visible on the PR conversation). The skill does not own a script for this yet; compose with `_auth_curl` from `shared/github-ops/github-remote.sh` and ask the user to confirm the exact reply text before posting.
+   - **Address by changing code** → user describes the fix; if it's a recognizable feature change, route through `auto-fix` with an explicit `affected_files` list provided by the user. Do not infer files from the review body.
+   - **Address by branch/repo state** (e.g., rename branch, retarget base) → the skill does not perform these autonomously. Print the command(s) and let the user run them.
+   - **Acknowledge and leave for human** → no action; the change request stays active and the skill will surface it again on the next snapshot.
+5. Any action that produces a remote write (reply, push) requires explicit user confirmation immediately before execution, same as Guardrails demand for comment threads. Top-level reviews have no GraphQL `resolve` API — the only way to clear a CHANGES_REQUESTED is for the reviewer to approve or dismiss, so the skill never tries to.
+6. Re-snapshot after any action and loop.
+
 ### Idle wait
 
-When CI is pending and `unresolved_n` is unchanged, call `wait-for-state.sh` with the snapshot. It blocks until the CI/comment state changes or times out, then you re-snapshot and loop.
+When CI is pending and `unresolved_n` / `active_cr_n` / `issue_comments_n` are unchanged, call `shared/github-ops/wait-for-state.sh` with the snapshot. It blocks until CI status or inline-thread count changes (top-level review changes are not watched — see Primitives), or times out. Then you re-snapshot and loop.
 
 ### Termination
 
-If CI passed, `unresolved_n == 0`, and no action is pending, print the summary table, write the result file, then exit. Output schemas live in `references/result-schema.md`.
+If CI passed, `unresolved_n == 0`, and `active_cr_n == 0`, and no action is pending, print the summary table, write the result file, then exit. Outstanding active change requests block termination — the agent surfaces them and waits for the user, rather than declaring "all clear" while a reviewer still requires changes. Output schemas live in `references/result-schema.md`.
 
 ---
 
@@ -165,12 +196,13 @@ The skill must never:
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/doctor.sh` | Diagnose environment |
-| `scripts/ci-check.sh` | One-shot CI status |
-| `scripts/comment-check.sh` | Fetch unresolved review threads |
-| `scripts/wait-for-state.sh` | Block until CI/comment state changes or timeout |
-| `scripts/comment-resolve.sh` | Reply to + resolve a thread; refuses on thread-state drift (snapshot-gated) |
+| `scripts/doctor.sh` | Diagnose environment (wraps `shared/github-ops/doctor.sh` + auto-fix sibling check) |
+| `shared/github-ops/ci-check.sh` | One-shot CI status |
+| `shared/github-ops/comment-check.sh` | Fetch unresolved inline review threads |
+| `shared/github-ops/pr-review-check.sh` | Fetch active top-level change requests, review bodies, and issue comments |
+| `shared/github-ops/wait-for-state.sh` | Block until CI/inline-comment state changes or timeout (does NOT watch top-level reviews) |
+| `shared/github-ops/comment-resolve.sh` | Reply to + resolve a thread; refuses on thread-state drift (snapshot-gated) |
 | `scripts/push-with-snapshot.sh` | Push only if remote head still matches the gate snapshot; refuses on remote drift |
-| `scripts/github-remote.sh` | Detect owner/repo from git remote |
+| `shared/github-ops/github-remote.sh` | Detect owner/repo from git remote |
 
 **Security:** Never run scripts with `bash -x` — token leaks via variable expansion. Details in `references/troubleshooting.md`.

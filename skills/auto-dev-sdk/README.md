@@ -28,22 +28,22 @@ stages:
   design:
     vendor: codex
     model: gpt-5.5
-    timeout_sec: 1200
+    probe_interval_sec: 1200
     effort: max
   build:
     vendor: codex
     model: gpt-5.4
-    timeout_sec: 3600
+    probe_interval_sec: 3600
     effort: high
   spec:
     vendor: codex
     model: gpt-5.4
-    timeout_sec: 900
+    probe_interval_sec: 900
     effort: high
   review:
     vendor: codex
     model: gpt-5.4
-    timeout_sec: 900
+    probe_interval_sec: 900
     effort: high
 
 panel:
@@ -61,6 +61,8 @@ panel:
     vendor: claude
     model: claude-sonnet-4-6
     effort: high
+  reviewer_probe_interval_sec: 600
+  synthesizer_probe_interval_sec: 300
 
 probe:
   vendor: claude
@@ -78,7 +80,10 @@ Notes:
 - All harness-owned LLM calls go through the packaged
   `shared/vendors/scripts/call.sh` interface and use its unified
   `<id>/out`, `<id>/status`, `<id>/log` output contract.
-- `timeout_sec` is passed to the shared vendors call as a per-vendor timeout.
+- `probe_interval_sec` is the stream-output idle threshold for coding
+  stages and panel calls. When output is quiet for that long, the
+  read-only probe decides whether to extend or kill. A much larger hard
+  wall-clock backstop is derived internally.
 - `effort` is the shared vendor scale `min|low|medium|high|xhigh|max`;
   `shared/vendors` maps it to the nearest supported native effort for the
   selected vendor.

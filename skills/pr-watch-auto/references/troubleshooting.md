@@ -25,7 +25,7 @@ printf "protocol=https\nhost=github.com\n" | git credential fill
 
 **Comment check fails.** The PAT needs `Pull requests: Read`. The GraphQL API also requires the token to have access to the repository.
 
-**Previously selected thread disappears.** `comment-check.sh` fetches all review-thread pages before filtering to unresolved threads. If a previously selected thread is absent, treat it as resolved and take no action.
+**Previously selected thread disappears.** `shared/github-ops/comment-check.sh` fetches all review-thread pages before filtering to unresolved threads. If a previously selected thread is absent, treat it as resolved and take no action.
 
 **Cannot resolve threads.** Resolving review threads requires `Pull requests: Write` (for GraphQL `resolveReviewThread` mutation and REST comment reply).
 
@@ -35,12 +35,12 @@ When unlimited CI retries are configured, still stop after 10 consecutive identi
 
 ## Stateful-gate refusals
 
-Both `comment-resolve.sh` and `push-with-snapshot.sh` enforce the stateful-gate invariant: the user's confirmation is bound to a specific state snapshot, and the scripts refuse if that state has drifted by the time the action would land. Refusals are not bugs — they're the gate doing its job. Handle them by re-prompting the user with the diff, never by silently re-fetching and retrying.
+Both `shared/github-ops/comment-resolve.sh` and `push-with-snapshot.sh` enforce the stateful-gate invariant: the user's confirmation is bound to a specific state snapshot, and the scripts refuse if that state has drifted by the time the action would land. Refusals are not bugs — they're the gate doing its job. Handle them by re-prompting the user with the diff, never by silently re-fetching and retrying.
 
 | Script | Exit | Meaning | Recovery |
 |---|---|---|---|
-| `comment-resolve.sh` | 4 | Thread had new comments before our reply was posted; nothing was sent. | Re-fetch via `comment-check.sh`, show the user the new comments, re-confirm, retry with the new snapshot. |
-| `comment-resolve.sh` | 5 | Reply posted, but a third comment arrived before we could resolve. Reply is visible; thread stays open. | Re-fetch, show the user the new comment, ask whether to resolve anyway or to re-evaluate. |
+| `shared/github-ops/comment-resolve.sh` | 4 | Thread had new comments before our reply was posted; nothing was sent. | Re-fetch via `shared/github-ops/comment-check.sh`, show the user the new comments, re-confirm, retry with the new snapshot. |
+| `shared/github-ops/comment-resolve.sh` | 5 | Reply posted, but a third comment arrived before we could resolve. Reply is visible; thread stays open. | Re-fetch, show the user the new comment, ask whether to resolve anyway or to re-evaluate. |
 | `push-with-snapshot.sh` | 4 | Remote head moved since the gate was confirmed (someone else pushed). No push attempted. | Show the user the new remote head and any new commits between `prior` and `current`, re-confirm whether to proceed, retry with the new `--prior-head-sha`. |
 
 ## Token-handling internals

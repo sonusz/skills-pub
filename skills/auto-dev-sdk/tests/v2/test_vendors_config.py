@@ -56,6 +56,7 @@ def test_load_happy_path(tmp_path):
     cfg = load_vendors_config(_write(tmp_path, body))
     s = cfg.resolve("build")
     assert s.vendor == "claude"
+    assert s.probe_interval_sec > 0
     assert cfg.probe.vendor == "claude"
     assert cfg.panel.synthesizer.model == "fake-panel-synth"
 
@@ -117,6 +118,36 @@ def test_effort_fields_loaded_and_normalized(tmp_path):
     assert cfg.panel.reviewers[0].effort == "xhigh"
     assert cfg.panel.synthesizer.effort == "high"
     assert cfg.probe.effort == "min"
+
+
+def test_stage_probe_interval_loaded(tmp_path):
+    stages = _happy_stages()
+    stages["build"]["probe_interval_sec"] = 123
+    cfg = load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(stages=stages))))
+    assert cfg.resolve("build").probe_interval_sec == 123
+
+
+def test_stage_legacy_timeout_rejected(tmp_path):
+    stages = _happy_stages()
+    stages["build"]["timeout_sec"] = 123
+    with pytest.raises(ConfigError, match="timeout_sec is deprecated"):
+        load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(stages=stages))))
+
+
+def test_panel_probe_intervals_loaded(tmp_path):
+    panel = _happy_panel()
+    panel["reviewer_probe_interval_sec"] = 321
+    panel["synthesizer_probe_interval_sec"] = 123
+    cfg = load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(panel=panel))))
+    assert cfg.panel.reviewer_probe_interval_sec == 321
+    assert cfg.panel.synthesizer_probe_interval_sec == 123
+
+
+def test_panel_legacy_timeout_rejected(tmp_path):
+    panel = _happy_panel()
+    panel["reviewer_timeout_sec"] = 321
+    with pytest.raises(ConfigError, match="reviewer_timeout_sec is deprecated"):
+        load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(panel=panel))))
 
 
 def test_invalid_effort_rejected(tmp_path):

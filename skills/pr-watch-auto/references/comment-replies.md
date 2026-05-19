@@ -23,19 +23,19 @@ If the user says nothing about a thread, leave it untouched.
 
 Any action that changes remote state requires a final confirmation immediately before execution. Remote-changing actions include commit/push, posting or editing a reply, and resolving a thread.
 
-Use `comment-resolve.sh <pr> <thread-id> <reply-message> <comment-database-id> [--no-resolve]` when posting a new reply. The helper requires all four positional arguments; if the reply POST fails it exits before resolving, leaving the thread open.
+Use `shared/github-ops/comment-resolve.sh <pr> <thread-id> <reply-message> <comment-database-id> [--no-resolve]` when posting a new reply. The helper requires all four positional arguments; if the reply POST fails it exits before resolving, leaving the thread open.
 
-If a suitable response is already present, do not post a duplicate. Use `comment-resolve.sh <pr> <thread-id> "<existing response summary>" - --already-replied` after explicit confirmation; this records the existing response and resolves only. Do not bypass the helper with direct GraphQL calls.
+If a suitable response is already present, do not post a duplicate. Use `shared/github-ops/comment-resolve.sh <pr> <thread-id> "<existing response summary>" - --already-replied` after explicit confirmation; this records the existing response and resolves only. Do not bypass the helper with direct GraphQL calls.
 
 ## Outdated threads
 
-`is_outdated: true` means the diff hunk moved or a newer push changed the code. It does not mean the thread is resolved. `comment-check.sh` fetches all review-thread pages and returns only unresolved threads. If a thread is absent from that unresolved snapshot, treat it as resolved and take no action. For threads still present and unresolved, compare against the prior snapshot; if an approved action addressed it, still reply/resolve it even when outdated.
+`is_outdated: true` means the diff hunk moved or a newer push changed the code. It does not mean the thread is resolved. `shared/github-ops/comment-check.sh` fetches all review-thread pages and returns only unresolved threads. If a thread is absent from that unresolved snapshot, treat it as resolved and take no action. For threads still present and unresolved, compare against the prior snapshot; if an approved action addressed it, still reply/resolve it even when outdated.
 
 Do not call an outdated thread stale only because the head SHA changed after an approved push. Stale means new reviewer replies appeared after the snapshot or the thread state conflicts with the planned action; re-evaluate before acting.
 
 ## Identifier details
 
-`comment-database-id` is the REST numeric id of the original comment: field `database_id` on each comment object returned by `comment-check.sh`. It is distinct from the GraphQL `thread_id` (`PRRT_...`). Capture both from the same `comment-check.sh` fetch.
+`comment-database-id` is the REST numeric id of the original comment: field `database_id` on each comment object returned by `shared/github-ops/comment-check.sh`. It is distinct from the GraphQL `thread_id` (`PRRT_...`). Capture both from the same `shared/github-ops/comment-check.sh` fetch.
 
 ## Reply shape
 

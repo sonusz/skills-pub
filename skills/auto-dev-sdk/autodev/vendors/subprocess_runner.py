@@ -105,7 +105,12 @@ def run_stage_subprocess(
     effort = stage_spec.effort or flags_effort
     model = model_override or stage_spec.model
 
-    hard_backstop_sec = _hard_backstop_sec(stage_spec.probe_interval_sec)
+    probe_enabled = probe_config is not None
+    hard_backstop_sec = (
+        _hard_backstop_sec(stage_spec.probe_interval_sec)
+        if probe_enabled
+        else stage_spec.probe_interval_sec
+    )
 
     if log_emit:
         log_emit({"event": "subprocess-start", "stage": stage,
@@ -129,7 +134,7 @@ def run_stage_subprocess(
             probe_config=probe_config,
             log_emit=log_emit,
         )
-        if probe_config is not None
+        if probe_enabled
         else None
     )
     try:
