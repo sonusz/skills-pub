@@ -30,6 +30,7 @@ pipeline_position:
   downstream_marker_on_pass: accepted-design.json
   downstream_stage_after_marker: build
   downstream_gate_on_pass: close-approval
+  parallel_gate: trace-review
 ```
 
 
@@ -87,11 +88,14 @@ design.md IS the first architectural record. In greenfield:
 
 ## Gate questions
 
-Six questions, one panel run:
+Three questions, one panel run:
 
-1. **PRD ↔ design coverage.** Does every active `### R<N>:`
-   requirement in prd.md map to design.md content (directly
-   named or via a scope item covering it)?
+1. **PRD ↔ design coverage.** Does design.md content adequately
+   address each `### R<N>:` requirement (not just nominally
+   reference it)? Structural completeness — every R<N> has a
+   scope item or exclusion — is guaranteed by precheck before
+   this gate runs. Your job here is semantic adequacy: does the
+   design actually deliver what each requirement specifies?
 
 2. **Design ↔ architecture fit.** Every primitive design.md
    commits to is either described in an arch-doc you found, OR
@@ -107,38 +111,18 @@ Six questions, one panel run:
    `design_ref` fields on items resolve to real design.md
    sections.
 
-4. **Behavioral enumeration completeness.** Every invariant,
-   SLA, constraint, and failure mode the PRD (or design.md)
-   implies for a scope item appears as a trace row. Findings
-   here typically target `primary_pair.trace.md` + cite
-   `anchor.prd.md` for the missing invariant — that cross-
-   reference is the substantive signal.
-
-5. **Trace-test alignment.** Each test case actually exercises
-   the behavior its trace row claims. "Rejects concurrent
-   writes" paired with a test that never fires two writes is a
-   gap.
-
-6. **Testability fit.** Test tiers and fixtures are consistent
-   with the architectural primitives design.md committed to.
-   Tests that fake away a committed primitive at every tier
-   don't verify it.
-
 ## Finding categories
 
 - **MISSING** — a PRD `### R<N>:` requirement has no scope
-  item / no trace row / no test case covering it; OR a design
-  commitment has no corresponding scope item; OR a PRD-implied
-  invariant has no trace row.
+  item covering it; OR a design commitment has no corresponding
+  scope item; OR a required design.md section is absent.
 - **INVENTED** — a scope item's `prd_ref` or `design_ref`
   doesn't resolve; OR an item's description imposes obligations
-  the PRD does not state; OR a trace row cites a scope item
-  that doesn't exist.
+  the PRD does not state.
 - **AMBIGUOUS** — a PRD requirement is under-specified such
   that two incompatible design decompositions would both be
   valid; OR design.md commits to a primitive described by two
-  incompatible arch-docs; OR a trace row's language doesn't
-  clearly pin the expected behavior.
+  incompatible arch-docs.
 - **UNDELIVERED** — design.md contradicts an arch-doc's claim
   (doc says X is required; design commits to ¬X); OR a scope
   item's `design_ref` points to a section that commits to
@@ -146,9 +130,6 @@ Six questions, one panel run:
 - **MISSIZED** — a scope item is obviously too coarse (spans
   multiple primitives with unclear seams) or too fine (trivial
   change you'd bundle with a sibling).
-- **UNTESTABLE** — tier/fixture choices skip the architectural
-  primitive design.md committed to (every test fakes the
-  primitive away, or tier is below where the primitive operates).
 
 ## Severity taxonomy
 
@@ -166,8 +147,6 @@ Not "files referenced" — files that need to change. Use:
 
 - `primary_pair.design.md` — design.md must change
 - `primary_pair.scope.json` — scope.json must change
-- `primary_pair.trace.md` — trace.md must change
-- `primary_pair.test-plan.md` — test-plan.md must change
 - `anchor.prd.md` — PRD must change (halt-for-human)
 - `primary_pair.<arch-doc-filename>` — a specific arch doc you
   read must change (halt-for-human)
@@ -176,7 +155,7 @@ Not "files referenced" — files that need to change. Use:
 
 **Prefer primary_pair targets over anchor.prd.md** when the
 design agent could reasonably address the concern by revising
-one of its four artifacts. Reserve `anchor.prd.md` targets for
+design.md or scope.json. Reserve `anchor.prd.md` targets for
 findings where the PRD itself has a factual error, internal
 contradiction, or missing requirement that cannot be resolved
 by design authoring alone.
@@ -187,13 +166,12 @@ Plain markdown.
 
 ### Required: PRD coverage table (FIRST in your output)
 
-Before writing findings, output a markdown table listing every
-active `### R<N>:` requirement from prd.md as a row. This is a
-hard requirement: the table forces you to walk every R<n>
-mechanically rather than reviewing by impression. Reviewers that
-omit rows or skip the table produce reviews the synthesizer will
-flag as incomplete (a `risk` meta-finding is emitted against you
-for any R<n> missing from your table).
+Output a markdown table with one row per active `### R<N>:`
+requirement from prd.md. Walk every R<N> mechanically — do not
+skip any. The synthesizer checks this table for completeness.
+Structural gaps (R<N> not referenced in scope at all) are already
+caught by precheck; your table judges whether the design content
+*adequately addresses* each requirement.
 
 Columns:
 

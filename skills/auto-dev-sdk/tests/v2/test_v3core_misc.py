@@ -30,12 +30,12 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "autodev" / "promp
 
 
 def test_stage_design_prompt_declares_source_vocabulary():
-    text = (PROMPTS_DIR / "stage-scope.md").read_text(encoding="utf-8")
+    text = (PROMPTS_DIR / "stage-design.md").read_text(encoding="utf-8")
     assert "Source:" in text or "`Source`" in text
     # R7 vocabulary tags
     for tag in ("prd:<section>", "scope:<id>", "trace:<req-id>",
                 "inferred", "commonsense"):
-        assert tag in text, f"stage-scope.md missing vocabulary tag {tag!r}"
+        assert tag in text, f"stage-design.md missing vocabulary tag {tag!r}"
 
 
 def test_stage_spec_prompt_declares_source_vocabulary():
@@ -46,7 +46,7 @@ def test_stage_spec_prompt_declares_source_vocabulary():
 
 
 def test_stage_design_mentions_source_column():
-    text = (PROMPTS_DIR / "stage-scope.md").read_text(encoding="utf-8")
+    text = (PROMPTS_DIR / "stage-design.md").read_text(encoding="utf-8")
     # Column name + attribution-unit language appear somewhere.
     assert "Source" in text
 

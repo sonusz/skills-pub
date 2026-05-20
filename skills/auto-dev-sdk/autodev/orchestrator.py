@@ -40,6 +40,7 @@ from autodev.workspace import snapshot
 # Mapping from cascade artifact names → gate names (R4 / R4e).
 ARTIFACT_TO_GATE = {
     "panel_design_review": "design-review",
+    "panel_trace_review":  "trace-review",
     "panel_close_approval": "close-approval",
 }
 
@@ -174,6 +175,7 @@ class Orchestrator:
         # Map panel file name → cascade artifact name
         panel_name_by_file = {
             "panel-design-review.json": "panel_design_review",
+            "panel-trace-review.json":  "panel_trace_review",
             "panel-close-approval.json": "panel_close_approval",
         }
         overrides = ov.load(active)
@@ -196,7 +198,7 @@ class Orchestrator:
                     detail={"gate": v.gate, "verdict": v.verdict,
                             "finding_count": len(v.findings)},
                 )
-                if v.gate == "design-review":
+                if v.gate in ("design-review", "trace-review"):
                     record_design_review_memory(active, v)
                 decision = handle_panel_verdict(active, v.gate, v)
                 logger.emit(stage="gate", event="revision-loop-triggered",
@@ -281,7 +283,11 @@ class Orchestrator:
                         feature=feature, detail={"artifact": str(path)})
             return AdvanceResult(stage_name="design_packet", success=True)
         if next_name == "accepted_design":
-            path = write_accepted_design(active, active / "panel-design-review.json")
+            path = write_accepted_design(
+                active,
+                active / "panel-design-review.json",
+                active / "panel-trace-review.json",
+            )
             logger.emit(stage="accepted-design", event="artifact-written",
                         feature=feature, detail={"artifact": str(path)})
             return AdvanceResult(stage_name="accepted_design", success=True)
@@ -342,7 +348,7 @@ class Orchestrator:
             )
         else:
             v = existing
-        if gate == "design-review":
+        if gate in ("design-review", "trace-review"):
             record_design_review_memory(active, v)
 
         logger.emit(stage="gate", event="panel-done", feature=feature,
@@ -405,6 +411,7 @@ class Orchestrator:
             (active / "trace.md").unlink(missing_ok=True)
             (active / "design-packet.json").unlink(missing_ok=True)
             (active / "panel-design-review.json").unlink(missing_ok=True)
+            (active / "panel-trace-review.json").unlink(missing_ok=True)
             (active / "accepted-design.json").unlink(missing_ok=True)
         elif stage == "spec":
             (active / "implemented-spec.md").unlink(missing_ok=True)
@@ -417,6 +424,10 @@ class Orchestrator:
     def _gate_primary_artifact(self, active: Path, gate: str) -> Path:
         mapping = {
             "design-review": active / "design-packet.json",
+            # trace-review reviews the design packet too (same subject);
+            # the consulted docs (trace.md, test-plan.md, prd.md) are
+            # hash-pinned separately in run_panel_gate.
+            "trace-review":  active / "design-packet.json",
             # close-approval reviews the implemented spec directly.
             # PRD and checklist are hash-pinned consulted docs.
             "close-approval": active / "implemented-spec.md",
@@ -459,7 +470,7 @@ class Orchestrator:
 
     # Stage → (primary artifact name, extra artifact names, prompt file)
     _STAGE_MANIFEST: dict[str, tuple[str, tuple[str, ...], str]] = {
-        "design": ("design.md",   ("scope.json", "trace.md", "test-plan.md"), "stage-scope.md"),
+        "design": ("design.md",   ("scope.json", "trace.md", "test-plan.md", "design-changelog.json"), "stage-design.md"),
         "build":  ("build.json",  (),                         "stage-implement.md"),
         "spec":   ("implemented-spec.md", ("README.md",),     "stage-spec.md"),
     }
@@ -575,6 +586,7 @@ class Orchestrator:
         panel_context_by_stage = {
             "design": {
                 "panel-design-review.json",
+                "panel-trace-review.json",
                 "panel-close-approval.json",
             },
             "build": {"panel-close-approval.json"},
@@ -595,9 +607,9 @@ class Orchestrator:
                 append_once(extra)
 
         if stage == "design":
-            memory_path = active / "design-rework-memory.json"
-            if memory_path.exists():
-                append_once(memory_path)
+            changelog_path = active / "design-changelog.json"
+            if changelog_path.exists():
+                append_once(changelog_path)
 
         if stage == "build":
             # Build is inside the Ralph loop: each retry must see the latest
@@ -1068,6 +1080,7 @@ class Orchestrator:
             (active / "test-plan.md").unlink(missing_ok=True)
             (active / "design-packet.json").unlink(missing_ok=True)
             (active / "panel-design-review.json").unlink(missing_ok=True)
+            (active / "panel-trace-review.json").unlink(missing_ok=True)
             (active / "accepted-design.json").unlink(missing_ok=True)
         else:
             raise PreflightError(f"cannot invalidate unknown layer {layer!r}")

@@ -139,37 +139,26 @@ def _response_to_feedback(
     prd_hash: str,
     current_context_refs: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    memory = load_design_rework_memory(active)
-    rounds = memory.get("rounds", [])
-    if not isinstance(rounds, list):
+    """Return the design-changelog.json reference if it exists.
+
+    The changelog replaces accumulated per-round verdict archives in the
+    design packet's response_to_feedback field. design-rework-memory.json
+    and round-NNN.json files continue to be archived for audit purposes
+    but are no longer consumed by the active loop.
+
+    The ``prd_path``, ``prd_hash``, and ``current_context_refs`` parameters
+    are retained for call-site stability but are no longer consulted: the
+    changelog is append-only and the agent is responsible for reading it
+    in CONTEXT_ARTIFACTS, not the harness.
+    """
+    del prd_path, prd_hash, current_context_refs  # retained for signature stability
+    changelog_path = active / "design-changelog.json"
+    if not changelog_path.exists():
         return []
-    refs: list[dict[str, str]] = []
-    for round_entry in rounds:
-        if not isinstance(round_entry, dict):
-            continue
-        history_path_raw = round_entry.get("history_path")
-        history_hash = round_entry.get("history_hash")
-        if not isinstance(history_path_raw, str) or not isinstance(history_hash, str):
-            continue
-        history_path = Path(history_path_raw)
-        if history_path.name == "panel-design-review.json":
-            continue
-        if not history_path.exists():
-            continue
-        if hash_file(history_path) != history_hash:
-            continue
-        history_payload = _load_json(history_path)
-        if history_payload.get("verdict") in {"pass", "skipped"}:
-            continue
-        if not _feedback_consulted_epoch_matches(
-            history_payload,
-            prd_path=prd_path,
-            prd_hash=prd_hash,
-            current_context_refs=current_context_refs,
-        ):
-            continue
-        refs.append({"path": str(history_path), "hash": history_hash})
-    return refs
+    return [{
+        "path": str(changelog_path),
+        "hash": hash_file(changelog_path),
+    }]
 
 
 def _input_fingerprint(
@@ -377,42 +366,60 @@ def _verdict_fresh_against_packet(verdict_path: Path, packet_path: Path) -> bool
     return True
 
 
-def write_accepted_design(active: Path, verdict_path: Path | None = None) -> Path:
-    """Write ``accepted-design.json`` after design-review passes or is skipped."""
+def write_accepted_design(
+    active: Path,
+    verdict_path: Path | None = None,
+    trace_verdict_path: Path | None = None,
+) -> Path:
+    """Write ``accepted-design.json`` after both design-review and trace-review pass or are skipped."""
     active = Path(active)
     packet_path = active / DESIGN_PACKET_FILENAME
     verdict_path = Path(verdict_path) if verdict_path is not None else active / "panel-design-review.json"
+    trace_verdict_path = Path(trace_verdict_path) if trace_verdict_path is not None else active / "panel-trace-review.json"
     if not packet_path.exists():
         raise SchemaError("accepted design missing design-packet.json")
     if not verdict_path.exists():
         raise SchemaError("accepted design missing panel-design-review.json")
+    if not trace_verdict_path.exists():
+        raise SchemaError("accepted design missing panel-trace-review.json")
 
-    packet_hash_before = hash_file(packet_path)
-    verdict_hash_before = hash_file(verdict_path)
     packet = _load_json(packet_path)
     verdict_obj = load_verdict(verdict_path)
-    if hash_file(packet_path) != packet_hash_before or hash_file(verdict_path) != verdict_hash_before:
-        raise SchemaError("accepted design packet/verdict changed during acceptance write")
+    trace_verdict_obj = load_verdict(trace_verdict_path)
 
-    verdict_status = verdict_obj.verdict
-    if verdict_obj.effectively_blocks() or verdict_status not in ("pass", "skipped"):
+    if verdict_obj.effectively_blocks() or verdict_obj.verdict not in ("pass", "skipped"):
         raise SchemaError(
             "accepted design requires non-blocking pass/skipped "
-            f"design-review verdict, got {verdict_status!r}"
+            f"design-review verdict, got {verdict_obj.verdict!r}"
         )
-    acceptance_mode = "skip_gate" if verdict_status == "skipped" else "panel_pass"
+    if trace_verdict_obj.effectively_blocks() or trace_verdict_obj.verdict not in ("pass", "skipped"):
+        raise SchemaError(
+            "accepted design requires non-blocking pass/skipped "
+            f"trace-review verdict, got {trace_verdict_obj.verdict!r}"
+        )
+
+    acceptance_mode = "skip_gate" if verdict_obj.verdict == "skipped" else "panel_pass"
+    trace_acceptance_mode = "skip_gate" if trace_verdict_obj.verdict == "skipped" else "panel_pass"
+    packet_hash = hash_file(packet_path)
+    verdict_hash = hash_file(verdict_path)
+    trace_verdict_hash = hash_file(trace_verdict_path)
     out = active / ACCEPTED_DESIGN_FILENAME
     atomic_write_json(out, {
         "kind": "accepted-design",
-        "schema_version": 1,
-        "source": str(verdict_path),
-        "source_hash": verdict_hash_before,
+        "schema_version": 2,
         "written": _utc_now(),
         "gate": "design-review",
-        "verdict": verdict_status,
+        "verdict": verdict_obj.verdict,
         "acceptance_mode": acceptance_mode,
+        "trace_gate": "trace-review",
+        "trace_verdict": trace_verdict_obj.verdict,
+        "trace_acceptance_mode": trace_acceptance_mode,
+        "source": str(verdict_path),
+        "source_hash": verdict_hash,
+        "trace_source": str(trace_verdict_path),
+        "trace_source_hash": trace_verdict_hash,
         "design_packet_path": str(packet_path),
-        "design_packet_hash": packet_hash_before,
+        "design_packet_hash": packet_hash,
         "review_subject_hash": packet.get("review_subject_hash"),
         "dev_input_hash": packet.get("dev_input_hash"),
     })
@@ -420,11 +427,12 @@ def write_accepted_design(active: Path, verdict_path: Path | None = None) -> Pat
 
 
 def accepted_design_fresh(path: Path) -> bool:
-    """Return true when acceptance still points at the current verdict and packet."""
+    """Return true when acceptance still points at the current verdict(s) and packet."""
     path = Path(path)
     active = path.parent
     packet_path = active / DESIGN_PACKET_FILENAME
     verdict_path = active / "panel-design-review.json"
+    trace_verdict_path = active / "panel-trace-review.json"
     try:
         data = _load_json(path)
         verdict_obj = load_verdict(verdict_path)
@@ -433,7 +441,8 @@ def accepted_design_fresh(path: Path) -> bool:
         return False
     if data.get("kind") != "accepted-design":
         return False
-    if data.get("schema_version") != 1:
+    schema_version = data.get("schema_version", 1)
+    if schema_version not in (1, 2):
         return False
     if verdict_obj.effectively_blocks() or verdict_obj.verdict not in ("pass", "skipped"):
         return False
@@ -443,6 +452,18 @@ def accepted_design_fresh(path: Path) -> bool:
         return False
     if data.get("source_hash") != hash_file(verdict_path):
         return False
+    if schema_version >= 2:
+        # Check trace verdict freshness
+        try:
+            trace_verdict_obj = load_verdict(trace_verdict_path)
+        except (SchemaError, OSError):
+            return False
+        if trace_verdict_obj.effectively_blocks() or trace_verdict_obj.verdict not in ("pass", "skipped"):
+            return False
+        if data.get("trace_source") != str(trace_verdict_path):
+            return False
+        if data.get("trace_source_hash") != hash_file(trace_verdict_path):
+            return False
     if data.get("design_packet_path") != str(packet_path):
         return False
     if data.get("design_packet_hash") != hash_file(packet_path):

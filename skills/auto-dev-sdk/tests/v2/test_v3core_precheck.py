@@ -138,6 +138,11 @@ def test_design_review_precheck_inactive_item_skipped(active):
     raw["in_scope"][0]["status"] = "removed"
     raw["in_scope"][0]["prd_ref"] = []
     raw["in_scope"][0]["design_ref"] = []
+    # R1 from s-1 is no longer covered by any active item; record it as excluded
+    # so the reverse-coverage precheck still passes.
+    raw.setdefault("excluded", []).append(
+        {"id": "x-1", "description": "R1 descoped", "reason": "deferred"}
+    )
     scope_p.write_text(json.dumps(raw))
     write_design_packet(active)
     r = precheck_design_review(active)

@@ -75,6 +75,20 @@ def _seed_all_ten(active: Path) -> None:
         ],
     )
     write_verdict(active / "panel-design-review.json", v_design)
+
+    # panel-trace-review.json
+    v_trace = PanelVerdict(
+        gate="trace-review", verdict="pass", findings=[],
+        source=str(packet), source_hash=packet_h,
+        prompt_file="x", prompt_hash="sha256:" + "0" * 64,
+        harness_version="t", run_ts="2026-04-20T00:00:00Z",
+        consulted_docs=[
+            {"path": str(active / "trace.md"), "hash": hash_file(active / "trace.md"), "priority": "consulted"},
+            {"path": str(active / "test-plan.md"), "hash": hash_file(active / "test-plan.md"), "priority": "consulted"},
+            {"path": str(active / "prd.md"), "hash": prd_h, "priority": "consulted"},
+        ],
+    )
+    write_verdict(active / "panel-trace-review.json", v_trace)
     write_accepted_design(active)
 
     # build.json
@@ -134,7 +148,7 @@ def test_cascade_prd_change_invalidates_full_chain(feature_active):
     assert fresh["prd"] is True
     expected_stale = {
         "design", "scope", "trace", "test_plan", "design_packet",
-        "panel_design_review", "accepted_design", "build",
+        "panel_design_review", "panel_trace_review", "accepted_design", "build",
         "implementation_index", "spec", "prd_checklist",
         "panel_close_approval",
     }
@@ -167,8 +181,8 @@ def test_cascade_scope_mutation_invalidates_downstream_only(feature_active):
     # The raw design bundle is source-pinned to PRD, so trace/test-plan remain
     # mechanically fresh. design-packet catches the changed scope hash and
     # invalidates the review, acceptance marker, build, and downstream gates.
-    for name in ("design_packet", "panel_design_review", "accepted_design",
-                 "build", "implementation_index", "spec",
+    for name in ("design_packet", "panel_design_review", "panel_trace_review",
+                 "accepted_design", "build", "implementation_index", "spec",
                  "panel_close_approval"):
         assert fresh[name] is False, f"{name} should be stale"
     assert c.next_stage() == "design_packet"

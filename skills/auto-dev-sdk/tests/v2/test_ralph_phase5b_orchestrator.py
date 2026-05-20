@@ -297,6 +297,7 @@ def _seed_feature(active: Path, *, ids: list[str]) -> None:
     zero_hash = "sha256:" + "0" * 64
     for gate, source_path in (
         ("design-review", packet),
+        ("trace-review", packet),
     ):
         write_verdict(active / f"panel-{gate}.json", PanelVerdict(
             gate=gate,
@@ -534,6 +535,17 @@ def test_upstream_change_resets_only_ralph_state_and_restarts_iter_one(
     zero_hash = "sha256:" + "0" * 64
     write_verdict(feature_active / "panel-design-review.json", PanelVerdict(
         gate="design-review",
+        verdict="pass",
+        findings=[],
+        source=str(packet),
+        source_hash=hash_file(packet),
+        prompt_file="prompt.md",
+        prompt_hash=zero_hash,
+        harness_version=HARNESS_VERSION,
+        run_ts="2026-04-21T00:00:00+00:00",
+    ))
+    write_verdict(feature_active / "panel-trace-review.json", PanelVerdict(
+        gate="trace-review",
         verdict="pass",
         findings=[],
         source=str(packet),

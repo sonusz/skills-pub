@@ -27,6 +27,9 @@ case "$behavior" in
     tgt_scope="${AUTODEV_FAKE_TARGET_SCOPE:?need scope target}"
     tgt_trace="${AUTODEV_FAKE_TARGET_TRACE:?need trace target}"
     tgt_tp="${AUTODEV_FAKE_TARGET_TEST_PLAN:?need test-plan target}"
+    # design-changelog.json target — default to sibling of design.md when
+    # the test doesn't pass an explicit env var.
+    tgt_changelog="${AUTODEV_FAKE_TARGET_CHANGELOG:-$(dirname "$tgt_design")/design-changelog.json}"
     cat > "${tgt_design}.tmp" <<EOF
 <!-- source: $src_path -->
 <!-- source_hash: $src_hash -->
@@ -81,6 +84,25 @@ toy
 | t-1 | happy | unit | — | — | Source: prd:§1 |
 ## Coverage
 t-1 covered.
+EOF
+    cat > "${tgt_changelog}.tmp" <<EOF
+{
+  "kind": "design-changelog",
+  "schema_version": 1,
+  "entries": [
+    {
+      "round": 1,
+      "trigger": "initial",
+      "reason": "first design pass (FakeCLI)",
+      "artifacts_changed": ["design.md", "scope.json", "trace.md", "test-plan.md"],
+      "added": [
+        {"artifact": "scope.json", "anchor": "t-1"},
+        {"artifact": "trace.md", "anchor": "t-1.r1"}
+      ],
+      "removed": []
+    }
+  ]
+}
 EOF
     exit 0
     ;;
@@ -202,6 +224,12 @@ EOF
 <!-- written: $(date +%Y-%m-%d) -->
 EOF
     fi
+    tgt_changelog_mp="${AUTODEV_FAKE_TARGET_CHANGELOG:-$(dirname "$tmp" 2>/dev/null)/design-changelog.json}"
+    if [ -n "$tgt_changelog_mp" ]; then
+      cat > "${tgt_changelog_mp}.tmp" <<EOF
+{"kind":"design-changelog","schema_version":1,"entries":[{"round":1,"trigger":"initial","reason":"malformed provenance test","artifacts_changed":["design.md"],"added":[],"removed":[]}]}
+EOF
+    fi
     if [ -n "${AUTODEV_FAKE_TARGET_README:-}" ]; then
       cat > "${AUTODEV_FAKE_TARGET_README}.tmp" <<EOF
 <!-- source: $src_path -->
@@ -248,6 +276,10 @@ EOF
 <!-- source: $src_path -->
 <!-- source_hash: $src_hash -->
 <!-- written: $(date +%Y-%m-%d) -->
+EOF
+    tgt_changelog_oos="${AUTODEV_FAKE_TARGET_CHANGELOG:-$(dirname "$tgt_design")/design-changelog.json}"
+    cat > "${tgt_changelog_oos}.tmp" <<EOF
+{"kind":"design-changelog","schema_version":1,"entries":[{"round":1,"trigger":"initial","reason":"out_of_scope_write test","artifacts_changed":["design.md"],"added":[],"removed":[]}]}
 EOF
     outside="${AUTODEV_FAKE_ESCAPE_PATH:-/tmp/escape.txt}"
     echo "escaped" > "$outside"

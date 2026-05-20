@@ -180,6 +180,29 @@ def precheck_design_review(feature_active: Path) -> PrecheckResult:
             f"hash(prd.md) {actual_prd_hash!r}"
         )
 
+    # Reverse coverage: every ### R<N>: heading in prd.md must appear in
+    # at least one active scope item's prd_ref OR in an excluded item's
+    # description/reason. Catches requirements silently omitted from scope.
+    prd_req_ids = set(re.findall(r'^###\s+(R\d+)\s*:', prd_text, re.MULTILINE))
+    if prd_req_ids:
+        covered_refs: set[str] = set()
+        for item in in_scope:
+            if item.get("status") == "active":
+                for tok in item.get("prd_ref", []):
+                    covered_refs.add(tok)
+        for item in scope_raw.get("excluded", []):
+            desc = item.get("description", "") + " " + item.get("reason", "")
+            for m in re.finditer(r'\bR\d+\b', desc):
+                covered_refs.add(m.group())
+        uncovered = sorted(prd_req_ids - covered_refs)
+        if uncovered:
+            return PrecheckResult(
+                False,
+                f"precheck_design_review: PRD requirement(s) {uncovered!r} not "
+                f"referenced in any active scope item prd_ref or excluded item; "
+                f"add to in_scope or excluded before panel review",
+            )
+
     try:
         scope_raw = json.loads(scope_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
@@ -236,6 +259,43 @@ def precheck_design_review(feature_active: Path) -> PrecheckResult:
                 )
 
     return PrecheckResult(True, "precheck_design_review: ok")
+
+
+# ------------------------- G1b: trace-review ---------------------------
+
+def precheck_trace_review(feature_active: Path) -> PrecheckResult:
+    prd_path = feature_active / "prd.md"
+    trace_path = feature_active / "trace.md"
+    tp_path = feature_active / "test-plan.md"
+
+    for p in (prd_path, trace_path, tp_path):
+        if not p.exists():
+            return PrecheckResult(False, f"precheck_trace_review: {p.name} missing")
+
+    trace_text = trace_path.read_text(encoding="utf-8")
+    tp_text = tp_path.read_text(encoding="utf-8")
+
+    # Every scope id referenced in trace.md (Scope ID column, 3rd column) must
+    # also appear somewhere in test-plan.md.
+    scope_ids_in_trace: set[str] = set()
+    for line in trace_text.splitlines():
+        if not line.startswith("|") or re.match(r"\|\s*[-#]", line):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) >= 3:
+            sid = cells[2].strip()  # Scope ID column (3rd column: # | Req ID | Scope ID | ...)
+            if re.match(r'^[a-zA-Z][\w-]*-\d+$', sid):
+                scope_ids_in_trace.add(sid)
+
+    for sid in scope_ids_in_trace:
+        if sid not in tp_text:
+            return PrecheckResult(
+                False,
+                f"precheck_trace_review: scope id {sid!r} in trace.md "
+                f"has no test-plan.md test case"
+            )
+
+    return PrecheckResult(True, "precheck_trace_review: ok")
 
 
 # ------------------------- Close ------------------------------------
@@ -352,6 +412,8 @@ def run_precheck(
     """Run the gate-specific pre-check. Returns ok/message."""
     if gate == "design-review":
         return precheck_design_review(feature_active)
+    if gate == "trace-review":
+        return precheck_trace_review(feature_active)
     if gate == "close-approval":
         return precheck_close_approval(feature_active)
     return PrecheckResult(False, f"precheck: unknown gate {gate!r}")

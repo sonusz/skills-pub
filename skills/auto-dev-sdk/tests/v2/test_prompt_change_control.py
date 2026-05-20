@@ -18,6 +18,7 @@ PROMPTS_DIR = (
 
 REVIEWER_PROMPTS = (
     "review-design-review.md",
+    "review-trace-review.md",
     "review-close-approval.md",
 )
 SYNTHESIZER_PROMPT = "synthesize.md"
@@ -58,7 +59,9 @@ def test_reviewer_prompts_absent_from_blacklist():
 # Fixture-pinned hashes. Bumping these requires intentional prompt change.
 EXPECTED_HASHES = {
     "review-design-review.md":
-        "2625d79b30728e1c5816fac33e5622855fe830c5ed882e82201c8475c37592b5",
+        "33e1ec38ad0c13729768ecb3ac071625e8faf87d4fe9d6c8f2984b2498a8286e",
+    "review-trace-review.md":
+        "774df661c0da950ed84f6fef8b8ebf2599af0a4067b73582fbce51dc89b16873",
     "review-close-approval.md":
         "91f11cfe315f6bdc670a3623d9d994b443fc7e90f6ec30d4cb5083fd39cdb129",
     "synthesize.md":

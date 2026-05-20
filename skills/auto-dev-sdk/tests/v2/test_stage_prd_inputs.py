@@ -141,7 +141,7 @@ def test_design_prompt_body_mentions_prd():
     """Prompt-file body mentions PRD as input (not just context section)."""
     body = (
         Path(__file__).resolve().parent.parent.parent
-        / "autodev" / "prompts" / "stage-scope.md"
+        / "autodev" / "prompts" / "stage-design.md"
     ).read_text(encoding="utf-8")
     assert "PRD_PATH" in body
     assert "PRD_HASH" in body

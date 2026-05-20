@@ -63,6 +63,7 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 REVIEW_PROMPT_FILE = {
     "design-review": "review-design-review.md",
+    "trace-review":  "review-trace-review.md",
     "close-approval": "review-close-approval.md",
 }
 SYNTHESIZE_PROMPT_FILENAME = "synthesize.md"
@@ -306,8 +307,13 @@ def _invoke_reviewer(
 
 def _compose_synthesizer_prompt(
     *, gate: str, artifact_path: Path, reviewer_results: list[ReviewerResult],
+    feature_active: Path | None = None,
 ) -> str:
     """Build the prompt for the synthesizer given reviewer outputs."""
+    import json as _json
+    import re as _re
+    from autodev.panel.extract_reviewer import parse_reviewer_output
+
     base = synthesize_prompt_path().read_text(encoding="utf-8")
     responded = [r.vendor for r in reviewer_results if r.ok]
     missing = [r.vendor for r in reviewer_results if not r.ok]
@@ -325,12 +331,35 @@ def _compose_synthesizer_prompt(
         "\nThe synthesizer is an extractor, not a reviewer. Do not re-review "
         "the artifact and do not add findings absent from reviewer outputs.\n"
     )
-    out += "\n## Reviewer outputs\n\n"
+
+    # Get PRD req IDs for coverage gap pre-computation
+    prd_req_ids: set[str] = set()
+    if feature_active is not None:
+        prd_path = feature_active / "prd.md"
+        if prd_path.exists():
+            prd_text = prd_path.read_text(encoding="utf-8")
+            prd_req_ids = set(_re.findall(r'^###\s+(R\d+)\s*:', prd_text, _re.MULTILINE))
+
+    out += "\n## Pre-extracted reviewer findings\n\n"
+    out += (
+        "The harness pre-parsed each reviewer's markdown into structured JSON. "
+        "Use the extracted data directly. When `quality` is `partial` or "
+        "`fallback`, the raw reviewer text is included in `<raw_text>` tags "
+        "for recovery of any fields the parser could not extract.\n\n"
+    )
     for r in reviewer_results:
+        out += f"### Reviewer: {r.vendor} ({r.model})\n\n"
         if r.ok:
-            out += f"### Reviewer: {r.vendor} ({r.model})\n\n{r.output}\n\n"
+            extracted = parse_reviewer_output(r.output, prd_req_ids or None, gate=gate)
+            out += f"```json\n{_json.dumps(extracted.to_dict(), indent=2)}\n```\n\n"
+            if extracted.quality != "clean":
+                # Include truncated raw text for recovery
+                raw_snip = r.output[:6000]
+                if len(r.output) > 6000:
+                    raw_snip += f"\n... [{len(r.output) - 6000} chars truncated]"
+                out += f"<raw_text>\n{raw_snip}\n</raw_text>\n\n"
         else:
-            out += f"### Reviewer: {r.vendor} — NO RESPONSE ({r.failure_detail})\n\n"
+            out += f"NO RESPONSE — {r.failure_detail}\n\n"
     return out
 
 def _invoke_synthesizer(
@@ -721,6 +750,7 @@ def run_panel_gate_internal(
     synth_prompt = _compose_synthesizer_prompt(
         gate=gate, artifact_path=primary_artifact,
         reviewer_results=reviewer_results,
+        feature_active=feature_active,
     )
 
     synth_ok, synth_parsed, synth_detail = _invoke_synthesizer(

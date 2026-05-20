@@ -111,7 +111,24 @@ def _seed_forward_feature(active: Path) -> None:
                     "status": "active",
                 }
             ],
-            "excluded": [],
+            "excluded": [
+                {
+                    "id": "x-R2", "description": "R2 review the packet",
+                    "reason": "covered by panel gate, not a build scope item",
+                },
+                {
+                    "id": "x-R3", "description": "R3 write accepted design",
+                    "reason": "harness-owned artifact, not a build scope item",
+                },
+                {
+                    "id": "x-R4", "description": "R4 block build until acceptance",
+                    "reason": "harness-owned gate logic, not a build scope item",
+                },
+                {
+                    "id": "x-R5", "description": "R5 forward path only",
+                    "reason": "test-scope constraint, not a build scope item",
+                },
+            ],
         },
     )
     write_markdown_with_hash(
@@ -349,77 +366,36 @@ def test_build_design_packet_rejects_invalid_resolved_context_refs(git_repo, mon
         monkeypatch.undo()
 
 
-def test_design_packet_filters_response_to_feedback_by_current_epoch(git_repo):
+def test_design_packet_references_changelog_when_present(git_repo):
+    """response_to_feedback points at design-changelog.json when it exists.
+
+    The legacy round-NNN.json filtering is gone; the changelog is the
+    single source of truth for design history in the active loop. The
+    per-round archive files continue to be written for audit but are
+    no longer consulted by the packet.
+    """
     active = git_repo / "docs" / "features" / "demo" / "active"
     active.mkdir(parents=True)
     _seed_forward_feature(active)
     first_packet = build_design_packet(active)
     atomic_write_json(active / "design-packet.json", first_packet)
 
-    prd_hash = hash_file(active / "prd.md")
-    context_hash = hash_file(git_repo / "docs" / "architecture-proposal.md")
-    current = _seed_history_round(
-        active,
-        round_no=1,
-        prd_hash=prd_hash,
-        context_hash=context_hash,
-        live_hash=hash_file(active / "design-packet.json"),
-    )
-    stale = _seed_history_round(
-        active,
-        round_no=2,
-        prd_hash="sha256:" + ("9" * 64),
-        context_hash=context_hash,
-    )
-    stale_context = _seed_history_round(
-        active,
-        round_no=3,
-        prd_hash=prd_hash,
-        context_hash="sha256:" + ("8" * 64),
-    )
-    atomic_write_json(
-        active / "design-rework-memory.json",
-        {
-            "kind": "design-rework-memory",
-            "written": "2026-04-26",
-            "rounds": [
-                {
-                    "round": 1,
-                    "history_path": str(current),
-                    "history_hash": hash_file(current),
-                },
-                {
-                    "round": 2,
-                    "history_path": str(stale),
-                    "history_hash": hash_file(stale),
-                },
-                {
-                    "round": 3,
-                    "history_path": str(stale_context),
-                    "history_hash": hash_file(stale_context),
-                },
-            ],
-            "established_constraints": [],
-        },
-    )
-    atomic_write_json(
-        active / "panel-design-review.json",
-        {
-            "gate": "design-review",
-            "verdict": "needs_revision",
-            "findings": [],
-            "source": str(active / "design-packet.json"),
-            "source_hash": hash_file(active / "design-packet.json"),
-            "prompt_file": "p",
-            "prompt_hash": "sha256:" + ("2" * 64),
-            "harness_version": "test",
-            "run_ts": "2026-04-26T00:00:03Z",
-        },
-    )
+    # No changelog → empty response_to_feedback.
+    assert first_packet["response_to_feedback"] == []
 
+    # Once a changelog exists, response_to_feedback references it.
+    changelog_path = active / "design-changelog.json"
+    atomic_write_json(changelog_path, {
+        "kind": "design-changelog",
+        "schema_version": 1,
+        "entries": [
+            {"round": 1, "trigger": "initial", "reason": "first pass",
+             "artifacts_changed": ["design.md"], "added": [], "removed": []},
+        ],
+    })
     packet = build_design_packet(active)
     assert packet["response_to_feedback"] == [
-        {"path": str(current), "hash": hash_file(current)}
+        {"path": str(changelog_path), "hash": hash_file(changelog_path)},
     ]
 
 
@@ -518,30 +494,18 @@ def test_design_review_consulted_docs_include_context_and_feedback_refs(git_repo
     active = git_repo / "docs" / "features" / "demo" / "active"
     active.mkdir(parents=True)
     _seed_forward_feature(active)
-    packet = build_design_packet(active)
-    atomic_write_json(active / "design-packet.json", packet)
-    history = _seed_history_round(
-        active,
-        round_no=1,
-        prd_hash=hash_file(active / "prd.md"),
-        context_hash=hash_file(git_repo / "docs" / "architecture-proposal.md"),
-        live_hash=hash_file(active / "design-packet.json"),
-    )
-    atomic_write_json(
-        active / "design-rework-memory.json",
-        {
-            "kind": "design-rework-memory",
-            "written": "2026-04-26",
-            "rounds": [
-                {
-                    "round": 1,
-                    "history_path": str(history),
-                    "history_hash": hash_file(history),
-                }
-            ],
-            "established_constraints": [],
-        },
-    )
+    # Seed a design-changelog.json — it should flow into consulted_docs
+    # via the packet's response_to_feedback field.
+    changelog_path = active / "design-changelog.json"
+    atomic_write_json(changelog_path, {
+        "kind": "design-changelog",
+        "schema_version": 1,
+        "entries": [
+            {"round": 1, "trigger": "initial", "reason": "first pass",
+             "artifacts_changed": ["design.md", "scope.json", "trace.md", "test-plan.md"],
+             "added": [], "removed": []},
+        ],
+    })
     packet = build_design_packet(active)
     atomic_write_json(active / "design-packet.json", packet)
 
@@ -568,7 +532,7 @@ def test_design_review_consulted_docs_include_context_and_feedback_refs(git_repo
         "test-plan.md",
         "prd.md",
         "architecture-proposal.md",
-        "round-001.json",
+        "design-changelog.json",
     }.issubset(names)
 
 
@@ -765,6 +729,18 @@ def test_write_accepted_design_rejects_blocking_verdict_and_preserves_existing_m
         run_ts="2026-04-26T00:00:00Z",
     )
     write_verdict(active / "panel-design-review.json", passing)
+    passing_trace = PanelVerdict(
+        gate="trace-review",
+        verdict="pass",
+        findings=[],
+        source=str(active / "design-packet.json"),
+        source_hash=hash_file(active / "design-packet.json"),
+        prompt_file="p",
+        prompt_hash="sha256:" + ("0" * 64),
+        harness_version="test",
+        run_ts="2026-04-26T00:00:00Z",
+    )
+    write_verdict(active / "panel-trace-review.json", passing_trace)
     write_accepted_design(active)
     original = (active / "accepted-design.json").read_text(encoding="utf-8")
 
@@ -786,42 +762,37 @@ def test_write_accepted_design_rejects_blocking_verdict_and_preserves_existing_m
     assert accepted_design_fresh(active / "accepted-design.json") is False
 
 
-def test_authoritative_context_drift_excludes_prior_feedback_and_stales_cached_acceptance(
+def test_authoritative_context_drift_stales_cached_acceptance(
     git_repo,
     monkeypatch,
 ):
+    """Context drift (e.g. arch-proposal change) invalidates cached panel
+    verdicts and the accepted-design marker. The design-changelog
+    reference itself persists — it is a historical record, not a
+    cache of validated state — but the surrounding packet/verdict
+    machinery must re-validate after upstream change.
+    """
     active = git_repo / "docs" / "features" / "demo" / "active"
     active.mkdir(parents=True)
     _seed_forward_feature(active)
 
     first_packet = build_design_packet(active)
     atomic_write_json(active / "design-packet.json", first_packet)
-    prd_hash = hash_file(active / "prd.md")
-    context_hash = hash_file(git_repo / "docs" / "architecture-proposal.md")
-    history = _seed_history_round(
-        active,
-        round_no=1,
-        prd_hash=prd_hash,
-        context_hash=context_hash,
-        live_hash=hash_file(active / "design-packet.json"),
-    )
-    atomic_write_json(
-        active / "design-rework-memory.json",
-        {
-            "kind": "design-rework-memory",
-            "written": "2026-04-26",
-            "rounds": [
-                {
-                    "round": 1,
-                    "history_path": str(history),
-                    "history_hash": hash_file(history),
-                }
-            ],
-            "established_constraints": [],
-        },
-    )
+
+    # Seed a design-changelog.json to exercise the response_to_feedback path
+    changelog_path = active / "design-changelog.json"
+    atomic_write_json(changelog_path, {
+        "kind": "design-changelog",
+        "schema_version": 1,
+        "entries": [
+            {"round": 1, "trigger": "initial", "reason": "first pass",
+             "artifacts_changed": ["design.md"], "added": [], "removed": []},
+        ],
+    })
     packet = build_design_packet(active)
-    assert packet["response_to_feedback"] == [{"path": str(history), "hash": hash_file(history)}]
+    assert packet["response_to_feedback"] == [
+        {"path": str(changelog_path), "hash": hash_file(changelog_path)},
+    ]
     atomic_write_json(active / "design-packet.json", packet)
 
     monkeypatch.setenv(
@@ -831,6 +802,14 @@ def test_authoritative_context_drift_excludes_prior_feedback_and_stales_cached_a
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
     run_panel_gate(
         gate="design-review",
+        feature_active=active,
+        repo_root=git_repo,
+        feature="demo",
+        primary_artifact=active / "design-packet.json",
+        panel_config=_panel_config(),
+    )
+    run_panel_gate(
+        gate="trace-review",
         feature_active=active,
         repo_root=git_repo,
         feature="demo",
@@ -851,7 +830,12 @@ def test_authoritative_context_drift_excludes_prior_feedback_and_stales_cached_a
     )
 
     refreshed = build_design_packet(active)
-    assert refreshed["response_to_feedback"] == []
+    # Changelog reference persists across context drift — it is an
+    # observational record, not state that becomes "stale".
+    assert refreshed["response_to_feedback"] == [
+        {"path": str(changelog_path), "hash": hash_file(changelog_path)},
+    ]
+    # Packet itself is stale because context_refs hashes change.
     assert design_packet_fresh(active / "design-packet.json") is False
     assert accepted_design_fresh(active / "accepted-design.json") is False
     assert verdict_exists_and_valid(

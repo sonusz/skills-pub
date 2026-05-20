@@ -72,7 +72,7 @@ def record_design_review_memory(
     Duplicate calls with the same source hash, timestamp, and verdict are
     no-ops so cached verdict checks do not create duplicate rounds.
     """
-    if verdict.gate != "design-review":
+    if verdict.gate not in ("design-review", "trace-review"):
         return memory_path(feature_active)
 
     feature_active = Path(feature_active)
@@ -84,7 +84,7 @@ def record_design_review_memory(
     hdir = _history_dir(feature_active)
     hdir.mkdir(parents=True, exist_ok=True)
     history_path = hdir / f"round-{round_no:03d}.json"
-    live_verdict = feature_active / "panel-design-review.json"
+    live_verdict = feature_active / f"panel-{verdict.gate}.json"
     if live_verdict.exists():
         shutil.copyfile(live_verdict, history_path)
     else:

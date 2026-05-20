@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import os
 import re
 import sys
@@ -61,9 +62,10 @@ def main() -> int:
     # Stage detection: look for target variables the stage-*.md prompts
     # declare. The unified design stage writes four artifacts.
     tgt_design = _extract_path(prompt, ["TARGET_DESIGN"])
-    tgt_scope = _extract_path(prompt, ["TARGET_SCOPE", "TARGET_ARTIFACT"]) if "stage-scope" in prompt or "scope.json" in prompt else None
+    tgt_scope = _extract_path(prompt, ["TARGET_SCOPE", "TARGET_ARTIFACT"]) if "stage-design" in prompt or "stage-scope" in prompt or "scope.json" in prompt else None
     tgt_trace = _extract_path(prompt, ["TARGET_TRACE"])
     tgt_test_plan = _extract_path(prompt, ["TARGET_TEST_PLAN"])
+    tgt_changelog = _extract_path(prompt, ["TARGET_CHANGELOG"])
     tgt_build = _extract_path(prompt, ["TARGET_BUILD_JSON"])
     tgt_spec = _extract_path(prompt, ["TARGET_SPEC"])
     tgt_readme = _extract_path(prompt, ["TARGET_README"])
@@ -147,6 +149,32 @@ Smoke-test only — single happy path.
 ## Coverage Summary
 t-1 covered.
 """)
+        if tgt_changelog:
+            # Read prior changelog if present to compute next round number
+            existing_rounds: list = []
+            if tgt_changelog.exists():
+                try:
+                    prior = json.loads(tgt_changelog.read_text(encoding="utf-8"))
+                    existing_rounds = prior.get("entries", []) or []
+                except Exception:
+                    existing_rounds = []
+            next_round = (
+                max((e.get("round", 0) for e in existing_rounds), default=0) + 1
+            )
+            new_entry = {
+                "round": next_round,
+                "trigger": "initial" if next_round == 1 else "design-review",
+                "reason": "fake auto vendor",
+                "artifacts_changed": ["design.md", "scope.json", "trace.md", "test-plan.md"],
+                "added": [],
+                "removed": [],
+            }
+            entries = list(existing_rounds) + [new_entry]
+            _write_tmp(tgt_changelog, json.dumps({
+                "kind": "design-changelog",
+                "schema_version": 1,
+                "entries": entries,
+            }))
         return 0
 
     # build stage

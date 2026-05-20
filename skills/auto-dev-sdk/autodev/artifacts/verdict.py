@@ -18,7 +18,7 @@ DecisionOutcome = Literal["pass", "retry_design", "halt_for_human"]
 
 _VALID_SEVERITY = {"invariant_violation", "risk", "opinion"}
 _VALID_VERDICT = {"pass", "needs_revision", "fail", "skipped"}
-_VALID_GATE = {"design-review", "close-approval"}
+_VALID_GATE = {"design-review", "trace-review", "close-approval"}
 _VALID_DECISION_SEVERITY = {"invariant_violation", "risk", "opinion"}
 _VALID_DESIGN_REVIEW_OUTCOME = {"pass", "retry_design", "halt_for_human"}
 

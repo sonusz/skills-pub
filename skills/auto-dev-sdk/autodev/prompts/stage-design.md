@@ -46,6 +46,9 @@ user wants" (PRD) and "what must be built + how it must be verified"
 - `TARGET_SCOPE`: path to write scope.json (same tmp pattern).
 - `TARGET_TRACE`: path to write trace.md (same tmp pattern).
 - `TARGET_TEST_PLAN`: path to write test-plan.md (same tmp pattern).
+- `TARGET_CHANGELOG`: path to write design-changelog.json (same tmp
+  pattern). Append-only history of design rounds — see "Maintaining
+  design-changelog.json" below.
 - `DIFF_BASE`: branch or commit to diff against during build
   validation.
 - `CONTEXT_ARTIFACTS`: list of paths to on-disk artifacts relevant to
@@ -56,9 +59,10 @@ user wants" (PRD) and "what must be built + how it must be verified"
   - `panel-design-review.json` — findings targeting any of your four
     artifacts are yours to address; `invariant_violation` + `risk`
     MUST be fixed, `opinion` may be acknowledged but is optional
-  - `design-rework-memory.json` — cumulative prior review findings and
-    established constraints from earlier iterations; keep previously
-    fixed constraints fixed while redesigning
+  - `design-changelog.json` — append-only history of prior design
+    rounds (what was tried, what feedback drove each round). Read it
+    as historical context to inform — but not dictate — what you do
+    this round. See "Maintaining design-changelog.json" below.
   - `build.json` if a build halt routed back here: inspect
     `deviations[]` entries and address each one's `evidence` pointer
 
@@ -367,6 +371,118 @@ feedback. Save the round-trip: self-verify first.
 8. All four files have the three-line provenance header (or
    scope.json's equivalent top-level fields).
 
+## Maintaining design-changelog.json
+
+`design-changelog.json` is the append-only history of every design
+round on this feature. It records **what was already tried and why** so
+future reruns (yours, or a later agent's) can read prior work as
+historical context. **It is descriptive, not prescriptive** — you decide
+what to do this round based on the current panel feedback and the four
+artifacts on disk; the changelog merely informs that decision.
+
+### File shape
+
+`design-changelog.json` lives at `<TARGET_CHANGELOG>` (i.e.
+`<FEATURE_ACTIVE>/design-changelog.json`):
+
+```json
+{
+  "kind": "design-changelog",
+  "schema_version": 1,
+  "entries": [
+    {
+      "round": 1,
+      "trigger": "initial",
+      "reason": "first design pass",
+      "artifacts_changed": ["design.md", "scope.json", "trace.md", "test-plan.md"],
+      "added": [
+        {"artifact": "scope.json", "anchor": "s-1"},
+        {"artifact": "trace.md", "anchor": "s-1.r1"}
+      ],
+      "removed": []
+    },
+    {
+      "round": 2,
+      "trigger": "trace-review",
+      "reason": "trace-review flagged R4 timeout invariant absent from trace.md",
+      "artifacts_changed": ["trace.md"],
+      "added": [{"artifact": "trace.md", "anchor": "s-2.r3"}],
+      "removed": []
+    }
+  ]
+}
+```
+
+### Entry fields
+
+- `round` — sequential, 1-indexed. Compute as
+  `max(prior entry rounds) + 1`, or `1` if no prior entries.
+- `trigger` — one of `"initial"`, `"design-review"`,
+  `"trace-review"`, `"close-approval"`, `"build"`, or a combined
+  string when multiple gates blocked (e.g.
+  `"design-review+trace-review"`).
+- `reason` — short string (≤ 500 chars). Describes what feedback
+  drove this round, in your own words. Pure description, not a
+  directive.
+- `artifacts_changed` — list of filenames you modified this round
+  (subset of `["design.md", "scope.json", "trace.md",
+  "test-plan.md"]`).
+- `added` — list of `{artifact, anchor}` objects. `anchor` is a
+  navigable identifier in the artifact: scope ID (`s-1`), trace
+  req ID (`s-1.r3`), JSON path, or markdown header.
+- `removed` — same shape as `added`. Items you removed or
+  replaced. Use blank or null anchors if a structural change is
+  hard to anchor.
+
+### Responsibilities
+
+1. **Read** the existing `design-changelog.json` if it appears in
+   CONTEXT_ARTIFACTS. Use prior entries as historical context — what
+   was tried, what panel feedback drove each round, what was added or
+   removed. Decide on your own whether to build on prior work, revert
+   it, or take a novel approach. The changelog informs that decision;
+   it does not dictate it.
+
+2. **Determine this round's `trigger`** from CONTEXT_ARTIFACTS:
+   - no `panel-*.json` and no `build.json` blocking → `"initial"`
+     (this is round 1)
+   - `panel-design-review.json` with `verdict: needs_revision` or
+     `verdict: fail` → `"design-review"`
+   - `panel-trace-review.json` blocking → `"trace-review"`
+   - `panel-close-approval.json` blocking → `"close-approval"`
+   - `build.json` with `blocking: true` → `"build"`
+   - multiple blocking → combine with `+`, e.g.
+     `"design-review+trace-review"`
+
+3. **Determine `round`** as `max(prior entry rounds) + 1`, or `1` if
+   no prior entries.
+
+4. **Author the entry** describing what this round actually changed:
+   - `reason` — short summary of what feedback drove this round
+     (drawn from panel findings, build deviations, or, for round 1,
+     a one-liner like "first design pass").
+   - `artifacts_changed` — list only files actually modified this
+     round (subset of the four design files).
+   - `added` — anchors that exist in the current artifacts but were
+     not in prior versions.
+   - `removed` — anchors that existed in prior versions but are not
+     in the current artifacts.
+
+5. **Write** the file to `<TARGET_CHANGELOG>.tmp`. The harness renames
+   to final. Contents must be the **full changelog object** — prior
+   entries preserved verbatim, with this round's entry appended.
+
+### Rules
+
+- This is a record of **what's been done**, not a TODO list.
+- The agent decides what to do based on current panel feedback; the
+  changelog informs that decision but doesn't dictate it.
+- **Always append. Never edit or remove prior entries.**
+- For the first round (no existing file in CONTEXT_ARTIFACTS), create
+  the file with a single initial entry (`round: 1`, `trigger: "initial"`).
+- If you cannot meaningfully anchor an `added`/`removed` item to a
+  scope ID, req ID, or header, use a blank or null `anchor` value.
+
 ## Self-check before exit
 
 Before writing the four `.tmp` files:
@@ -393,13 +509,18 @@ Before writing the four `.tmp` files:
 - Count data rows in trace.md's table; count rows with
   `Source:`. Equal.
 - Same for test-plan.md Test Cases.
+- **Verify changelog format**: `design-changelog.json` is a JSON object
+  with `kind == "design-changelog"`, `schema_version == 1`, and a list
+  of `entries`. Prior entries are preserved verbatim; your new entry has
+  `round`, `trigger`, `reason`, `artifacts_changed`, `added`, `removed`.
 - Re-run the six design-review gate questions against the whole packet.
 - If any check fails, fix before writing.
 
 ## Output
 
 - `<TARGET_DESIGN>.tmp`, `<TARGET_SCOPE>.tmp`,
-  `<TARGET_TRACE>.tmp`, `<TARGET_TEST_PLAN>.tmp`.
+  `<TARGET_TRACE>.tmp`, `<TARGET_TEST_PLAN>.tmp`,
+  `<TARGET_CHANGELOG>.tmp`.
 - Exit 0 on success; non-zero on fatal error (failure to read
   PRD, etc.).
 - Stdout: free-form logging. Not parsed by orchestrator.

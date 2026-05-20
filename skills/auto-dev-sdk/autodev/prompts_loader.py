@@ -9,7 +9,7 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 _STAGE_PROMPT_FILE = {
-    "design": "stage-scope.md",
+    "design": "stage-design.md",
     "build":  "stage-implement.md",
     "spec":   "stage-spec.md",
 }
@@ -96,6 +96,7 @@ def render_stage_prompt(
             ("TARGET_SCOPE", extra_targets[0] if len(extra_targets) > 0 else feature_active / "scope.json"),
             ("TARGET_TRACE", extra_targets[1] if len(extra_targets) > 1 else feature_active / "trace.md"),
             ("TARGET_TEST_PLAN", extra_targets[2] if len(extra_targets) > 2 else feature_active / "test-plan.md"),
+            ("TARGET_CHANGELOG", extra_targets[3] if len(extra_targets) > 3 else feature_active / "design-changelog.json"),
         ],
         "build":  [("TARGET_BUILD_JSON", primary_target)],
         "spec":   [("TARGET_SPEC",    primary_target),

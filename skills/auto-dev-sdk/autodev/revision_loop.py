@@ -141,13 +141,23 @@ def _dispatch_for_verdict(
                 halt_filenames.append(fn)
 
         if halt_filenames:
-            return _DispatchResult(None, "", (
-                f"findings target non-rerunnable artifact(s) "
-                f"{sorted(halt_filenames)!r}; halt for human "
-                f"(PRD amendment or arch-doc edit required)"
-            ), prd_targeted=bool(prd_filenames))
+            if gate == "trace-review":
+                # trace-review reviewers cannot see design.md/scope.json/arch-docs
+                # directly, so off-mandate targets are heuristic signals about
+                # an upstream issue. Give the design agent one retry via the
+                # shared prd_target_streak counter; halt on the second
+                # consecutive occurrence.
+                producers.add("design")
+                prd_filenames.extend(halt_filenames)
+                halt_filenames = []
+            else:
+                return _DispatchResult(None, "", (
+                    f"findings target non-rerunnable artifact(s) "
+                    f"{sorted(halt_filenames)!r}; halt for human "
+                    f"(PRD amendment or arch-doc edit required)"
+                ), prd_targeted=bool(prd_filenames))
         if prd_filenames:
-            if gate != "design-review":
+            if gate not in ("design-review", "trace-review"):
                 return _DispatchResult(None, "", (
                     f"findings target PRD artifact(s) "
                     f"{sorted(prd_filenames)!r}; halt for human "
@@ -276,7 +286,7 @@ def handle_panel_verdict(
             reason=dispatch.reason, would_rerun=dispatch.would_rerun,
         )
 
-    if dispatch.prd_targeted and gate == "design-review":
+    if dispatch.prd_targeted and gate in ("design-review", "trace-review"):
         streak = min(
             PRD_TARGET_HALT_STREAK,
             s.prd_target_streak.get(gate, 0) + 1,
@@ -287,7 +297,7 @@ def handle_panel_verdict(
             return Decision(
                 kind=DecisionKind.HALT_FOR_HUMAN, gate=gate, state=s,
                 reason=(
-                    f"PRD-targeted design-review findings repeated "
+                    f"PRD-targeted {gate} findings repeated "
                     f"{streak} consecutive rounds; halt for human after "
                     "design agent already had a chance to avoid the "
                     "apparent PRD conflict"
