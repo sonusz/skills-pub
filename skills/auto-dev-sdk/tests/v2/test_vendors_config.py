@@ -127,11 +127,16 @@ def test_stage_probe_interval_loaded(tmp_path):
     assert cfg.resolve("build").probe_interval_sec == 123
 
 
-def test_stage_legacy_timeout_rejected(tmp_path):
+def test_stage_legacy_timeout_auto_migrates(tmp_path, capsys):
+    """Legacy `timeout_sec` is auto-migrated to `probe_interval_sec` with a
+    stderr warning. Run continues — users can rename at their convenience."""
     stages = _happy_stages()
     stages["build"]["timeout_sec"] = 123
-    with pytest.raises(ConfigError, match="timeout_sec is deprecated"):
-        load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(stages=stages))))
+    cfg = load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(stages=stages))))
+    assert cfg.resolve("build").probe_interval_sec == 123
+    err = capsys.readouterr().err
+    assert "stages.build.timeout_sec" in err
+    assert "deprecated" in err.lower()
 
 
 def test_panel_probe_intervals_loaded(tmp_path):
@@ -143,11 +148,18 @@ def test_panel_probe_intervals_loaded(tmp_path):
     assert cfg.panel.synthesizer_probe_interval_sec == 123
 
 
-def test_panel_legacy_timeout_rejected(tmp_path):
+def test_panel_legacy_timeout_auto_migrates(tmp_path, capsys):
+    """Legacy `reviewer_timeout_sec` / `synthesizer_timeout_sec` are
+    auto-migrated to their probe_interval_sec equivalents with a warning."""
     panel = _happy_panel()
     panel["reviewer_timeout_sec"] = 321
-    with pytest.raises(ConfigError, match="reviewer_timeout_sec is deprecated"):
-        load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(panel=panel))))
+    panel["synthesizer_timeout_sec"] = 222
+    cfg = load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(panel=panel))))
+    assert cfg.panel.reviewer_probe_interval_sec == 321
+    assert cfg.panel.synthesizer_probe_interval_sec == 222
+    err = capsys.readouterr().err
+    assert "panel.reviewer_timeout_sec" in err
+    assert "panel.synthesizer_timeout_sec" in err
 
 
 def test_invalid_effort_rejected(tmp_path):

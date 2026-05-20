@@ -1,6 +1,7 @@
 """vendors.yml loader + validator (v2 schema)."""
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,17 @@ from typing import Any
 import yaml
 
 from autodev.errors import ConfigError
+
+
+def _deprecation_warn(path: Path, old: str, new: str) -> None:
+    """Emit a one-line deprecation warning to stderr. The harness auto-migrates
+    the value to the new key in-memory so the run continues — the user can
+    rename the key in vendors.yml at their convenience."""
+    print(
+        f"[autodev] WARNING: {path}: {old!r} is deprecated; auto-migrating "
+        f"to {new!r}. Rename the key in your vendors.yml to silence this.",
+        file=sys.stderr,
+    )
 
 # Coding stages — vendors.yml must cover all.
 STAGES = ("design", "build", "spec", "review")
@@ -162,14 +174,15 @@ def _validate_raw(raw: Any, path: Path) -> dict[str, dict[str, Any]]:
             )
         if not isinstance(entry["model"], str) or not entry["model"].strip():
             raise ConfigError(f"{path}: stages.{s}.model must be non-empty string")
+        if "timeout_sec" in entry:
+            # Auto-migrate legacy key: move timeout_sec → probe_interval_sec
+            # if the new key isn't already set. Emit a deprecation warning.
+            if "probe_interval_sec" not in entry:
+                entry["probe_interval_sec"] = entry["timeout_sec"]
+            _deprecation_warn(path, f"stages.{s}.timeout_sec", f"stages.{s}.probe_interval_sec")
+            del entry["timeout_sec"]
         if "probe_interval_sec" in entry and not isinstance(entry["probe_interval_sec"], int):
             raise ConfigError(f"{path}: stages.{s}.probe_interval_sec must be int")
-        if "timeout_sec" in entry:
-            raise ConfigError(
-                f"{path}: stages.{s}.timeout_sec is deprecated; rename to "
-                f"`probe_interval_sec` (idle threshold for the probe). The "
-                f"hard wall-clock cap is derived in subprocess_runner."
-            )
         if "effort" in entry:
             entry["effort"] = _normalize_effort_value(
                 entry["effort"], path=path, field=f"stages.{s}.effort"
@@ -260,11 +273,10 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
         ("synthesizer_timeout_sec", "synthesizer_probe_interval_sec"),
     ):
         if old in raw:
-            raise ConfigError(
-                f"{path}: panel.{old} is deprecated; rename to "
-                f"`{new}` (idle threshold for the probe). The hard "
-                f"wall-clock cap is derived in panel/runner."
-            )
+            if new not in raw:
+                raw[new] = raw[old]
+            _deprecation_warn(path, f"panel.{old}", f"panel.{new}")
+            del raw[old]
 
     return PanelConfig(
         reviewers=reviewers,
