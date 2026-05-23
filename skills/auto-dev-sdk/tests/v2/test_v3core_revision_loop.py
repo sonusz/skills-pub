@@ -58,9 +58,9 @@ def test_l_max_is_set():
 
 
 def test_all_panel_gates_cover_tracked_gates():
-    """Unified design stage with parallel trace-review yields three panel gates."""
+    """Unified design-review gate (with internal dual-group dispatch) and close-approval."""
     assert set(ALL_PANEL_GATES) == {
-        "design-review", "trace-review", "close-approval",
+        "design-review", "close-approval",
     }
 
 

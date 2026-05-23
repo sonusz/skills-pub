@@ -51,6 +51,12 @@ def test_stage_design_mentions_source_column():
     assert "Source" in text
 
 
+def test_stage_design_prompt_uses_changelog_for_design_history():
+    text = (PROMPTS_DIR / "stage-design.md").read_text(encoding="utf-8")
+    assert "design-changelog.json" in text
+    assert "design-rework-memory.json" not in text
+
+
 # ---------- SC3: panel prompts have no "Do NOT flag" blocklists ----------
 
 PANEL_PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "autodev" / "panel" / "prompts"

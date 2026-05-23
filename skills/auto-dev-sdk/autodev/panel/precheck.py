@@ -261,43 +261,6 @@ def precheck_design_review(feature_active: Path) -> PrecheckResult:
     return PrecheckResult(True, "precheck_design_review: ok")
 
 
-# ------------------------- G1b: trace-review ---------------------------
-
-def precheck_trace_review(feature_active: Path) -> PrecheckResult:
-    prd_path = feature_active / "prd.md"
-    trace_path = feature_active / "trace.md"
-    tp_path = feature_active / "test-plan.md"
-
-    for p in (prd_path, trace_path, tp_path):
-        if not p.exists():
-            return PrecheckResult(False, f"precheck_trace_review: {p.name} missing")
-
-    trace_text = trace_path.read_text(encoding="utf-8")
-    tp_text = tp_path.read_text(encoding="utf-8")
-
-    # Every scope id referenced in trace.md (Scope ID column, 3rd column) must
-    # also appear somewhere in test-plan.md.
-    scope_ids_in_trace: set[str] = set()
-    for line in trace_text.splitlines():
-        if not line.startswith("|") or re.match(r"\|\s*[-#]", line):
-            continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) >= 3:
-            sid = cells[2].strip()  # Scope ID column (3rd column: # | Req ID | Scope ID | ...)
-            if re.match(r'^[a-zA-Z][\w-]*-\d+$', sid):
-                scope_ids_in_trace.add(sid)
-
-    for sid in scope_ids_in_trace:
-        if sid not in tp_text:
-            return PrecheckResult(
-                False,
-                f"precheck_trace_review: scope id {sid!r} in trace.md "
-                f"has no test-plan.md test case"
-            )
-
-    return PrecheckResult(True, "precheck_trace_review: ok")
-
-
 # ------------------------- Close ------------------------------------
 
 def precheck_close_approval(feature_active: Path) -> PrecheckResult:
@@ -412,8 +375,6 @@ def run_precheck(
     """Run the gate-specific pre-check. Returns ok/message."""
     if gate == "design-review":
         return precheck_design_review(feature_active)
-    if gate == "trace-review":
-        return precheck_trace_review(feature_active)
     if gate == "close-approval":
         return precheck_close_approval(feature_active)
     return PrecheckResult(False, f"precheck: unknown gate {gate!r}")

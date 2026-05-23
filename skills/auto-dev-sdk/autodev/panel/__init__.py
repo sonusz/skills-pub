@@ -131,18 +131,6 @@ def run_panel_gate(
             from autodev.state.atomic import atomic_write_json
             docs_path = feature_active / f"panel-{gate}.docs.json"
             atomic_write_json(docs_path, consulted_docs)
-    elif gate == "trace-review":
-        from autodev.state.hashing import hash_file
-        for name in ("trace.md", "test-plan.md", "prd.md", "design-changelog.json"):
-            p = feature_active / name
-            if p.exists():
-                consulted_docs.append(
-                    {"path": str(p), "hash": hash_file(p), "priority": "consulted"}
-                )
-        if consulted_docs:
-            from autodev.state.atomic import atomic_write_json
-            docs_path = feature_active / f"panel-{gate}.docs.json"
-            atomic_write_json(docs_path, consulted_docs)
     elif gate == "close-approval":
         # Close-approval reads implemented-spec.md as the primary code
         # fact surface plus PRD and a mechanical PRD checklist. No

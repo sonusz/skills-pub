@@ -88,7 +88,7 @@ place." Use this protocol instead:
 
 1. **Consolidate feedback into root causes first.**
    Before editing files, read the latest panel verdict and any
-   `design-rework-memory.json`. Group current and historical findings
+   `design-changelog.json`. Group current and historical findings
    into the smallest set of underlying design problems. Ask:
    - is this a local omission, or evidence that the current design model
      is wrong?

@@ -156,40 +156,6 @@ def _seed_forward_feature(active: Path) -> None:
     )
 
 
-def _seed_history_round(
-    active: Path,
-    *,
-    round_no: int,
-    prd_hash: str,
-    context_hash: str,
-    live_hash: str | None = None,
-) -> Path:
-    history_dir = active / "design-review-history"
-    history_dir.mkdir(parents=True, exist_ok=True)
-    history_path = history_dir / f"round-{round_no:03d}.json"
-    payload = {
-        "gate": "design-review",
-        "verdict": "needs_revision",
-        "findings": [],
-        "source": str(active / "design-packet.json"),
-        "source_hash": live_hash or "sha256:" + ("1" * 64),
-        "prompt_file": "p",
-        "prompt_hash": "sha256:" + ("2" * 64),
-        "harness_version": "test",
-        "run_ts": f"2026-04-26T00:00:0{round_no}Z",
-        "consulted_docs": [
-            {"path": str(active / "prd.md"), "hash": prd_hash, "priority": "consulted"},
-            {
-                "path": str(active.parents[3] / "docs" / "architecture-proposal.md"),
-                "hash": context_hash,
-                "priority": "consulted",
-            },
-        ],
-    }
-    atomic_write_json(history_path, payload)
-    return history_path
-
-
 def _panel_config() -> PanelConfig:
     return PanelConfig(
         reviewers=(
@@ -370,9 +336,7 @@ def test_design_packet_references_changelog_when_present(git_repo):
     """response_to_feedback points at design-changelog.json when it exists.
 
     The legacy round-NNN.json filtering is gone; the changelog is the
-    single source of truth for design history in the active loop. The
-    per-round archive files continue to be written for audit but are
-    no longer consulted by the packet.
+    single source of truth for design history in the active loop.
     """
     active = git_repo / "docs" / "features" / "demo" / "active"
     active.mkdir(parents=True)
@@ -800,6 +764,8 @@ def test_authoritative_context_drift_stales_cached_acceptance(
         str(Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"),
     )
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
+    # design-review now dispatches BOTH reviewer groups internally and
+    # writes panel-design-review.json + panel-trace-review.json atomically.
     run_panel_gate(
         gate="design-review",
         feature_active=active,
@@ -808,14 +774,11 @@ def test_authoritative_context_drift_stales_cached_acceptance(
         primary_artifact=active / "design-packet.json",
         panel_config=_panel_config(),
     )
-    run_panel_gate(
-        gate="trace-review",
-        feature_active=active,
-        repo_root=git_repo,
-        feature="demo",
-        primary_artifact=active / "design-packet.json",
-        panel_config=_panel_config(),
-    )
+    assert (active / "panel-design-review.json").exists()
+    assert (active / "panel-trace-review.json").exists()
+    from autodev.artifacts.verdict import load_verdict as _lv
+    assert _lv(active / "panel-design-review.json").gate == "design-review"
+    assert _lv(active / "panel-trace-review.json").gate == "trace-review"
     write_accepted_design(active)
     assert accepted_design_fresh(active / "accepted-design.json") is True
     assert verdict_exists_and_valid(

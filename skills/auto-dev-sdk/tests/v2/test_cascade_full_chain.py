@@ -148,7 +148,7 @@ def test_cascade_prd_change_invalidates_full_chain(feature_active):
     assert fresh["prd"] is True
     expected_stale = {
         "design", "scope", "trace", "test_plan", "design_packet",
-        "panel_design_review", "panel_trace_review", "accepted_design", "build",
+        "panel_design_review", "accepted_design", "build",
         "implementation_index", "spec", "prd_checklist",
         "panel_close_approval",
     }
@@ -181,7 +181,7 @@ def test_cascade_scope_mutation_invalidates_downstream_only(feature_active):
     # The raw design bundle is source-pinned to PRD, so trace/test-plan remain
     # mechanically fresh. design-packet catches the changed scope hash and
     # invalidates the review, acceptance marker, build, and downstream gates.
-    for name in ("design_packet", "panel_design_review", "panel_trace_review",
+    for name in ("design_packet", "panel_design_review",
                  "accepted_design", "build", "implementation_index", "spec",
                  "panel_close_approval"):
         assert fresh[name] is False, f"{name} should be stale"

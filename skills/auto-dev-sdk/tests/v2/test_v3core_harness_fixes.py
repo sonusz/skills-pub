@@ -18,10 +18,7 @@ import pytest
 
 from autodev.artifacts.revision_state import filename_to_producer, load_state
 from autodev.artifacts.design_packet import write_design_packet
-from autodev.artifacts.design_rework_memory import (
-    load_design_rework_memory,
-    record_design_review_memory,
-)
+from autodev.artifacts.design_package_history import archive_design_package
 from autodev.artifacts.scope import Scope, ScopeItem, write_scope
 from autodev.artifacts.verdict import (
     PanelFinding, PanelVerdict, load_verdict, write_verdict,
@@ -421,40 +418,56 @@ def test_handle_verdict_design_review_scope_and_spec_still_halt(active):
     assert "non-rerunnable" in d.reason
 
 
-# ---------- Bug 3: design rework memory preserves review history ----------
+# ---------- Design package snapshots ----------
 
-def test_design_rework_memory_archives_distinct_panel_rounds(active):
+def test_design_package_history_archives_distinct_package_versions(active):
     _seed_prd_and_scope(active)
-    packet = active / "design-packet.json"
-    first = PanelVerdict(
-        gate="design-review", verdict="needs_revision",
-        findings=[PanelFinding(
-            severity="invariant_violation", vendor="claude",
-            summary="trace misses R1", targets=["primary_pair.trace.md"],
-        )],
-        source=str(packet), source_hash=hash_file(packet),
-        prompt_file="p", prompt_hash="sha256:" + "0" * 64,
-        harness_version="t", run_ts="2026-04-22T00:00:00Z",
+    (active / "design-changelog.json").write_text(
+        json.dumps({
+            "kind": "design-changelog",
+            "schema_version": 1,
+            "entries": [{
+                "round": 1,
+                "trigger": "initial",
+                "reason": "first pass",
+                "artifacts_changed": ["design.md", "scope.json", "trace.md", "test-plan.md"],
+                "added": [],
+                "removed": [],
+            }],
+        }),
+        encoding="utf-8",
     )
-    write_verdict(active / "panel-design-review.json", first)
-    record_design_review_memory(active, first)
 
-    second = PanelVerdict(
-        gate="design-review", verdict="needs_revision",
-        findings=[PanelFinding(
-            severity="risk", vendor="gemini",
-            summary="scope item too broad", targets=["primary_pair.scope.json"],
-        )],
-        source=str(packet), source_hash=hash_file(packet),
-        prompt_file="p", prompt_hash="sha256:" + "0" * 64,
-        harness_version="t", run_ts="2026-04-22T00:01:00Z",
+    first = archive_design_package(active)
+    duplicate = archive_design_package(active)
+    assert duplicate == first
+
+    original_design = (first / "design.md").read_text(encoding="utf-8")
+    current_design = (active / "design.md").read_text(encoding="utf-8")
+    (active / "design.md").write_text(
+        current_design + "\n## Changed\nnew package version\n",
+        encoding="utf-8",
     )
-    write_verdict(active / "panel-design-review.json", second)
-    record_design_review_memory(active, second)
-    record_design_review_memory(active, second)  # duplicate no-op
 
-    memory = load_design_rework_memory(active)
-    assert [r["round"] for r in memory["rounds"]] == [1, 2]
-    assert len(list((active / "design-review-history").glob("round-*.json"))) == 2
-    assert any("trace misses R1" in c for c in memory["established_constraints"])
-    assert any("scope item too broad" in c for c in memory["established_constraints"])
+    second = archive_design_package(active)
+    snapshots = sorted((active / "design-package-history").glob("package-*"))
+    assert snapshots == [first, second]
+    assert "new package version" not in original_design
+    assert "new package version" not in (first / "design.md").read_text(encoding="utf-8")
+    assert "new package version" in (second / "design.md").read_text(encoding="utf-8")
+    assert (second / "scope.json").exists()
+    assert (second / "trace.md").exists()
+    assert (second / "test-plan.md").exists()
+    assert (second / "design-changelog.json").exists()
+
+    manifest = json.loads((second / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == "design-package-snapshot"
+    assert manifest["package_hash"].startswith("sha256:")
+    assert {a["path"] for a in manifest["artifacts"]} == {
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "design-changelog.json",
+    }
+    assert not (active / "design-rework-memory.json").exists()

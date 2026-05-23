@@ -453,6 +453,38 @@ def test_parallel_dispatch_uses_threadpool(fake_invoker, monkeypatch, feature_ac
         panel_config=panel_config,
     )
     elapsed = time.monotonic() - t0
-    # 3 reviewers × 1s each serial = 3s; parallel should be ~1s-1.5s.
-    assert elapsed < 2.5, f"panel elapsed {elapsed:.2f}s — not parallel"
+    # design-review now dispatches 6 reviewers (2 groups × 3) in parallel.
+    # Serial would be ~6s; parallel should still be ~1s-1.5s. Leave a
+    # generous bound to absorb synthesizer setup overhead.
+    assert elapsed < 3.0, f"panel elapsed {elapsed:.2f}s — not parallel"
     assert v.verdict == "pass"
+
+
+def test_design_review_dual_group_writes_both_verdicts(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    """A single design-review panel run writes two verdict files —
+    panel-design-review.json and panel-trace-review.json — each tagged
+    with its own group name."""
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
+    artifact = _make_artifact(feature_active)
+    run_panel_gate_internal(
+        gate="design-review",
+        feature_active=feature_active,
+        primary_artifact=artifact,
+        prompt_file_for_audit=artifact,
+        consulted_docs=[],
+        panel_config=panel_config,
+    )
+    dr_path = feature_active / "panel-design-review.json"
+    tr_path = feature_active / "panel-trace-review.json"
+    assert dr_path.exists()
+    assert tr_path.exists()
+    dr = load_verdict(dr_path)
+    tr = load_verdict(tr_path)
+    assert dr.gate == "design-review"
+    assert tr.gate == "trace-review"
+    # Both groups share the same primary artifact.
+    assert dr.source == str(artifact)
+    assert tr.source == str(artifact)
+    assert dr.source_hash == tr.source_hash

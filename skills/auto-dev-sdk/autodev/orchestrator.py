@@ -15,7 +15,7 @@ from autodev.artifacts.design_packet import (
     write_accepted_design,
     write_design_packet,
 )
-from autodev.artifacts.design_rework_memory import record_design_review_memory
+from autodev.artifacts.design_package_history import archive_design_package
 from autodev.artifacts.implementation_index import write_implementation_index
 from autodev.artifacts.prd_checklist import write_prd_checklist
 from autodev.artifacts.revision_state import reset_prd_target_streak
@@ -40,9 +40,16 @@ from autodev.workspace import snapshot
 # Mapping from cascade artifact names → gate names (R4 / R4e).
 ARTIFACT_TO_GATE = {
     "panel_design_review": "design-review",
-    "panel_trace_review":  "trace-review",
     "panel_close_approval": "close-approval",
 }
+
+
+_VERDICT_ORDER = {"fail": 3, "needs_revision": 2, "pass": 1, "skipped": 0}
+
+
+def _worst_verdict(a: str, b: str) -> str:
+    """Return the more-severe of two verdict labels."""
+    return a if _VERDICT_ORDER.get(a, 0) >= _VERDICT_ORDER.get(b, 0) else b
 
 # Stage artifacts the orchestrator produces via vendor subprocess.
 # (Panel-review artifacts are produced by the panel subsystem, not by
@@ -168,19 +175,29 @@ class Orchestrator:
 
         Skip-gate overrides are respected — a gate with an active
         skip_gate override is not halted on.
+
+        For the design-review gate: the panel runner writes TWO verdict
+        files (panel-design-review.json + panel-trace-review.json) from
+        a single panel run. This method merges them into one
+        PanelVerdict before calling handle_panel_verdict, so the
+        revision loop sees both groups' findings in one decision.
         """
         from autodev.artifacts.verdict import load_verdict
         cascade = StalenessCascade(active)
         fresh_by_name = cascade.fresh()
-        # Map panel file name → cascade artifact name
+        # Map panel file name → cascade artifact name. trace-review is
+        # not a cascade artifact in its own right — it is pulled in by
+        # the design-review merge below.
         panel_name_by_file = {
             "panel-design-review.json": "panel_design_review",
-            "panel-trace-review.json":  "panel_trace_review",
             "panel-close-approval.json": "panel_close_approval",
         }
         overrides = ov.load(active)
         for p in sorted(active.glob("panel-*.json")):
             if p.name.endswith(".docs.json"):
+                continue
+            # Skip trace-review here — it's merged into design-review.
+            if p.name == "panel-trace-review.json":
                 continue
             cascade_name = panel_name_by_file.get(p.name)
             if cascade_name is not None and not fresh_by_name.get(cascade_name, False):
@@ -191,6 +208,16 @@ class Orchestrator:
                 continue
             if overrides.has_active_skip_gate(v.gate):
                 continue
+
+            # For design-review, attempt to merge the parallel
+            # trace-review verdict into a single PanelVerdict.
+            merged_feedback_paths: list[str] | None = None
+            if v.gate == "design-review":
+                v_merged, paths = self._merge_trace_into_design(active, v)
+                if v_merged is not None:
+                    v = v_merged
+                    merged_feedback_paths = paths
+
             if v.effectively_blocks():
                 logger.emit(
                     stage="orchestrator", event="blocking-verdict-enforced",
@@ -198,9 +225,14 @@ class Orchestrator:
                     detail={"gate": v.gate, "verdict": v.verdict,
                             "finding_count": len(v.findings)},
                 )
-                if v.gate in ("design-review", "trace-review"):
-                    record_design_review_memory(active, v)
                 decision = handle_panel_verdict(active, v.gate, v)
+                # When merging, override feedback_paths so the rerun
+                # agent reads BOTH verdict files.
+                if (
+                    merged_feedback_paths is not None
+                    and decision.kind == DecisionKind.LOCAL_REVISE
+                ):
+                    decision.feedback_paths = list(merged_feedback_paths)
                 logger.emit(stage="gate", event="revision-loop-triggered",
                             feature=feature, detail={
                                 "gate": v.gate,
@@ -348,18 +380,29 @@ class Orchestrator:
             )
         else:
             v = existing
-        if gate in ("design-review", "trace-review"):
-            record_design_review_memory(active, v)
-
         logger.emit(stage="gate", event="panel-done", feature=feature,
                     detail={"gate": gate, "verdict": v.verdict,
                             "invariant": v.has_invariant_violation()})
+
+        # For design-review, merge in the parallel trace-review verdict
+        # so blocking findings from either group route through one
+        # revision-loop decision.
+        merged_feedback_paths: list[str] | None = None
+        if gate == "design-review":
+            v_merged, merged_feedback_paths = self._merge_trace_into_design(active, v)
+            if v_merged is not None:
+                v = v_merged
 
         if v.effectively_blocks():
             # v3-core R4: revision loop picks a producer rerun based on
             # reviewer-emitted filename-qualified targets, or halts for
             # human when not auto-rerunnable / L_MAX reached.
             decision = handle_panel_verdict(active, gate, v)
+            if (
+                merged_feedback_paths is not None
+                and decision.kind == DecisionKind.LOCAL_REVISE
+            ):
+                decision.feedback_paths = list(merged_feedback_paths)
             logger.emit(stage="gate", event="revision-loop-triggered",
                         feature=feature, detail={
                             "gate": gate, "decision": decision.kind.value,
@@ -396,6 +439,59 @@ class Orchestrator:
             raise GatePending(gate, f"verdict={v.verdict}; revise or skip-gate")
         reset_prd_target_streak(active, gate)
         return AdvanceResult(stage_name=f"panel-{gate}", success=True)
+
+    def _merge_trace_into_design(
+        self, active: Path, v_design: PanelVerdict,
+    ) -> tuple[PanelVerdict | None, list[str] | None]:
+        """Return a merged design-review PanelVerdict if a fresh
+        panel-trace-review.json exists referencing the same source as
+        ``v_design``. Returns (merged, feedback_paths) or (None, None).
+        """
+        from autodev.artifacts.verdict import load_verdict
+        trace_path = active / "panel-trace-review.json"
+        if not trace_path.exists():
+            return None, None
+        try:
+            v_trace = load_verdict(trace_path)
+        except Exception:
+            return None, None
+        if v_trace.source != v_design.source or v_trace.source_hash != v_design.source_hash:
+            return None, None
+        # Decision merge: design-review group's synthesizer is the only one
+        # that emits a `decision` object today (trace-review group always has
+        # decision=None). If design's decision says "pass" but trace has
+        # blocking findings, the merged decision MUST NOT be "pass" — the
+        # design-review group's verdict is not authoritative over the whole
+        # design evaluation. Drop the decision in that case so handle_panel_verdict
+        # falls back to filename-based dispatch on the merged findings list.
+        trace_has_blocking = any(
+            f.severity in ("invariant_violation", "risk")
+            for f in v_trace.findings
+        )
+        merged_decision = v_design.decision
+        if (
+            merged_decision is not None
+            and merged_decision.outcome == "pass"
+            and trace_has_blocking
+        ):
+            merged_decision = None
+        merged = PanelVerdict(
+            gate="design-review",
+            verdict=_worst_verdict(v_design.verdict, v_trace.verdict),  # type: ignore[arg-type]
+            findings=list(v_design.findings) + list(v_trace.findings),
+            source=v_design.source,
+            source_hash=v_design.source_hash,
+            prompt_file=v_design.prompt_file,
+            prompt_hash=v_design.prompt_hash,
+            harness_version=v_design.harness_version,
+            run_ts=v_design.run_ts,
+            consulted_docs=v_design.consulted_docs,
+            per_vendor_raw={**v_design.per_vendor_raw, **v_trace.per_vendor_raw},
+            dropped_findings=list(v_design.dropped_findings) + list(v_trace.dropped_findings),
+            coverage_map={**v_design.coverage_map, **v_trace.coverage_map},
+            decision=merged_decision,
+        )
+        return merged, ["panel-design-review.json", "panel-trace-review.json"]
 
     def _apply_revision_invalidation(self, active: Path, decision: Decision) -> None:
         """Delete artifacts so cascade re-runs ``decision.stage_to_rerun``.
@@ -464,6 +560,28 @@ class Orchestrator:
             skip_who=skip_record.who if skip_record else "",
         )
         write_verdict(active / f"panel-{gate}.json", v)
+        # design-review's panel run normally writes BOTH
+        # panel-design-review.json and panel-trace-review.json from one
+        # invocation; when skip-gate substitutes for the panel run, we
+        # must mirror that contract so write_accepted_design has both
+        # verdict files to seal against.
+        if gate == "design-review":
+            from autodev.panel.runner import review_prompt_path
+            trace_prompt = review_prompt_path("trace-review")
+            v_trace = PanelVerdict(
+                gate="trace-review",
+                verdict="skipped",
+                findings=[],
+                source=str(primary),
+                source_hash=hash_file(primary),
+                prompt_file=str(trace_prompt),
+                prompt_hash=hash_file(trace_prompt) if trace_prompt.exists() else "sha256:" + "0" * 64,
+                harness_version=HARNESS_VERSION,
+                run_ts=datetime.now(timezone.utc).isoformat(),
+                skip_reason=skip_record.reason if skip_record else "",
+                skip_who=skip_record.who if skip_record else "",
+            )
+            write_verdict(active / "panel-trace-review.json", v_trace)
 
     # ------------------------------------------------------------------
     # Coding-stage dispatch (G2 — phase-2)
@@ -539,9 +657,17 @@ class Orchestrator:
                 allowed_write_paths=allowed_write_paths,
                 pre_snap=pre_snap,
             )
+            archive_path = None
+            if stage == "design":
+                archive_path = archive_design_package(active)
+            detail = {
+                "artifact": str(primary_target),
+                "elapsed_sec": result.elapsed_sec,
+            }
+            if archive_path is not None:
+                detail["design_package_archive"] = str(archive_path)
             logger.emit(stage=stage, event="stage-complete", feature=feature,
-                        detail={"artifact": str(primary_target),
-                                "elapsed_sec": result.elapsed_sec})
+                        detail=detail)
             return AdvanceResult(stage_name=stage, success=True)
 
         return self._advance_build_with_ralph_loop(

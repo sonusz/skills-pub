@@ -51,6 +51,8 @@ def normalize_shared_vendor(vendor: str) -> str:
         return "claude"
     if raw in {"gemini", "google"}:
         return "gemini"
+    if raw in {"cursor", "cursor-agent", "anysphere"}:
+        return "cursor"
     raise ValueError(f"unknown vendor: {vendor!r}")
 
 

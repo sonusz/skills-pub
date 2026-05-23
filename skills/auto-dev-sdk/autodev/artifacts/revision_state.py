@@ -3,14 +3,12 @@
 Shape::
 
     {
-      "L": {                         # per-gate local counter, all 3 gates
+      "L": {                         # per-gate local counter, both gates
         "design-review": <int>,
-        "trace-review": <int>,
         "close-approval": <int>
       },
       "prd_target_streak": {         # consecutive blocking PRD-target rounds
         "design-review": <int>,
-        "trace-review": <int>,
         "close-approval": <int>
       },
       "pending_feedback": {          # stage → paths list (panel verdicts or build.json)
@@ -56,7 +54,7 @@ PRD_TARGET_HALT_STREAK = 2
 
 # All panel gates tracked by L[*].
 ALL_PANEL_GATES: tuple[str, ...] = (
-    "design-review", "trace-review", "close-approval",
+    "design-review", "close-approval",
 )
 
 # Producer stage for each gate's fallback path (when reviewer findings
@@ -69,7 +67,6 @@ ALL_PANEL_GATES: tuple[str, ...] = (
 # for human decision.
 GATE_FALLBACK_PRODUCER: dict[str, str] = {
     "design-review": "design",
-    "trace-review": "design",
 }
 
 # Filename → producer stage. Used to dispatch reruns based on the
@@ -91,10 +88,6 @@ GATE_FILENAME_TO_PRODUCER: dict[str, dict[str, str]] = {
     "design-review": {
         "design.md": "design",
         "scope.json": "design",
-        "trace.md": "design",
-        "test-plan.md": "design",
-    },
-    "trace-review": {
         "trace.md": "design",
         "test-plan.md": "design",
     },

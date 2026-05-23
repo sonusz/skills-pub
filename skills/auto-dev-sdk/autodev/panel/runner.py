@@ -68,6 +68,29 @@ REVIEW_PROMPT_FILE = {
 }
 SYNTHESIZE_PROMPT_FILENAME = "synthesize.md"
 
+# When gate=="design-review" the panel runs TWO reviewer groups in parallel.
+# Each group has its own prompt file and consulted_docs filter. Both groups
+# share the same primary_artifact (design-packet.json). After the reviewers
+# finish, each group runs its own synthesizer; the harness writes TWO verdict
+# files (panel-design-review.json + panel-trace-review.json) referencing the
+# same packet. The orchestrator merges findings from both files when routing.
+DESIGN_REVIEW_GROUPS: tuple[dict, ...] = (
+    {
+        "name": "design-review",
+        "prompt_file": "review-design-review.md",
+        "verdict_file": "panel-design-review.json",
+        # None = pass through ALL consulted_docs unchanged
+        "consulted_filter": None,
+    },
+    {
+        "name": "trace-review",
+        "prompt_file": "review-trace-review.md",
+        "verdict_file": "panel-trace-review.json",
+        # Restrict to behavioral artifacts only
+        "consulted_filter": {"trace.md", "test-plan.md", "prd.md"},
+    },
+)
+
 # Minimum healthy reviewers required before we'll run the synthesizer.
 # With fewer than 2, there is no panel — just a single-model opinion —
 # and we fail fast pointing the operator at doctor.sh.
@@ -403,10 +426,10 @@ def _invoke_synthesizer(
             parsed = raw.get("structured_output") if isinstance(raw, dict) and "structured_output" in raw else raw
             return True, parsed, ""
 
-        if spec.vendor == "gemini":
+        if spec.vendor in {"gemini", "cursor"}:
             return False, None, (
-                "synthesizer vendor 'gemini' not supported: gemini CLI has no "
-                "native JSON-schema enforcement"
+                f"synthesizer vendor {spec.vendor!r} not supported: "
+                f"{spec.vendor} CLI has no native JSON-schema enforcement"
             )
         idle_callback = (
             _build_idle_callback(
@@ -633,6 +656,340 @@ def _mechanical_fallback(
     return overall, findings, "mechanical fallback"
 
 
+def _filter_consulted_docs(
+    consulted_docs: list[dict], filter_set: set[str] | None,
+) -> list[dict]:
+    """Restrict ``consulted_docs`` to entries whose basename is in
+    ``filter_set``. ``None`` passes through unchanged."""
+    if filter_set is None:
+        return list(consulted_docs)
+    return [
+        d for d in consulted_docs
+        if isinstance(d.get("path"), str)
+        and Path(d["path"]).name in filter_set
+    ]
+
+
+def _synthesize_and_build_verdict(
+    *,
+    gate_label: str,
+    reviewer_results: list[ReviewerResult],
+    primary_artifact: Path,
+    prompt_file_for_audit: Path,
+    consulted_docs: list[dict],
+    per_vendor_raw: dict[str, str],
+    panel_config: PanelConfig,
+    feature_active: Path,
+    vendor_cwd: Path,
+    probe_config: ProbeConfig | None,
+    log_emit: Callable[[dict], None] | None,
+) -> tuple[PanelVerdict, Path, str | None]:
+    """Run the synthesizer for a single reviewer group and build the
+    PanelVerdict. Returns (verdict, output_path, synth_infra_error_or_None).
+
+    The caller writes the verdict, decides whether to raise PreflightError
+    based on ``synth_infra_error``, and is responsible for orchestrating
+    multiple group calls.
+    """
+    cfg = panel_config
+
+    synth_prompt = _compose_synthesizer_prompt(
+        gate=gate_label, artifact_path=primary_artifact,
+        reviewer_results=reviewer_results,
+        feature_active=feature_active,
+    )
+
+    synth_ok, synth_parsed, synth_detail = _invoke_synthesizer(
+        cfg.synthesizer, synth_prompt, cfg.synthesizer_probe_interval_sec,
+        cwd=vendor_cwd,
+        debug_dir=feature_active,
+        probe_config=probe_config,
+        log_emit=log_emit,
+    )
+
+    findings: list[PanelFinding] = []
+    coverage_map: dict[str, list[dict]] = {}
+    decision: ReviewDecision | None = None
+    synth_infra_error: str | None = None
+    if synth_ok and synth_parsed:
+        per_reviewer = synth_parsed.get("per_reviewer", [])
+        per_vendor_verdicts: list[str] = []
+        for entry in per_reviewer:
+            vendor = entry.get("vendor", "unknown")
+            per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
+            if entry.get("coverage"):
+                coverage_map[vendor] = list(entry.get("coverage", []))
+            for f in entry.get("findings", []):
+                findings.append(PanelFinding(
+                    severity=f.get("severity", "opinion"),
+                    vendor=vendor,
+                    summary=f.get("summary", ""),
+                    targets=list(f.get("targets", [])),
+                ))
+        if gate_label == "design-review" and isinstance(synth_parsed.get("decision"), dict):
+            decision = _normalize_design_review_decision(
+                feature_active=feature_active,
+                decision_payload=synth_parsed["decision"],
+                findings=findings,
+            )
+            verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
+        else:
+            verdict_str = _derive_overall_verdict(per_vendor_verdicts)
+    else:
+        findings = [
+            PanelFinding(
+                severity="invariant_violation",
+                vendor="harness",
+                summary=(
+                    f"synthesizer_failed: {synth_detail[:300]}. The "
+                    f"harness cannot determine a verdict because the "
+                    f"synthesizer's output was not parseable JSON. "
+                    f"Re-running the producer will not help — fix the "
+                    f"synthesizer prompt, the synthesizer model "
+                    f"choice, or `autodev escalate` for human review."
+                ),
+                targets=[],
+            ),
+        ]
+        verdict_str = "fail"
+        synth_infra_error = synth_detail or "synthesizer call failed"
+
+    # v3-core R3 — anchor-filter post-processing. Findings whose targets
+    # are all-anchor move to dropped_findings[]; unknown/malformed target
+    # strings default to primary_pair and are logged as warnings.
+    feature_log = JsonlLog(feature_active / "log.jsonl")
+    warnings: list[str] = []
+    kept_findings, dropped = filter_anchor_findings(
+        findings, warn=warnings.append,
+    )
+    if decision is not None:
+        _validate_design_review_targets(kept_findings + [  # keep invariant after audit-only filtering
+            PanelFinding(
+                severity=df.severity,
+                vendor=df.vendor,
+                summary=df.summary,
+                targets=df.targets,
+            )
+            for df in dropped
+        ])
+    for w in warnings:
+        feature_log.emit(stage="gate", event="anchor-filter-warning",
+                         feature=feature_active.parent.name,
+                         detail={"gate": gate_label, "message": w})
+    if synth_ok and synth_parsed and decision is None:
+        has_blocking = any(
+            f.severity in ("invariant_violation", "risk") for f in kept_findings
+        )
+        verdict_str = "needs_revision" if has_blocking else "pass"
+
+    v = PanelVerdict(
+        gate=gate_label, verdict=verdict_str,  # type: ignore[arg-type]
+        findings=kept_findings,
+        source=str(primary_artifact),
+        source_hash=hash_file(primary_artifact),
+        prompt_file=str(prompt_file_for_audit),
+        prompt_hash=hash_file(prompt_file_for_audit),
+        harness_version=HARNESS_VERSION,
+        run_ts=datetime.now(timezone.utc).isoformat(),
+        consulted_docs=consulted_docs,
+        per_vendor_raw=per_vendor_raw,
+        dropped_findings=dropped,
+        coverage_map=coverage_map,
+        decision=decision,
+    )
+    out_path = feature_active / f"panel-{gate_label}.json"
+    return v, out_path, synth_infra_error
+
+
+def _run_one_group_pipeline(
+    *,
+    group_spec: dict,
+    primary_artifact: Path,
+    prompt_file_for_audit: Path,
+    panel_config: PanelConfig,
+    feature_active: Path,
+    vendor_cwd: Path,
+    probe_config: ProbeConfig | None,
+    log_emit: Callable[[dict], None] | None,
+) -> tuple[PanelVerdict, Path, str | None]:
+    """Run one reviewer group's complete pipeline: 3 reviewers in parallel,
+    then synthesize (or write a degraded verdict if <2 healthy reviewers).
+
+    Returns (verdict, output_path, synth_infra_error_or_None). The caller
+    writes the verdict (kept out of this helper so dual-group orchestration
+    can decide error-handling policy across groups).
+    """
+    cfg = panel_config
+
+    # Dispatch this group's reviewers concurrently (3-wide).
+    reviewer_results: list[ReviewerResult] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(len(cfg.reviewers), 1),
+        thread_name_prefix=f"panel-{group_spec['name']}",
+    ) as pool:
+        futs = [
+            pool.submit(
+                _invoke_reviewer,
+                r,
+                group_spec["reviewer_prompt"],
+                cfg.reviewer_probe_interval_sec,
+                cwd=vendor_cwd,
+                context_files=group_spec["reviewer_context_files"],
+                probe_config=probe_config,
+                log_emit=log_emit,
+            )
+            for r in cfg.reviewers
+        ]
+        for fut in concurrent.futures.as_completed(futs):
+            reviewer_results.append(fut.result())
+
+    # Sort by configured vendor order for stable audit output.
+    order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
+    reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+
+    healthy = [r for r in reviewer_results if r.ok]
+    per_vendor_raw = {r.vendor: r.output for r in reviewer_results if r.ok}
+    for r in reviewer_results:
+        if not r.ok:
+            per_vendor_raw[r.vendor] = f"[NO RESPONSE — {r.failure_detail}]"
+
+    out_path = feature_active / group_spec["verdict_file"]
+
+    # Degraded path: skip synthesizer, return harness-authored verdict.
+    if len(healthy) < MIN_HEALTHY_REVIEWERS:
+        missing = [r.vendor for r in reviewer_results if not r.ok]
+        finding = PanelFinding(
+            severity="invariant_violation", vendor="harness",
+            summary=(
+                f"panel degraded: only {len(healthy)} of {len(reviewer_results)} "
+                f"reviewers responded (missing: {', '.join(missing) or 'n/a'}). "
+                f"Divergence signal requires ≥{MIN_HEALTHY_REVIEWERS}. "
+                f"Debug: {_doctor_hint()}. Do not skip-gate — fix the vendor(s) "
+                f"or `autodev escalate` the feature for human review."
+            ),
+        )
+        v = PanelVerdict(
+            gate=group_spec["name"], verdict="fail",  # type: ignore[arg-type]
+            findings=[finding],
+            source=str(primary_artifact),
+            source_hash=hash_file(primary_artifact),
+            prompt_file=str(prompt_file_for_audit),
+            prompt_hash=hash_file(prompt_file_for_audit),
+            harness_version=HARNESS_VERSION,
+            run_ts=datetime.now(timezone.utc).isoformat(),
+            consulted_docs=group_spec["consulted_docs"],
+            per_vendor_raw=per_vendor_raw,
+        )
+        return v, out_path, None
+
+    # Healthy → synthesize immediately (no barrier waiting for other group).
+    return _synthesize_and_build_verdict(
+        gate_label=group_spec["name"],
+        reviewer_results=reviewer_results,
+        primary_artifact=primary_artifact,
+        prompt_file_for_audit=prompt_file_for_audit,
+        consulted_docs=group_spec["consulted_docs"],
+        per_vendor_raw=per_vendor_raw,
+        panel_config=panel_config,
+        feature_active=feature_active,
+        vendor_cwd=vendor_cwd,
+        probe_config=probe_config,
+        log_emit=log_emit,
+    )
+
+
+def _run_dual_group_design_review(
+    *,
+    feature_active: Path,
+    primary_artifact: Path,
+    prompt_file_for_audit: Path,
+    consulted_docs: list[dict],
+    panel_config: PanelConfig,
+    repo_root: Path | None,
+    probe_config: ProbeConfig | None,
+    log_emit: Callable[[dict], None] | None,
+) -> PanelVerdict:
+    """Run the design-review gate as two reviewer groups (design-review +
+    trace-review) sharing one primary_artifact (design-packet.json).
+
+    Each group runs its own pipeline (3 reviewers → synthesizer) concurrently
+    and independently. Whichever group's reviewers finish first immediately
+    starts its synthesizer; neither group waits on the other. Writes BOTH
+    verdict files; returns the design-review group's PanelVerdict. The
+    orchestrator merges findings from both files when routing.
+    """
+    vendor_cwd = repo_root or feature_active
+
+    # Build per-group reviewer prompts and context files up-front.
+    group_specs: list[dict] = []
+    for group in DESIGN_REVIEW_GROUPS:
+        group_docs = _filter_consulted_docs(consulted_docs, group["consulted_filter"])
+        group_specs.append({
+            "name": group["name"],
+            "prompt_file": group["prompt_file"],
+            "verdict_file": group["verdict_file"],
+            "consulted_docs": group_docs,
+            "reviewer_prompt": _compose_reviewer_prompt(
+                gate=group["name"],
+                artifact_path=primary_artifact,
+                consulted_docs=group_docs,
+                feature_active=feature_active,
+                repo_root=repo_root,
+            ),
+            "reviewer_context_files": _reviewer_context_files(
+                primary_artifact=primary_artifact,
+                consulted_docs=group_docs,
+            ),
+        })
+
+    # Run two group pipelines concurrently; each is reviewers → synthesizer
+    # in sequence WITHIN the group, but groups run independently — no barrier.
+    pipeline_results: dict[str, tuple[PanelVerdict, Path, str | None]] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(group_specs),
+        thread_name_prefix="panel-group",
+    ) as pool:
+        future_to_name = {
+            pool.submit(
+                _run_one_group_pipeline,
+                group_spec=gs,
+                primary_artifact=primary_artifact,
+                prompt_file_for_audit=prompt_file_for_audit,
+                panel_config=panel_config,
+                feature_active=feature_active,
+                vendor_cwd=vendor_cwd,
+                probe_config=probe_config,
+                log_emit=log_emit,
+            ): gs["name"]
+            for gs in group_specs
+        }
+        for fut in concurrent.futures.as_completed(future_to_name):
+            pipeline_results[future_to_name[fut]] = fut.result()
+
+    # Write verdicts in declared order; collect any synth infra errors.
+    written: dict[str, PanelVerdict] = {}
+    infra_errors: list[tuple[str, str]] = []
+    for gs in group_specs:
+        v, out_path, err = pipeline_results[gs["name"]]
+        write_verdict(out_path, v)
+        written[gs["name"]] = v
+        if err is not None:
+            infra_errors.append((gs["name"], err))
+
+    if infra_errors:
+        from autodev.errors import PreflightError
+        names = ", ".join(n for n, _ in infra_errors)
+        first_err = infra_errors[0][1]
+        raise PreflightError(
+            f"panel design-review: synthesizer infrastructure error in "
+            f"group(s) {names} — {first_err[:200]}. Verdict files written "
+            f"for audit. Cannot determine content verdict; halting run. "
+            f"Fix the synthesizer prompt/model or `autodev escalate`."
+        )
+
+    return written["design-review"]
+
+
 def run_panel_gate_internal(
     *,
     gate: str,
@@ -676,6 +1033,20 @@ def run_panel_gate_internal(
         out_path = feature_active / f"panel-{gate}.json"
         write_verdict(out_path, v)
         return v
+
+    # design-review runs TWO reviewer groups (design-review + trace-review),
+    # writing two verdict files. close-approval uses the single-group path.
+    if gate == "design-review":
+        return _run_dual_group_design_review(
+            feature_active=feature_active,
+            primary_artifact=primary_artifact,
+            prompt_file_for_audit=prompt_file_for_audit,
+            consulted_docs=consulted_docs,
+            panel_config=panel_config,
+            repo_root=repo_root,
+            probe_config=probe_config,
+            log_emit=log_emit,
+        )
 
     reviewer_prompt = _compose_reviewer_prompt(
         gate=gate, artifact_path=primary_artifact, consulted_docs=consulted_docs,
@@ -747,122 +1118,19 @@ def run_panel_gate_internal(
         write_verdict(out_path, v)
         return v
 
-    synth_prompt = _compose_synthesizer_prompt(
-        gate=gate, artifact_path=primary_artifact,
+    v, out_path, synth_infra_error = _synthesize_and_build_verdict(
+        gate_label=gate,
         reviewer_results=reviewer_results,
+        primary_artifact=primary_artifact,
+        prompt_file_for_audit=prompt_file_for_audit,
+        consulted_docs=consulted_docs,
+        per_vendor_raw=per_vendor_raw,
+        panel_config=panel_config,
         feature_active=feature_active,
-    )
-
-    synth_ok, synth_parsed, synth_detail = _invoke_synthesizer(
-        cfg.synthesizer, synth_prompt, cfg.synthesizer_probe_interval_sec,
-        cwd=vendor_cwd,
-        debug_dir=feature_active,
+        vendor_cwd=vendor_cwd,
         probe_config=probe_config,
         log_emit=log_emit,
     )
-
-    findings: list[PanelFinding] = []
-    coverage_map: dict[str, list[dict]] = {}
-    decision: ReviewDecision | None = None
-    synth_infra_error: str | None = None
-    if synth_ok and synth_parsed:
-        per_reviewer = synth_parsed.get("per_reviewer", [])
-        per_vendor_verdicts: list[str] = []
-        for entry in per_reviewer:
-            vendor = entry.get("vendor", "unknown")
-            per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
-            if entry.get("coverage"):
-                coverage_map[vendor] = list(entry.get("coverage", []))
-            for f in entry.get("findings", []):
-                findings.append(PanelFinding(
-                    severity=f.get("severity", "opinion"),
-                    vendor=vendor,
-                    summary=f.get("summary", ""),
-                    targets=list(f.get("targets", [])),
-                ))
-        if gate == "design-review" and isinstance(synth_parsed.get("decision"), dict):
-            decision = _normalize_design_review_decision(
-                feature_active=feature_active,
-                decision_payload=synth_parsed["decision"],
-                findings=findings,
-            )
-            verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
-        else:
-            verdict_str = _derive_overall_verdict(per_vendor_verdicts)
-    else:
-        # Synthesizer non-JSON / timeout / exit-nonzero is a HARNESS
-        # infrastructure error, not a content judgment. We cannot
-        # determine whether the artifact is OK because the synthesizer
-        # crashed. Write the fail verdict for audit, then raise
-        # PreflightError so the orchestrator halts the run cleanly
-        # instead of letting revision_loop dispatch a fallback rerun
-        # (which would burn L cycles on a fake panel rejection).
-        findings = [
-            PanelFinding(
-                severity="invariant_violation",
-                vendor="harness",
-                summary=(
-                    f"synthesizer_failed: {synth_detail[:300]}. The "
-                    f"harness cannot determine a verdict because the "
-                    f"synthesizer's output was not parseable JSON. "
-                    f"Re-running the producer will not help — fix the "
-                    f"synthesizer prompt, the synthesizer model "
-                    f"choice, or `autodev escalate` for human review."
-                ),
-                targets=[],
-            ),
-        ]
-        verdict_str = "fail"
-        synth_infra_error = synth_detail or "synthesizer call failed"
-
-    # v3-core R3 — anchor-filter post-processing. Findings whose targets
-    # are all-anchor move to dropped_findings[]; unknown/malformed target
-    # strings default to primary_pair and are logged as warnings.
-    feature_log = JsonlLog(feature_active / "log.jsonl")
-    warnings: list[str] = []
-    kept_findings, dropped = filter_anchor_findings(
-        findings, warn=warnings.append,
-    )
-    if decision is not None:
-        _validate_design_review_targets(kept_findings + [  # keep invariant after audit-only filtering
-            PanelFinding(
-                severity=df.severity,
-                vendor=df.vendor,
-                summary=df.summary,
-                targets=df.targets,
-            )
-            for df in dropped
-        ])
-    for w in warnings:
-        feature_log.emit(stage="gate", event="anchor-filter-warning",
-                         feature=feature_active.parent.name,
-                         detail={"gate": gate, "message": w})
-    # After filter, derive top-level verdict (R4): `pass` if no
-    # invariant_violation or risk findings in kept_findings; else
-    # needs_revision. `fail` reserved for synthesizer errors (already
-    # set above when synth_ok was False).
-    if synth_ok and synth_parsed and decision is None:
-        has_blocking = any(
-            f.severity in ("invariant_violation", "risk") for f in kept_findings
-        )
-        verdict_str = "needs_revision" if has_blocking else "pass"
-
-    v = PanelVerdict(
-        gate=gate, verdict=verdict_str,  # type: ignore[arg-type]
-        findings=kept_findings,
-        source=str(primary_artifact),
-        source_hash=hash_file(primary_artifact),
-        prompt_file=str(prompt_file_for_audit),
-        prompt_hash=hash_file(prompt_file_for_audit),
-        harness_version=HARNESS_VERSION,
-        run_ts=datetime.now(timezone.utc).isoformat(),
-        consulted_docs=consulted_docs,
-        per_vendor_raw=per_vendor_raw,
-        dropped_findings=dropped,
-        coverage_map=coverage_map,
-        decision=decision,
-    )
-    out_path = feature_active / f"panel-{gate}.json"
     write_verdict(out_path, v)
     if synth_infra_error is not None:
         # Synthesizer infrastructure error: verdict written for audit,

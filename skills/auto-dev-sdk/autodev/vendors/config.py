@@ -30,11 +30,43 @@ ALLOWED_VENDORS = {"claude", "codex", "openai"}
 
 # Panel review vendors (gemini welcomed as a reviewer).
 PANEL_REVIEWER_VENDORS = {"claude", "codex", "openai", "gemini"}
-# Synthesizer requires native JSON-schema output (currently only claude).
-PANEL_SYNTHESIZER_VENDORS = {"claude"}
+# Synthesizer requires native JSON-schema output (claude via --json-schema,
+# codex/openai via --output-schema; gemini and cursor lack native enforcement).
+PANEL_SYNTHESIZER_VENDORS = {"claude", "codex", "openai"}
 # The idle probe is a short, read-only LLM call. Keep it on coding-capable
 # CLIs that accept prompt-on-stdin in headless mode.
 PROBE_VENDORS = {"claude", "codex", "openai"}
+
+# Cursor proxies many backends. For panel diversity we care about the underlying
+# LLM provider, not the `cursor` proxy. These substrings are matched against the
+# lowercased model id; first match wins. Unknown ids fall back to a per-model
+# sentinel so two distinct unknown models still count as distinct, while two
+# entries naming the exact same unknown model collide.
+_CURSOR_MODEL_VENDOR_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("claude", "claude"),
+    ("sonnet", "claude"),
+    ("opus", "claude"),
+    ("haiku", "claude"),
+    ("anthropic", "claude"),
+    ("gpt", "openai"),
+    ("codex", "openai"),
+    ("chatgpt", "openai"),
+    ("o1-", "openai"),
+    ("o3-", "openai"),
+    ("o4-", "openai"),
+    ("openai", "openai"),
+    ("gemini", "gemini"),
+    ("composer", "cursor"),
+)
+
+
+def _infer_cursor_underlying_vendor(model: str) -> str:
+    """Best-effort map cursor model id → underlying provider for diversity checks."""
+    m = model.strip().lower()
+    for kw, ven in _CURSOR_MODEL_VENDOR_KEYWORDS:
+        if kw in m:
+            return ven
+    return f"cursor:{m}"
 
 DEFAULT_TIMEOUT_SEC = 1800
 DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC = 600
@@ -211,7 +243,12 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
     if not isinstance(reviewers_raw, list) or not reviewers_raw:
         raise ConfigError(f"{path}: panel.reviewers must be a non-empty list")
     rs: list[PanelReviewerSpec] = []
-    seen: set[str] = set()
+    # Diversity is enforced on the *effective* provider. For non-cursor vendors
+    # that's the vendor name; for cursor it's the underlying provider inferred
+    # from the model id (so two cursor entries proxying different backends are
+    # allowed, and a cursor entry proxying e.g. claude collides with a native
+    # claude entry).
+    seen_providers: dict[str, tuple[str, str]] = {}
     for i, entry in enumerate(reviewers_raw):
         if not isinstance(entry, dict):
             raise ConfigError(f"{path}: panel.reviewers[{i}] must be a mapping")
@@ -225,12 +262,21 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
             raise ConfigError(
                 f"{path}: panel.reviewers[{i}].vendor {v!r} not in {PANEL_REVIEWER_VENDORS}"
             )
-        if v in seen:
-            raise ConfigError(f"{path}: panel.reviewers vendor {v!r} listed twice")
-        seen.add(v)
         model = entry["model"]
         if not isinstance(model, str) or not model.strip():
             raise ConfigError(f"{path}: panel.reviewers[{i}].model must be non-empty string")
+        effective_provider = (
+            _infer_cursor_underlying_vendor(model) if v == "cursor" else v
+        )
+        if effective_provider in seen_providers:
+            prev_vendor, prev_model = seen_providers[effective_provider]
+            raise ConfigError(
+                f"{path}: panel.reviewers entry vendor={v!r} model={model!r} "
+                f"collides with earlier entry vendor={prev_vendor!r} model={prev_model!r} "
+                f"(both resolve to provider {effective_provider!r}; "
+                f"panel reviewers must use distinct underlying providers)"
+            )
+        seen_providers[effective_provider] = (v, model)
         effort = _normalize_effort_value(
             entry.get("effort", ""), path=path, field=f"panel.reviewers[{i}].effort"
         )

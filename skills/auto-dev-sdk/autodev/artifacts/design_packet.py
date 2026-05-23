@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from autodev.artifacts.design_rework_memory import load_design_rework_memory
 from autodev.artifacts.verdict import load_verdict
 from autodev.artifacts.workflow_state import ensure_workflow_state, load_workflow_state
 from autodev.errors import SchemaError
@@ -142,9 +141,8 @@ def _response_to_feedback(
     """Return the design-changelog.json reference if it exists.
 
     The changelog replaces accumulated per-round verdict archives in the
-    design packet's response_to_feedback field. design-rework-memory.json
-    and round-NNN.json files continue to be archived for audit purposes
-    but are no longer consumed by the active loop.
+    design packet's response_to_feedback field. Legacy review-memory
+    artifacts are no longer consumed by the active loop.
 
     The ``prd_path``, ``prd_hash``, and ``current_context_refs`` parameters
     are retained for call-site stability but are no longer consulted: the

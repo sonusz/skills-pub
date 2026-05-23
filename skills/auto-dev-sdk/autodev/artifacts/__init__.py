@@ -10,10 +10,7 @@ from autodev.artifacts.design_packet import (
     write_accepted_design,
     write_design_packet,
 )
-from autodev.artifacts.design_rework_memory import (
-    load_design_rework_memory,
-    record_design_review_memory,
-)
+from autodev.artifacts.design_package_history import archive_design_package
 from autodev.artifacts.workflow_state import (
     bootstrap_workflow_state,
     discover_root_context_paths,
@@ -49,7 +46,7 @@ __all__ = [
     "read_markdown_with_hash", "write_markdown_with_hash",
     "accepted_design_fresh", "build_design_packet", "design_packet_fresh",
     "write_accepted_design", "write_design_packet",
-    "load_design_rework_memory", "record_design_review_memory",
+    "archive_design_package",
     "bootstrap_workflow_state", "discover_root_context_paths",
     "ensure_workflow_state", "load_workflow_state",
     "workflow_state_path", "write_workflow_state",

@@ -22,8 +22,7 @@ class ArtifactRef:
 
 # Unified design-stage graph.
 #   prd → {design, scope, trace, test_plan} → design_packet
-#       → panel_design_review ─┐
-#       → panel_trace_review  ─┴→ accepted_design → build
+#       → panel_design_review → accepted_design → build
 #       → implementation_index → spec
 #   prd → prd_checklist
 #   {prd, prd_checklist, spec} → panel_close_approval
@@ -35,8 +34,7 @@ ARTIFACTS: tuple[ArtifactRef, ...] = (
     ArtifactRef("test_plan",               "test-plan.md",                   False, ("prd",)),
     ArtifactRef("design_packet",           "design-packet.json",             True,  ("design", "scope", "trace", "test_plan", "prd")),
     ArtifactRef("panel_design_review",     "panel-design-review.json",       True,  ("design_packet", "prd")),
-    ArtifactRef("panel_trace_review",      "panel-trace-review.json",        True,  ("design_packet", "prd")),
-    ArtifactRef("accepted_design",         "accepted-design.json",           True,  ("panel_design_review", "panel_trace_review", "design_packet")),
+    ArtifactRef("accepted_design",         "accepted-design.json",           True,  ("panel_design_review", "design_packet")),
     ArtifactRef("build",                   "build.json",                     True,  ("scope", "accepted_design")),
     ArtifactRef("implementation_index",    "implementation-index.json",      True,  ("build",)),
     ArtifactRef("spec",                    "implemented-spec.md",            False, ("implementation_index",)),

@@ -127,6 +127,11 @@ def test_pipeline_full_run_with_fakes(git_repo, monkeypatch):
         p = active / name
         assert p.exists(), f"missing artifact after pipeline: {name}"
 
+    package_snapshot = active / "design-package-history" / "package-001"
+    for name in ("design.md", "scope.json", "trace.md", "test-plan.md", "design-changelog.json"):
+        assert (package_snapshot / name).exists(), f"missing design package snapshot file: {name}"
+    assert not (active / "design-rework-memory.json").exists()
+
     # Both panel verdicts should be pass.
     for gate in ("design-review", "close-approval"):
         v = json.loads((active / f"panel-{gate}.json").read_text())
