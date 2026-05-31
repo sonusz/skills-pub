@@ -72,6 +72,11 @@ claims to test is a gap. Specifically:
   mocks out time entirely does not count.
 - Each trace row must be traceable to at least one test case
   whose description unambiguously covers the same condition.
+- Trace rows cite test-plan **Test IDs** (`<scope-id>.t<N>`) in
+  their `Test(s)` column. Verify each cited ID resolves to a real
+  Test Cases row AND that test genuinely exercises the row's
+  condition — a dangling ID, or one pointing at a happy-path test,
+  is a gap.
 
 **Q6 — Testability fit**: Are the test tiers (unit/integration/
 e2e) and fixture strategies in test-plan.md appropriate for the

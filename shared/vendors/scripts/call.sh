@@ -574,6 +574,17 @@ run_one_vendor() {
   call_dir=$(dirname "$output_file")
   timeout_marker="$call_dir/timed-out"
   usage_file="$call_dir/usage.json"
+  VENDORS_STREAM_FILE="$call_dir/stream"
+  rm -f "$VENDORS_STREAM_FILE"
+  if [ "$vendor_id" = "openai" ]; then
+    VENDORS_TRANSCRIPT_FILE="$call_dir/codex-transcript.txt"
+    ln -s "$(basename "$VENDORS_TRANSCRIPT_FILE")" "$VENDORS_STREAM_FILE" 2>/dev/null \
+      || VENDORS_STREAM_FILE="$VENDORS_TRANSCRIPT_FILE"
+  else
+    VENDORS_TRANSCRIPT_FILE="$output_file"
+    ln -s "$(basename "$output_file")" "$VENDORS_STREAM_FILE" 2>/dev/null \
+      || VENDORS_STREAM_FILE="$output_file"
+  fi
 
   if ! command -v "$cli" >/dev/null 2>&1; then
     printf '{"available":false,"provider":"%s","total_tokens":null,"reason":"CLI not on PATH"}\n' \
@@ -585,6 +596,7 @@ run_one_vendor() {
         printf "label=%s\n" "$label"
         printf "exit_code=127\n"
         printf "output=%s\n" "$output_file"
+        printf "stream=%s\n" "$VENDORS_STREAM_FILE"
         printf "log=%s\n" "$log_file"
         printf "usage=%s\n" "$usage_file"
         printf "reason=CLI not on PATH\n"
@@ -601,7 +613,6 @@ run_one_vendor() {
   VENDORS_VENDOR_CLI="$cli"
   VENDORS_RESOLVED_MODEL=$(vendors_select_model "$vendor_id" "$MODEL_OVERRIDE")
   VENDORS_RESOLVED_EFFORT=$(vendors_map_effort "$vendor_id" "$EFFORT")
-  VENDORS_TRANSCRIPT_FILE="$call_dir/codex-transcript.txt"
 
   run_status=0
   if [ "$TIMEOUT_SECONDS" -gt 0 ] && [ "$VENDORS_DRY_RUN" != "1" ]; then
@@ -642,6 +653,7 @@ run_one_vendor() {
       printf "label=%s\n" "$label"
       printf "exit_code=%s\n" "$code"
       printf "output=%s\n" "$output_file"
+      printf "stream=%s\n" "$VENDORS_STREAM_FILE"
       printf "log=%s\n" "$log_file"
       printf "usage=%s\n" "$usage_file"
       if [ "$code" = "124" ]; then

@@ -134,6 +134,22 @@ place." Use this protocol instead:
    only adding a trace row, only splitting a scope item, or only
    rewording prose.
 
+7. **Produce clean, current-state artifacts — no round-by-round
+   archaeology.** Each rerun must leave the four artifacts reading as if
+   authored fresh today for the *current* design. Do NOT narrate revision
+   history inside them — strip any existing such text and never add new:
+   "Round-N addition", "closes trace-review/design-review …", "from round
+   N", "(was previously …/now …)", "(closes … risk)". That rationale
+   belongs ONLY in `design-changelog.json` (the single home for
+   why-it-changed). The four artifacts state *what to build now*; the
+   changelog records *how we got here*. When revising a row/section,
+   REPLACE its prose with the clean current statement — never append a
+   justification clause referencing a past round or a reviewer. This
+   narration is the primary cause of packet bloat (it accretes every
+   round until a reviewer's context window overflows) and it biases the
+   panel by arguing prior findings at it instead of presenting the design
+   on its own merits.
+
 ### Job (a) — architectural commitment (→ design.md)
 
 Turn the PRD's problem statement into a concrete architectural
@@ -298,21 +314,34 @@ G1 checks six things. Optimize for all six:
    Code Path | Status | Source`.
 
    - `Req ID` format: `<scope-id>.r<N>`, unique.
-   - All rows start `Status: pending`; `Test(s)` and `Code
-     Path` are `--` (build fills them).
+   - `Test(s)` references test-plan **Test IDs** (e.g.
+     `aps-1.t3, aps-1.t7`), never prose. Populate it at design
+     time — test-plan.md is authored in this same stage (step 6),
+     so the linkage exists now; do not defer to build.
+   - All rows start `Status: pending`; `Code Path` is `--`
+     (build fills it).
    - `Source` tag (one of): `prd:<section>` | `design:<section>`
      | `scope:<id>` | `trace:<req-id>` | `inferred` |
      `commonsense`.
 
-6. **Author test-plan.md.** Three sections:
+6. **Author test-plan.md.** Two sections:
    - **Test Strategy** — tiers, fixtures, infrastructure.
-   - **Test Cases** — table `Scope ID | Description | Tier |
-     Edges | Fixtures | Source`.
-   - **Coverage Summary** — which Scope IDs are covered; any
-     gaps named.
+   - **Test Cases** — table `Test ID | Scope ID | Description |
+     Tier | Edges | Fixtures | Source`.
+     - `Test ID` format: `<scope-id>.t<N>`, unique (mirrors
+       trace's `.r<N>`). A scope item usually maps to several
+       tests, so every test must be individually addressable by
+       ID — trace `Test(s)`, panel findings, and build all
+       reference these IDs.
 
    Every Test Cases row carries a `Source:` tag (same vocab as
    trace).
+
+   Do **NOT** author a "Coverage Summary" or any self-assessment
+   of which requirements/scope items are covered. Coverage is the
+   trace-review panel's job — it derives its own PRD coverage
+   table independently. A self-graded summary both biases that
+   independent review and bloats the packet.
 
 7. **Self-verify before exit.** Check against all six goals
    above. Grep each scope_id in all four files to confirm

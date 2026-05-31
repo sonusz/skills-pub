@@ -53,7 +53,7 @@ Common arguments:
 - `--yolo` to select each vendor's no-approval/no-confirmation mode
 - `--cwd DIR` to run from a specific working directory
 - `--output-dir DIR` to write `<id>/out`, `<id>/status`, `<id>/log`,
-  and `<id>/usage.json`
+  `<id>/stream`, and `<id>/usage.json`
   for one or more calls
 - `--id ID` to choose output directory ids; repeat once per `--vendor`
 - `--min-success N` to set how many selected vendors must succeed
@@ -277,6 +277,7 @@ Outputs are always written as:
 - `<output-dir>/openai/out`
 - `<output-dir>/openai/status`
 - `<output-dir>/openai/log`
+- `<output-dir>/openai/stream`
 - `<output-dir>/openai/usage.json`
 - `<output-dir>/claude/out`
 - `<output-dir>/gemini/out`
@@ -284,7 +285,12 @@ Outputs are always written as:
 
 For a single vendor, the same contract applies. For example, `--vendor claude`
 writes `<output-dir>/claude/out`, `<output-dir>/claude/status`,
-`<output-dir>/claude/log`, and `<output-dir>/claude/usage.json`.
+`<output-dir>/claude/log`, `<output-dir>/claude/stream`, and
+`<output-dir>/claude/usage.json`.
+
+`stream` is the live transcript/progress file callers should monitor for idle
+detection while the process is running. `out` remains the final normalized model
+response and may be written only after the vendor exits.
 
 `usage.json` has normalized top-level fields for callers:
 

@@ -19,7 +19,10 @@ from autodev.artifacts.design_package_history import archive_design_package
 from autodev.artifacts.implementation_index import write_implementation_index
 from autodev.artifacts.prd_checklist import write_prd_checklist
 from autodev.artifacts.revision_state import reset_prd_target_streak
-from autodev.artifacts.verdict import PanelVerdict
+from autodev.artifacts.verdict import (
+    PanelVerdict,
+    panel_verdict_transport_incomplete,
+)
 from autodev.errors import (
     DirtyWorkspace, GateFailed, GatePending, LockConflict, PreflightError,
 )
@@ -206,6 +209,14 @@ class Orchestrator:
                 v = load_verdict(p)
             except Exception:
                 continue
+            if panel_verdict_transport_incomplete(v):
+                logger.emit(
+                    stage="gate",
+                    event="panel-transport-verdict-ignored",
+                    feature=feature,
+                    detail={"path": p.name, "gate": v.gate},
+                )
+                continue
             if overrides.has_active_skip_gate(v.gate):
                 continue
 
@@ -384,6 +395,21 @@ class Orchestrator:
                     detail={"gate": gate, "verdict": v.verdict,
                             "invariant": v.has_invariant_violation()})
 
+        # Pause checkpoint: honor a `.pause` set WHILE the panel was
+        # running. The verdict is now durably on disk (run_panel_gate
+        # wrote it), but we have not yet called handle_panel_verdict —
+        # which bumps and persists L[gate] — nor dispatched a producer
+        # rerun. Halting here means a pause set mid-panel takes effect
+        # the moment the panel finishes, before the design agent revises,
+        # instead of one round later (the only earlier checks are at
+        # loop-top and _advance_one entry, both of which precede the
+        # panel run). On resume, _enforce_pending_blocking_verdicts
+        # re-reads this fresh verdict and dispatches the revision exactly
+        # once, so L[gate] is bumped exactly once — no double-count.
+        if self._check_pause_sentinel(active):
+            logger.emit(stage="orchestrator", event="paused", feature=feature)
+            raise GatePending("pause", "run `autodev resume` to continue")
+
         # For design-review, merge in the parallel trace-review verdict
         # so blocking findings from either group route through one
         # revision-loop decision.
@@ -454,6 +480,8 @@ class Orchestrator:
         try:
             v_trace = load_verdict(trace_path)
         except Exception:
+            return None, None
+        if panel_verdict_transport_incomplete(v_trace):
             return None, None
         if v_trace.source != v_design.source or v_trace.source_hash != v_design.source_hash:
             return None, None
@@ -899,6 +927,15 @@ class Orchestrator:
     ) -> AdvanceResult:
         self._reset_ralph_state_if_inputs_changed(active, logger, feature)
         while True:
+            # Pause checkpoint between build rounds: the only outer pause
+            # check (_advance_one entry) precedes the whole Ralph loop, so
+            # without this a pause set during build round N is not seen
+            # until the loop exits — one or more rounds later. ralph-state
+            # is persisted each round, so halting here is resumable: on
+            # resume cascade re-selects "build" and re-enters this loop.
+            if self._check_pause_sentinel(active):
+                logger.emit(stage="orchestrator", event="paused", feature=feature)
+                raise GatePending("pause", "run `autodev resume` to continue")
             from autodev.prompts_loader import render_stage_prompt
             from autodev.workspace import snapshot
 

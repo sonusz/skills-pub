@@ -79,9 +79,10 @@ Notes:
   and `openai` both route through the Codex CLI.
 - All harness-owned LLM calls go through the packaged
   `shared/vendors/scripts/call.sh` interface and use its unified
-  `<id>/out`, `<id>/status`, `<id>/log` output contract.
+  `<id>/out`, `<id>/status`, `<id>/log`, `<id>/stream` output contract.
 - `probe_interval_sec` is the stream-output idle threshold for coding
-  stages and panel calls. When output is quiet for that long, the
+  stages and panel calls. The harness monitors shared/vendors'
+  `<id>/stream` live transcript. When output is quiet for that long, the
   read-only probe decides whether to extend or kill. A much larger hard
   wall-clock backstop is derived internally.
 - `effort` is the shared vendor scale `min|low|medium|high|xhigh|max`;

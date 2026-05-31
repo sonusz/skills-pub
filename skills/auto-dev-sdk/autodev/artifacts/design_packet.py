@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from autodev.artifacts.verdict import load_verdict
+from autodev.artifacts.verdict import (
+    load_verdict,
+    panel_verdict_transport_incomplete,
+)
 from autodev.artifacts.workflow_state import ensure_workflow_state, load_workflow_state
 from autodev.errors import SchemaError
 from autodev.paths import find_repo_root
@@ -351,6 +354,8 @@ def _verdict_fresh_against_packet(verdict_path: Path, packet_path: Path) -> bool
         verdict = load_verdict(verdict_path)
     except Exception:
         return False
+    if panel_verdict_transport_incomplete(verdict):
+        return False
     if verdict.source != str(packet_path):
         return False
     if verdict.source_hash != hash_file(packet_path):
@@ -385,12 +390,20 @@ def write_accepted_design(
     verdict_obj = load_verdict(verdict_path)
     trace_verdict_obj = load_verdict(trace_verdict_path)
 
-    if verdict_obj.effectively_blocks() or verdict_obj.verdict not in ("pass", "skipped"):
+    if (
+        panel_verdict_transport_incomplete(verdict_obj)
+        or verdict_obj.effectively_blocks()
+        or verdict_obj.verdict not in ("pass", "skipped")
+    ):
         raise SchemaError(
             "accepted design requires non-blocking pass/skipped "
             f"design-review verdict, got {verdict_obj.verdict!r}"
         )
-    if trace_verdict_obj.effectively_blocks() or trace_verdict_obj.verdict not in ("pass", "skipped"):
+    if (
+        panel_verdict_transport_incomplete(trace_verdict_obj)
+        or trace_verdict_obj.effectively_blocks()
+        or trace_verdict_obj.verdict not in ("pass", "skipped")
+    ):
         raise SchemaError(
             "accepted design requires non-blocking pass/skipped "
             f"trace-review verdict, got {trace_verdict_obj.verdict!r}"
@@ -442,7 +455,11 @@ def accepted_design_fresh(path: Path) -> bool:
     schema_version = data.get("schema_version", 1)
     if schema_version not in (1, 2):
         return False
-    if verdict_obj.effectively_blocks() or verdict_obj.verdict not in ("pass", "skipped"):
+    if (
+        panel_verdict_transport_incomplete(verdict_obj)
+        or verdict_obj.effectively_blocks()
+        or verdict_obj.verdict not in ("pass", "skipped")
+    ):
         return False
     if data.get("verdict") != verdict_obj.verdict:
         return False
@@ -457,6 +474,8 @@ def accepted_design_fresh(path: Path) -> bool:
         except (SchemaError, OSError):
             return False
         if trace_verdict_obj.effectively_blocks() or trace_verdict_obj.verdict not in ("pass", "skipped"):
+            return False
+        if panel_verdict_transport_incomplete(trace_verdict_obj):
             return False
         if data.get("trace_source") != str(trace_verdict_path):
             return False
@@ -473,5 +492,7 @@ def accepted_design_fresh(path: Path) -> bool:
     if not design_packet_fresh(packet_path):
         return False
     if not _verdict_fresh_against_packet(verdict_path, packet_path):
+        return False
+    if not _verdict_fresh_against_packet(trace_verdict_path, packet_path):
         return False
     return True

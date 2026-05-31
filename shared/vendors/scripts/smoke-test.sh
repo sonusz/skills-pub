@@ -360,6 +360,17 @@ for caller in openai claude gemini cursor; do
       cat "$call_dir/$vendor/status" >&2
       exit 1
     fi
+    if ! grep -q '^stream=' "$call_dir/$vendor/status"; then
+      printf "FAIL: expected live stream path in status for %s in caller %s\n" "$vendor" "$caller" >&2
+      cat "$call_dir/$vendor/status" >&2
+      exit 1
+    fi
+    stream_path=$(awk -F= '$1 == "stream" { print $2; exit }' "$call_dir/$vendor/status")
+    if [ ! -s "$stream_path" ]; then
+      printf "FAIL: expected non-empty live stream %s for %s in caller %s\n" "$stream_path" "$vendor" "$caller" >&2
+      cat "$call_dir/$vendor/status" >&2
+      exit 1
+    fi
     if ! grep -q '"available": true' "$call_dir/$vendor/usage.json" \
         || ! grep -q '"total_tokens":' "$call_dir/$vendor/usage.json"; then
       printf "FAIL: expected available token usage for %s in caller %s\n" "$vendor" "$caller" >&2

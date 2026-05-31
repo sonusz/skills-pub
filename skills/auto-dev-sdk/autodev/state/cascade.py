@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from autodev.artifacts.verdict import panel_payload_transport_incomplete
 from autodev.artifacts.design_packet import (
     accepted_design_fresh,
     design_packet_fresh,
@@ -61,7 +62,7 @@ def _canonical_upstream(ref: ArtifactRef) -> str:
     return ref.upstream[0] if ref.upstream else ref.name
 
 
-def _panel_consulted_docs_fresh(panel_verdict_path: Path) -> bool:
+def _panel_payload_and_consulted_docs_fresh(panel_verdict_path: Path) -> tuple[bool, dict]:
     """For panel verdicts: every ``consulted_docs`` entry's recorded
     ``hash`` must still match the current file hash. This covers the
     multi-upstream case where a gate's primary pair contains more than
@@ -72,14 +73,44 @@ def _panel_consulted_docs_fresh(panel_verdict_path: Path) -> bool:
     try:
         data = json.loads(panel_verdict_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
+        return False, {}
+    if panel_payload_transport_incomplete(data):
+        return False, data
     for cd in data.get("consulted_docs", []):
         p = Path(cd.get("path", ""))
         if not p.exists():
-            return False
+            return False, data
         if hash_file(p) != cd.get("hash", ""):
-            return False
-    return True
+            return False, data
+    return True, data
+
+
+def _panel_consulted_docs_fresh(panel_verdict_path: Path) -> bool:
+    ok, _ = _panel_payload_and_consulted_docs_fresh(panel_verdict_path)
+    return ok
+
+
+def _design_panel_pair_fresh(design_verdict_path: Path) -> bool:
+    """The design-review cascade node represents both parallel panel
+    groups. A stale/missing/incomplete trace-review verdict must make the
+    design-review node stale too, otherwise accepted-design can advance from
+    only half of the design gate.
+    """
+    design_ok, design_payload = _panel_payload_and_consulted_docs_fresh(
+        design_verdict_path
+    )
+    if not design_ok:
+        return False
+    trace_path = design_verdict_path.parent / "panel-trace-review.json"
+    if not trace_path.exists():
+        return True
+    trace_ok, trace_payload = _panel_payload_and_consulted_docs_fresh(trace_path)
+    if not trace_ok:
+        return False
+    return (
+        trace_payload.get("source") == design_payload.get("source")
+        and trace_payload.get("source_hash") == design_payload.get("source_hash")
+    )
 
 
 class StalenessCascade:
@@ -125,7 +156,11 @@ class StalenessCascade:
             # catches the case where scope regenerates but the panel
             # verdict's primary_hash (prd) is unchanged.
             if ref.is_json and p.name.startswith("panel-"):
-                if not _panel_consulted_docs_fresh(p):
+                if p.name == "panel-design-review.json":
+                    if not _design_panel_pair_fresh(p):
+                        result[ref.name] = False
+                        continue
+                elif not _panel_consulted_docs_fresh(p):
                     result[ref.name] = False
                     continue
             result[ref.name] = True

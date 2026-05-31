@@ -13,7 +13,7 @@ from autodev.state.atomic import atomic_write_json
 InvariantViolation = "invariant_violation"  # re-exported for convenience
 Severity = Literal["invariant_violation", "risk", "opinion"]
 Verdict = Literal["pass", "needs_revision", "fail", "skipped"]
-Gate = Literal["design-review", "close-approval"]
+Gate = Literal["design-review", "trace-review", "close-approval"]
 DecisionOutcome = Literal["pass", "retry_design", "halt_for_human"]
 
 _VALID_SEVERITY = {"invariant_violation", "risk", "opinion"}
@@ -21,6 +21,54 @@ _VALID_VERDICT = {"pass", "needs_revision", "fail", "skipped"}
 _VALID_GATE = {"design-review", "trace-review", "close-approval"}
 _VALID_DECISION_SEVERITY = {"invariant_violation", "risk", "opinion"}
 _VALID_DESIGN_REVIEW_OUTCOME = {"pass", "retry_design", "halt_for_human"}
+
+NO_RESPONSE_PREFIX = "[NO RESPONSE"
+_TRANSPORT_SUMMARY_MARKERS = ("panel degraded:", "synthesizer_failed")
+
+
+def _is_no_response_text(value: Any) -> bool:
+    return isinstance(value, str) and value.lstrip().startswith(NO_RESPONSE_PREFIX)
+
+
+def _is_transport_summary(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    low = value.strip().lower()
+    return any(marker in low for marker in _TRANSPORT_SUMMARY_MARKERS)
+
+
+def panel_payload_transport_incomplete(raw: dict[str, Any]) -> bool:
+    """True when a persisted panel verdict represents panel transport
+    failure rather than a content review result.
+
+    Older harness versions wrote missing reviewer / synthesizer failures as
+    harness-authored invariant violations. Treat those as non-verdicts so the
+    orchestrator retries the panel instead of spending a design revision.
+    """
+    per_vendor = raw.get("per_vendor_raw", {})
+    if isinstance(per_vendor, dict) and any(
+        _is_no_response_text(v) for v in per_vendor.values()
+    ):
+        return True
+    findings = raw.get("findings", [])
+    if isinstance(findings, list):
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            if finding.get("vendor") == "harness" and _is_transport_summary(
+                finding.get("summary")
+            ):
+                return True
+    return False
+
+
+def panel_verdict_transport_incomplete(v: "PanelVerdict") -> bool:
+    if any(_is_no_response_text(v) for v in v.per_vendor_raw.values()):
+        return True
+    return any(
+        f.vendor == "harness" and _is_transport_summary(f.summary)
+        for f in v.findings
+    )
 
 
 @dataclass

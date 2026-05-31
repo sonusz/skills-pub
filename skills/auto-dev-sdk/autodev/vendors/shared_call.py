@@ -81,6 +81,23 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _live_stream_file(call_dir: Path, normalized_vendor: str) -> Path:
+    """Return the shared-vendors live stream file for idle probing.
+
+    Newer shared/vendors exposes `<id>/stream` for every provider. Keep a
+    fallback for older checkouts so the SDK remains diagnosable when the
+    bundled shell scripts are out of sync.
+    """
+    stream = call_dir / "stream"
+    if stream.exists():
+        return stream
+    if normalized_vendor == "openai":
+        transcript = call_dir / "codex-transcript.txt"
+        if transcript.exists():
+            return transcript
+    return call_dir / "out"
+
+
 def _candidate_binary_env_keys(vendor: str) -> list[str]:
     raw = vendor.strip().upper()
     cli = cli_name_for_vendor(vendor).upper()
@@ -287,7 +304,6 @@ def call_shared_vendor(
             # to keep waiting or kill the subprocess group.
             summary_out_path = work_dir / "summary.out"
             summary_err_path = work_dir / "summary.err"
-            stream_file = call_dir / "out"
             outer_timed_out = False
             with open(summary_out_path, "w") as so_f, open(summary_err_path, "w") as se_f:
                 proc = subprocess.Popen(
@@ -308,6 +324,7 @@ def call_shared_vendor(
                         break  # natural exit
                     except subprocess.TimeoutExpired:
                         # Still running: gather stream-file state and ask callback.
+                        stream_file = _live_stream_file(call_dir, normalized)
                         if stream_file.exists():
                             try:
                                 last_mtime = stream_file.stat().st_mtime
@@ -384,6 +401,18 @@ def call_shared_vendor(
             and elapsed >= max(timeout_sec - 0.5, 0)
             and status_code in {"124", "137", "143", "-9", "-15"}
         )
+        # DEBUG capture (behavior-preserving; active only when env var set):
+        # persist the whole work dir (call_dir out/status/log + summary stderr +
+        # any vendor transcript) before the TemporaryDirectory is cleaned, so a
+        # failing vendor's REAL stderr can be inspected after the run.
+        _keep_dir = os.environ.get("AUTODEV_KEEP_VENDOR_TMP")
+        if _keep_dir:
+            import shutil
+            try:
+                _dest = Path(_keep_dir) / f"{output_id}-rc{returncode}-{Path(tmp).name}"
+                shutil.copytree(work_dir, _dest, dirs_exist_ok=True)
+            except OSError:
+                pass
         return SharedVendorResult(
             vendor=normalized,
             output_id=output_id,

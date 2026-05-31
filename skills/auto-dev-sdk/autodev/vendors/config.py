@@ -28,8 +28,11 @@ STAGES = ("design", "build", "spec", "review")
 # `openai` and `codex` both route through the Codex CLI in shared/vendors.
 ALLOWED_VENDORS = {"claude", "codex", "openai"}
 
-# Panel review vendors (gemini welcomed as a reviewer).
-PANEL_REVIEWER_VENDORS = {"claude", "codex", "openai", "gemini"}
+# Panel review vendors. `cursor` is allowed as a reviewer (it proxies a
+# backing provider — e.g. a gemini or claude model — under cursor's own auth);
+# diversity is enforced on the inferred underlying provider, not the literal
+# `cursor` label (see _infer_cursor_underlying_vendor).
+PANEL_REVIEWER_VENDORS = {"claude", "codex", "openai", "gemini", "cursor"}
 # Synthesizer requires native JSON-schema output (claude via --json-schema,
 # codex/openai via --output-schema; gemini and cursor lack native enforcement).
 PANEL_SYNTHESIZER_VENDORS = {"claude", "codex", "openai"}

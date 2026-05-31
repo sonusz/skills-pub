@@ -22,8 +22,13 @@ import os
 import subprocess
 from pathlib import Path
 
-from autodev.artifacts.verdict import PanelVerdict, load_verdict
-from autodev.errors import ConfigError
+from autodev.artifacts.verdict import (
+    PanelVerdict,
+    load_verdict,
+    panel_verdict_transport_incomplete,
+)
+from autodev.errors import ConfigError, GatePending
+from autodev.panel import integrity
 from autodev.panel.runner import (
     REVIEW_PROMPT_FILE, review_prompt_path, run_panel_gate_internal,
 )
@@ -166,17 +171,65 @@ def run_panel_gate(
             )
         panel_config = load_vendors_config(vendors_yml).panel
 
-    return run_panel_gate_internal(
-        gate=gate,
-        feature_active=feature_active,
-        primary_artifact=primary_artifact,
-        prompt_file_for_audit=p_prompt,
-        consulted_docs=consulted_docs,
-        panel_config=panel_config,
-        repo_root=repo_root,
-        probe_config=probe_config,
-        log_emit=log_emit,
+    # Write-integrity guard. Reviewers run yolo (sandbox bypassed) and
+    # concurrently against the same canonical artifacts, so a stray write by
+    # one would silently poison the others. Snapshot the review surface
+    # before dispatch; if it changed during the round, discard the round and
+    # pause for a human decision (do NOT auto-revert — the change may be from
+    # another system).
+    canonical_files = [primary_artifact] + [
+        Path(d["path"]) for d in consulted_docs if d.get("path")
+    ]
+    guard = integrity.snapshot_before(
+        repo_root, gate, canonical_files, log_emit=log_emit,
     )
+    try:
+        verdict = run_panel_gate_internal(
+            gate=gate,
+            feature_active=feature_active,
+            primary_artifact=primary_artifact,
+            prompt_file_for_audit=p_prompt,
+            consulted_docs=consulted_docs,
+            panel_config=panel_config,
+            repo_root=repo_root,
+            probe_config=probe_config,
+            log_emit=log_emit,
+        )
+    except BaseException:
+        integrity.discard(guard)
+        raise
+
+    changes = integrity.detect_after(guard, canonical_files)
+    if changes:
+        # Round is tainted: drop its verdict + reviewer cache so resume
+        # re-runs fresh, then pause. The restore point is preserved (NOT
+        # discarded) so a human can roll back manually if it was a reviewer.
+        _invalidate_panel_round(feature_active, gate)
+        report = integrity.format_report(guard, changes)
+        if log_emit is not None:
+            log_emit({"event": "panel-integrity-violation",
+                      "gate": gate, "changes": changes})
+        (feature_active / ".pause").write_text(report, encoding="utf-8")
+        raise GatePending(f"panel-{gate}", report)
+
+    integrity.discard(guard)
+    return verdict
+
+
+def _invalidate_panel_round(feature_active: Path, gate: str) -> None:
+    """Remove this round's verdict + reviewer-cache files so a resume re-runs
+    the panel fresh instead of consuming a verdict built on mutated input."""
+    if gate == "design-review":
+        gates = ["design-review", "trace-review"]
+    else:
+        gates = [gate]
+    for g in gates:
+        for name in (f"panel-{g}.json", f"panel-{g}.reviewers.json"):
+            p = feature_active / name
+            try:
+                p.unlink()
+            except (FileNotFoundError, OSError):
+                pass
 
 
 def verdict_exists_and_valid(
@@ -188,6 +241,8 @@ def verdict_exists_and_valid(
     try:
         v = load_verdict(p)
     except Exception:
+        return None
+    if panel_verdict_transport_incomplete(v):
         return None
     if v.source_hash != current_source_hash:
         return None  # stale by primary-artifact hash
@@ -202,6 +257,24 @@ def verdict_exists_and_valid(
             return None
         if hash_file(cp) != cd.get("hash", ""):
             return None
+    if gate == "design-review":
+        trace_path = feature_active / "panel-trace-review.json"
+        if not trace_path.exists():
+            return v
+        try:
+            trace_v = load_verdict(trace_path)
+        except Exception:
+            return None
+        if panel_verdict_transport_incomplete(trace_v):
+            return None
+        if trace_v.source != v.source or trace_v.source_hash != v.source_hash:
+            return None
+        for cd in trace_v.consulted_docs:
+            cp = Path(cd.get("path", ""))
+            if not cp.exists():
+                return None
+            if hash_file(cp) != cd.get("hash", ""):
+                return None
     return v
 
 

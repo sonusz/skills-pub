@@ -1,13 +1,16 @@
 """Idle-timeout probe agent tests (Plan B)."""
 from __future__ import annotations
 
+import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from autodev.vendors.probe_agent import (
-    FAKE_PROBE_VERDICT_ENV, MAX_EXTEND_SEC, ProbeVerdict,
-    _compose_prompt, _parse_verdict, run_idle_probe,
+    FAKE_PROBE_VERDICT_ENV, MAX_EXTEND_SEC, PROCESS_TREE_SCRIPT, ProbeVerdict,
+    _compose_prompt, _parse_verdict, _process_tree, run_idle_probe,
 )
 from autodev.vendors.config import ProbeConfig
 from autodev.vendors import subprocess_runner
@@ -154,6 +157,43 @@ def test_fake_invoker_empty_output_defaults_to_kill(monkeypatch, tmp_path):
         stdout_path=tmp_path / "s.log", stderr_path=tmp_path / "e.log",
     )
     assert v.action == "kill"
+
+
+# ---------- _process_tree (macOS/BSD portability regression) ----------
+
+def test_process_tree_returns_real_tree_with_descendants():
+    # Regression guard for the macOS bug: the old `ps --forest -o ...,cmd`
+    # form is GNU-only and failed on BSD ps ("illegal option -- -" /
+    # "cmd: keyword not found"), so _process_tree returned the degraded
+    # sentinel and starved the idle probe -> false-positive kill. A live
+    # process with a child must now yield a real tree that includes the child.
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        time.sleep(0.3)
+        tree = _process_tree(os.getpid())
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+    assert "could not read" not in tree
+    assert str(os.getpid()) in tree
+    assert str(child.pid) in tree or "sleep 30" in tree
+
+
+def test_process_tree_dead_pid_is_graceful():
+    # A pid that is not alive must not raise and must not surface that pid
+    # as a process row (the probe should see an empty/headers-only tree).
+    dead = 2_000_000_000
+    tree = _process_tree(dead)
+    assert isinstance(tree, str)
+    assert str(dead) not in tree
+
+
+def test_process_tree_primary_path_is_the_shared_helper():
+    # The portable implementation must live in shared/vendors so every
+    # shared-vendors consumer inherits one tested, cross-platform version.
+    assert PROCESS_TREE_SCRIPT.name == "process-tree.sh"
+    assert "shared" in PROCESS_TREE_SCRIPT.parts
+    assert "vendors" in PROCESS_TREE_SCRIPT.parts
 
 
 def test_fake_invoker_receives_prompt_on_stdin(monkeypatch, tmp_path):

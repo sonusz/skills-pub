@@ -22,7 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autodev.vendors.config import ProbeConfig
-from autodev.vendors.shared_call import call_shared_vendor, split_common_vendor_flags
+from autodev.vendors.shared_call import (
+    SHARED_VENDORS_DIR,
+    call_shared_vendor,
+    split_common_vendor_flags,
+)
 
 PROMPT_FILENAME = "idle-probe.md"
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -51,26 +55,40 @@ class ProbeVerdict:
     raw_output: str = ""
 
 
+# Shared, cross-platform process-tree helper. Primary path so every
+# shared-vendors consumer gets one tested implementation, and so the
+# portability logic lives next to the rest of the vendor process handling
+# (call.sh's kill_tree). NEVER use GNU-only `ps --forest` / `cmd` here: they
+# fail on macOS BSD ps, which starves the probe of input and biases it toward
+# a false-positive kill.
+PROCESS_TREE_SCRIPT = SHARED_VENDORS_DIR / "scripts" / "process-tree.sh"
+
+
 def _process_tree(root_pid: int) -> str:
-    """Return ``ps --forest`` rooted at root_pid (plus its descendants).
-    Empty string if the process is gone."""
+    """Return a process tree rooted at root_pid (plus its descendants).
+
+    Primary path delegates to the shared ``process-tree.sh`` helper. Falls
+    back to an inline portable ``ps`` (keywords common to BSD/macOS and
+    GNU/Linux) if the helper is absent. Sentinel string if the process is
+    gone."""
+    if PROCESS_TREE_SCRIPT.exists():
+        try:
+            out = subprocess.run(
+                ["bash", str(PROCESS_TREE_SCRIPT), str(root_pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    # Inline fallback: portable `ps` form (works on BSD/macOS and GNU/Linux).
+    # Root pid only; the shared helper above is what surfaces descendants.
     try:
         out = subprocess.run(
-            ["ps", "--forest", "-o", "pid,ppid,etime,cmd", "-g",
-             str(os.getpgid(root_pid)) if hasattr(os, "getpgid") else str(root_pid)],
+            ["ps", "-o", "pid,ppid,state,etime,command", "-p", str(root_pid)],
             capture_output=True, text=True, timeout=5,
         )
-        if out.returncode == 0:
-            return out.stdout
-    except (FileNotFoundError, ProcessLookupError, subprocess.TimeoutExpired):
-        pass
-    # Fallback: plain ps with just the pid.
-    try:
-        out = subprocess.run(
-            ["ps", "-o", "pid,ppid,etime,cmd", "-p", str(root_pid)],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.returncode == 0:
+        if out.returncode == 0 and out.stdout.strip():
             return out.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -113,6 +131,11 @@ def _compose_prompt(
             f"- **Stream output file path**: `{stream_output_file}`\n"
             f"- **Stream output file size_bytes**: `{size_bytes}`\n"
             f"- **Stream output file seconds_since_modified**: `{seconds_since}s`\n"
+        )
+        stream_block += (
+            "\n### Stream output tail (last 200 lines)\n\n```\n"
+            + _tail(stream_output_file, 200)
+            + "\n```\n"
         )
     return (
         base

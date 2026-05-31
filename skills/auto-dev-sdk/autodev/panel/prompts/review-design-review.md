@@ -46,11 +46,11 @@ what you see; divergence across reviewers is the signal.
 Downstream `build` has finite context and implements one scope
 item at a time. If the design output has architectural gaps
 (primitives not described), coverage gaps (PRD requirement
-missing), sizing problems (items too coarse/fine), enumeration
-gaps (PRD invariants missing from trace), or testability
-mismatches (tests fake away the primitive), build ships something
-that either overflows context, misses requirements, or passes
-shallow tests while violating real invariants.
+missing), or sizing problems (items too coarse/fine), build ships
+something that either overflows context or misses requirements.
+Enumeration gaps (PRD invariants missing from trace) and
+testability mismatches (tests fake away the primitive) are the
+parallel **trace-review** panel's concern, not this gate's.
 
 This gate grades the design in one pass because a single
 subagent produced all four artifacts together; findings can
@@ -61,11 +61,20 @@ agent addresses them all.
 
 - **Primary artifact**: `design-packet.json`, which names the exact
   artifact hashes under review.
-- **Packet contents** (routable to design agent): `design.md`,
-  `scope.json`, `trace.md`, `test-plan.md` — listed in the required
-  file inputs below. Read those exact paths before judging.
-- **Anchor** (halt for human): `prd.md` — listed in the required file
-  inputs below. Read it before judging.
+- **Read before judging — YOUR inputs**: `design.md` + `scope.json`
+  (the design and its decomposition, which you grade) and `prd.md`
+  (the anchor; halt-for-human if it must change). These are what your
+  gate questions need.
+- **NOT your inputs — `trace.md` + `test-plan.md`**: these belong to
+  the parallel **trace-review** panel, which independently judges
+  behavioral coverage and test fidelity. Do **NOT** read them wholesale
+  or audit their coverage here — that is not this panel's job, and
+  duplicating it only burns your context. Search/reference a specific
+  trace row or test case ONLY when a concrete *design* concern needs
+  that detail to resolve (e.g. to confirm design.md and a cited row do
+  not contradict). They stay routable to the design agent — one rerun
+  fixes all four — so you may still `targets` them in a finding you
+  reached from the design itself.
 - **Architecture docs**: not pre-selected. Use your available
   file-reading mechanism; browse common locations as needed:
   - `<FEATURE_ACTIVE>/architecture.md` — feature-local
@@ -88,7 +97,10 @@ design.md IS the first architectural record. In greenfield:
 
 ## Gate questions
 
-Three questions, one panel run:
+Three questions, one panel run — all about the **design** (`design.md`)
+and its **decomposition** (`scope.json`) against the **PRD**. Behavioral
+coverage and test fidelity (trace.md / test-plan.md) are the parallel
+trace-review panel's job; do not audit them here.
 
 1. **PRD ↔ design coverage.** Does design.md content adequately
    address each `### R<N>:` requirement (not just nominally
@@ -182,13 +194,11 @@ Columns:
 - `status` — exactly one of `satisfied` / `partial` / `missing` /
   `deviated` / `ambiguous`. Match the close-prompt vocabulary so
   the synthesizer can extract it cleanly.
-  - `satisfied`: design.md + scope.json + trace.md collectively
-    cover this R<n> with no gap.
-  - `partial`: covered in some artifacts but a piece is weak or
-    underspecified.
-  - `missing`: no scope item references this R<n>, or trace.md
-    has no row for it, or design.md does not name the
-    primitive(s) it requires.
+  - `satisfied`: design.md + scope.json collectively cover this
+    R<n> with no gap.
+  - `partial`: covered but a piece is weak or underspecified.
+  - `missing`: no scope item references this R<n>, or design.md
+    does not name the primitive(s) it requires.
   - `deviated`: design takes a position contradicting the R<n>.
   - `ambiguous`: covered text exists but does not pin behavior.
 - `evidence` — short string citing the locations consulted. Use

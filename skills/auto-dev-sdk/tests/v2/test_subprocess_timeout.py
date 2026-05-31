@@ -65,6 +65,47 @@ def test_shared_vendor_timeout_records_timeout_status(
     assert result.status["reason"] == "timeout"
 
 
+def test_shared_vendor_exposes_standard_live_stream_for_codex(
+    git_repo, tmp_path, monkeypatch
+):
+    fake_codex = tmp_path / "fake-codex.sh"
+    fake_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "out=''\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  case \"$1\" in\n"
+        "    --output-last-message) out=\"$2\"; shift 2 ;;\n"
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        "prompt=$(cat)\n"
+        "printf 'live transcript for %s\\n' \"$prompt\"\n"
+        "printf 'final answer for %s\\n' \"$prompt\" > \"$out\"\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("AUTODEV_VENDOR_BIN_CODEX", str(fake_codex))
+
+    out_dir = tmp_path / "vendor-out"
+    result = call_shared_vendor(
+        vendor="codex",
+        model="fake",
+        prompt="stream sentinel",
+        output_id="codex-stream",
+        timeout_sec=5,
+        cwd=git_repo,
+        output_dir=out_dir,
+    )
+
+    stream = out_dir / "codex-stream" / "stream"
+    assert result.returncode == 0
+    assert stream.exists()
+    assert "live transcript for stream sentinel" in stream.read_text()
+    assert result.status["stream"] == str(stream)
+    assert "final answer for stream sentinel" in result.output
+
+
 def test_stage_effort_field_passed_to_shared_vendor(
     git_repo, feature_active, tmp_path, monkeypatch
 ):

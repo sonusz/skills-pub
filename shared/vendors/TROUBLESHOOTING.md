@@ -27,6 +27,7 @@ runtime calls:
 - `<output-dir>/<id>/out`
 - `<output-dir>/<id>/status`
 - `<output-dir>/<id>/log`
+- `<output-dir>/<id>/stream`
 - `<output-dir>/<id>/usage.json`
 
 For `doctor.sh`, failed probes are kept automatically. Use `--keep-output` or
@@ -35,9 +36,10 @@ For `doctor.sh`, failed probes are kept automatically. Use `--keep-output` or
 ## Output Contract
 
 All callers should inspect `status` first. The `exit_code` field is the
-machine-readable success signal; `out` is the model response; `log` is the
-launcher or CLI stderr/stdout capture; `usage.json` is normalized token usage
-when the vendor CLI exposes it. A `log` file can be empty on success.
+machine-readable success signal; `out` is the model response; `stream` is the
+live transcript/progress file for idle detection; `log` is the launcher or CLI
+stderr/stdout capture; `usage.json` is normalized token usage when the vendor
+CLI exposes it. A `log` file can be empty on success.
 
 Use `usage.json.available` and `usage.json.total_tokens` for programmatic token
 accounting. Vendor-specific usage payloads are retained under `raw` for
