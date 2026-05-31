@@ -15,13 +15,14 @@ import pytest
 from autodev.artifacts.verdict import load_verdict
 from autodev.panel.runner import (
     FAKE_INVOKER_ENV, _compose_reviewer_prompt, _compose_synthesizer_prompt,
-    _invoke_reviewer, _invoke_synthesizer, _reviewer_context_files,
+    _invoke_reviewer, _invoke_synthesizer,
     _read_only_native_args, run_panel_gate_internal,
 )
 from autodev.panel.schemas import synthesizer_output_schema
 from autodev.vendors.config import (
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
+from autodev.errors import GatePending
 from autodev.vendors.shared_call import cli_name_for_vendor, normalize_shared_vendor
 
 FAKE_SCRIPT = Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"
@@ -117,28 +118,15 @@ def test_reviewer_vendor_labels_route_through_shared_vendors():
     assert cli_name_for_vendor("openai") == "codex"
 
 
-def test_panel_reviewers_use_vendor_native_read_only_hints():
+def test_synthesizer_uses_vendor_native_read_only_hints():
+    # Reviewers now run yolo (see test_panel_yolo_integrity); the synthesizer
+    # stays read-only — it only reads reviewer outputs and emits a verdict.
     assert _read_only_native_args("codex") == ("--sandbox", "read-only")
     assert _read_only_native_args("openai") == ("--sandbox", "read-only")
     assert _read_only_native_args("claude") == (
         "--allowedTools", "Read,Glob,Grep,LS",
     )
     assert _read_only_native_args("gemini") == ("--approval-mode", "plan")
-
-
-def test_reviewer_context_files_dedupe_primary_and_consulted(feature_active):
-    primary = _make_artifact(feature_active)
-    extra = feature_active / "design.md"
-    extra.write_text("design", encoding="utf-8")
-    got = _reviewer_context_files(
-        primary_artifact=primary,
-        consulted_docs=[
-            {"path": str(primary)},
-            {"path": str(extra)},
-            {"path": str(feature_active / "missing.md")},
-        ],
-    )
-    assert got == (primary, extra)
 
 
 def test_compose_synthesizer_prompt_lists_responding_vendors(feature_active):
@@ -162,6 +150,11 @@ def test_compose_synthesizer_prompt_lists_responding_vendors(feature_active):
     assert "gemini" in sp
     # Synthesize prompt body itself is included (pure extractor wording)
     assert "extractor" in sp.lower()
+    assert "Pre-extracted reviewer findings" not in sp
+    assert "pre-parsed" not in sp
+    assert '"quality"' not in sp
+    assert "### Reviewer: claude (m)\n\nVerdict: pass" in sp
+    assert "### Reviewer: codex (m)\n\nVerdict: needs_revision" in sp
 
 
 def test_compose_synthesizer_prompt_does_not_truncate_or_inline_artifact(feature_active):
@@ -276,70 +269,98 @@ def test_end_to_end_inv_violation_fails(fake_invoker, monkeypatch, feature_activ
     assert "gemini" in vendors_on_findings
 
 
-def test_degraded_panel_one_missing_is_still_synthesized(
+def test_incomplete_panel_one_missing_halts_and_caches_successes(
     fake_invoker, monkeypatch, feature_active, panel_config,
 ):
-    """With exactly 2 healthy reviewers, the synthesizer still runs.
-    The missing reviewer's slot in per_vendor_raw records the no-response."""
+    """Any missing reviewer is panel transport failure, not a content
+    verdict. Successful reviewers are cached so restart retries only the
+    missing reviewer."""
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
     artifact = _make_artifact(feature_active)
-    v = run_panel_gate_internal(
-        gate="design-review",
-        feature_active=feature_active,
-        primary_artifact=artifact,
-        prompt_file_for_audit=artifact,
-        consulted_docs=[],
-        panel_config=panel_config,
+    with pytest.raises(GatePending, match="panel design-review incomplete"):
+        run_panel_gate_internal(
+            gate="design-review",
+            feature_active=feature_active,
+            primary_artifact=artifact,
+            prompt_file_for_audit=artifact,
+            consulted_docs=[],
+            panel_config=panel_config,
+        )
+
+    assert not (feature_active / "panel-design-review.json").exists()
+    cache = json.loads(
+        (feature_active / "panel-design-review.reviewers.json").read_text()
     )
-    # Gemini's slot in per_vendor_raw records the no-response reason.
-    assert v.per_vendor_raw["gemini"].startswith("[NO RESPONSE")
-    # Synthesizer ran (per_vendor_raw has ≥2 entries of real output).
-    responded = [
-        k for k, o in v.per_vendor_raw.items() if not o.startswith("[NO RESPONSE")
-    ]
-    assert len(responded) >= 2
-    # Specifically, runner's degraded-panel finding MUST NOT be present
-    # (only fires when < MIN_HEALTHY_REVIEWERS responded).
-    assert not any(
-        "only" in f.summary.lower() and "reviewers responded" in f.summary.lower()
-        for f in v.findings
-    )
+    assert set(cache["reviewers"]) == {"claude", "codex"}
+    assert "gemini" in cache["failures"]
 
 
-def test_degraded_panel_below_min_fails_fast(
+def test_incomplete_panel_restart_retries_missing_reviewer_only(
     fake_invoker, monkeypatch, feature_active, panel_config,
 ):
-    """<2 healthy reviewers → fail verdict pointing at doctor.sh. No
-    synthesizer call — a single-vendor opinion is not a panel."""
-    # Force a wrapper where only claude responds; gemini and codex emit nothing.
     import tempfile, os
+
+    artifact = _make_artifact(feature_active)
+
+    # First run: gemini fails; claude/codex succeed and should be cached.
     fd, path_str = tempfile.mkstemp(suffix=".sh")
     os.close(fd)
-    wrapper = Path(path_str)
-    wrapper.write_text(
+    first = Path(path_str)
+    first.write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "cat > /dev/null\n"
         "role=\"${AUTODEV_PANEL_FAKE_ROLE:-}\"\n"
         "vendor=\"${AUTODEV_PANEL_FAKE_VENDOR:-}\"\n"
         "if [[ \"$role\" == \"reviewer\" ]]; then\n"
-        "  if [[ \"$vendor\" == \"claude\" ]]; then\n"
-        "    echo 'Verdict: pass'\n"
-        "    exit 0\n"
-        "  fi\n"
-        "  exit 0  # empty stdout for gemini + codex\n"
+        "  if [[ \"$vendor\" == \"gemini\" ]]; then exit 0; fi\n"
+        "  echo \"cached $vendor\"\n"
+        "  echo 'Verdict: pass'\n"
+        "  exit 0\n"
         "fi\n"
-        # synthesizer should NEVER be called in this case. If it is, we
-        # emit JSON that would pass so the test catches the mistake via
-        # the verdict assertion below.
-        "echo 'SYNTHESIZER-SHOULD-NOT-RUN' >&2\n"
-        'echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]}]}\'\n'
+        "echo 'synthesizer should not run on incomplete panel' >&2\n"
+        "exit 9\n"
+    )
+    first.chmod(0o755)
+    monkeypatch.setenv(FAKE_INVOKER_ENV, str(first))
+    with pytest.raises(GatePending):
+        run_panel_gate_internal(
+            gate="design-review",
+            feature_active=feature_active,
+            primary_artifact=artifact,
+            prompt_file_for_audit=artifact,
+            consulted_docs=[],
+            panel_config=panel_config,
+        )
+
+    # Second run: only gemini may be invoked; claude/codex must come from cache.
+    calls = feature_active / "second-calls.txt"
+    fd, path_str = tempfile.mkstemp(suffix=".sh")
+    os.close(fd)
+    second = Path(path_str)
+    second.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "cat > /dev/null\n"
+        "role=\"${AUTODEV_PANEL_FAKE_ROLE:-}\"\n"
+        "vendor=\"${AUTODEV_PANEL_FAKE_VENDOR:-}\"\n"
+        f"echo \"$role:$vendor\" >> {calls}\n"
+        "if [[ \"$role\" == \"reviewer\" ]]; then\n"
+        "  if [[ \"$vendor\" != \"gemini\" ]]; then exit 97; fi\n"
+        "  echo 'fresh gemini'\n"
+        "  echo 'Verdict: pass'\n"
+        "  exit 0\n"
+        "fi\n"
+        "cat <<'EOF'\n"
+        '{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},'
+        '{"vendor":"gemini","verdict":"pass","findings":[]},'
+        '{"vendor":"codex","verdict":"pass","findings":[]}]}\n'
+        "EOF\n"
         "exit 0\n"
     )
-    wrapper.chmod(0o755)
-    monkeypatch.setenv(FAKE_INVOKER_ENV, str(wrapper))
+    second.chmod(0o755)
+    monkeypatch.setenv(FAKE_INVOKER_ENV, str(second))
 
-    artifact = _make_artifact(feature_active)
     v = run_panel_gate_internal(
         gate="design-review",
         feature_active=feature_active,
@@ -348,15 +369,11 @@ def test_degraded_panel_below_min_fails_fast(
         consulted_docs=[],
         panel_config=panel_config,
     )
-    assert v.verdict == "fail"
-    assert v.has_invariant_violation()
-    # Finding must point at doctor.sh
-    degraded = [f for f in v.findings if "panel degraded" in f.summary.lower()]
-    assert degraded, f"expected panel-degraded finding; got {v.findings}"
-    assert "doctor" in degraded[0].summary.lower() or "panel-review" in degraded[0].summary.lower()
-    # Two reviewers have [NO RESPONSE] markers
-    no_resp = [k for k, out in v.per_vendor_raw.items() if out.startswith("[NO RESPONSE")]
-    assert set(no_resp) == {"gemini", "codex"}
+    assert v.verdict == "pass"
+    observed = calls.read_text().splitlines()
+    assert "reviewer:claude" not in observed
+    assert observed.count("reviewer:gemini") == 2  # design + trace groups
+    assert "reviewer:codex" not in observed
 
 
 def test_synthesizer_broken_halts_with_invariant_violation(

@@ -29,7 +29,7 @@ stages:
   # and panel feedback during rework. Effort: highest.
   design:
     vendor: claude
-    model: claude-opus-4-7
+    model: claude-opus-4-8
     probe_interval_sec: 2400
     effort: max
 
@@ -47,7 +47,7 @@ stages:
   # exploration. Effort: medium-high.
   review:
     vendor: claude
-    model: claude-opus-4-7
+    model: claude-opus-4-8
     probe_interval_sec: 900
     effort: high
 
@@ -67,7 +67,7 @@ panel:
   reviewers:
     # Claude: strong natural-language critique and ambiguity detection.
     - vendor: claude
-      model: claude-opus-4-7
+      model: claude-opus-4-8
       effort: max
     # Gemini: independent second vendor for divergence signal.
     - vendor: gemini

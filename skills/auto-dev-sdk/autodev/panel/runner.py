@@ -12,19 +12,16 @@ Flow:
      panel-verdict.json atomically.
 
 Failure modes and their handling:
-  - Reviewer timeout / empty output → that reviewer's slot is empty;
-    synthesizer is told which vendors responded. If <2 reviewers
-    responded, the synthesizer's prompt forces needs_revision with a
-    harness-originating finding.
-  - Synthesizer timeout / non-JSON / schema-invalid output →
-    mechanical fallback: any explicit reviewer fail → fail, any
-    invariant_violation in reviewer output (keyword scan) → fail, else
-    needs_revision. The verdict always includes a
-    `synthesizer_failed` opinion-severity finding in this path.
+  - Reviewer timeout / empty output → cache successful reviewer outputs,
+    halt with GatePending, and retry only missing reviewers on restart.
+  - Synthesizer timeout / non-JSON / schema-invalid output → write a
+    harness-authored audit verdict and halt instead of routing a content
+    revision.
 """
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import subprocess
@@ -36,18 +33,21 @@ from typing import Callable
 from autodev import __version__ as HARNESS_VERSION
 from autodev.artifacts.revision_state import load_state
 from autodev.artifacts.verdict import (
+    NO_RESPONSE_PREFIX,
     PanelFinding,
     PanelVerdict,
     ReviewDecision,
+    load_verdict,
+    panel_verdict_transport_incomplete,
     write_verdict,
 )
-from autodev.errors import ConfigError, SchemaError
+from autodev.errors import ConfigError, GatePending, SchemaError
 from autodev.panel.anchor_filter import filter_anchor_findings
 from autodev.panel.precheck import run_precheck
 from autodev.panel.schemas import synthesizer_output_schema_json
 from autodev.state.hashing import hash_file
+from autodev.state.atomic import atomic_write_json
 from autodev.state.log import JsonlLog
-from typing import Callable
 
 from autodev.vendors.config import (
     ProbeConfig,
@@ -79,8 +79,16 @@ DESIGN_REVIEW_GROUPS: tuple[dict, ...] = (
         "name": "design-review",
         "prompt_file": "review-design-review.md",
         "verdict_file": "panel-design-review.json",
-        # None = pass through ALL consulted_docs unchanged
-        "consulted_filter": None,
+        # Restrict to the design reviewer's own inputs: design.md + scope.json
+        # + prd.md (~250KB). The pass-through `None` handed it ALL consulted
+        # docs (~985KB across 33 files: design+scope+trace+test + ~14 referenced
+        # source files + the 151KB changelog + arch/deploy), overflowing agentic
+        # reviewers (codex). trace.md + test-plan.md are the parallel
+        # trace-review group's job (see review-design-review.md, which tells
+        # this panel not to audit them), so they are intentionally excluded.
+        # Verified: codex survives at this size AND the design reviewer stays
+        # design-focused (no spurious test-coverage findings).
+        "consulted_filter": {"design.md", "scope.json", "prd.md"},
     },
     {
         "name": "trace-review",
@@ -91,10 +99,12 @@ DESIGN_REVIEW_GROUPS: tuple[dict, ...] = (
     },
 )
 
-# Minimum healthy reviewers required before we'll run the synthesizer.
-# With fewer than 2, there is no panel — just a single-model opinion —
-# and we fail fast pointing the operator at doctor.sh.
-MIN_HEALTHY_REVIEWERS = 2
+# The panel gate is only valid when every configured reviewer has produced a
+# review. Missing reviewers are panel transport failures, not content
+# findings, so the harness caches successful reviewer outputs and halts until
+# the operator restarts the gate. The restart dispatches only the missing
+# reviewers.
+REVIEWER_CACHE_SCHEMA_VERSION = 1
 
 DOCTOR_SCRIPT = SHARED_VENDORS_DIR / "scripts" / "doctor.sh"
 
@@ -141,6 +151,239 @@ def _hash_or_missing(path: Path) -> str:
     return hash_file(path)
 
 
+def _hash_text(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _reviewer_cache_path(feature_active: Path, gate_label: str) -> Path:
+    return feature_active / f"panel-{gate_label}.reviewers.json"
+
+
+def _is_no_response_text(value: str) -> bool:
+    return value.lstrip().startswith(NO_RESPONSE_PREFIX)
+
+
+def _reviewer_cache_metadata(
+    *,
+    gate_label: str,
+    primary_artifact: Path,
+    prompt_file_for_audit: Path,
+    reviewer_prompt: str,
+    consulted_docs: list[dict],
+) -> dict:
+    return {
+        "kind": "panel-reviewer-cache",
+        "schema_version": REVIEWER_CACHE_SCHEMA_VERSION,
+        "gate": gate_label,
+        "source": str(primary_artifact),
+        "source_hash": hash_file(primary_artifact),
+        "prompt_file": str(prompt_file_for_audit),
+        "prompt_hash": hash_file(prompt_file_for_audit),
+        "reviewer_prompt_hash": _hash_text(reviewer_prompt),
+        "consulted_docs": consulted_docs,
+    }
+
+
+def _cache_matches(payload: dict, metadata: dict) -> bool:
+    for key in (
+        "kind",
+        "schema_version",
+        "gate",
+        "source",
+        "source_hash",
+        "prompt_file",
+        "prompt_hash",
+        "reviewer_prompt_hash",
+        "consulted_docs",
+    ):
+        if payload.get(key) != metadata.get(key):
+            return False
+    return True
+
+
+def _load_reviewer_cache(
+    *,
+    feature_active: Path,
+    gate_label: str,
+    reviewer_specs: tuple[PanelReviewerSpec, ...],
+    metadata: dict,
+) -> tuple[list[ReviewerResult], dict[str, dict]]:
+    """Load reusable successful reviewer outputs for this exact panel input.
+
+    Returns (cached_results, failure_audit). Failure audit is only for
+    preserving diagnostics in the next cache write; failed reviewers are never
+    reused.
+    """
+    path = _reviewer_cache_path(feature_active, gate_label)
+    payload: dict = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    if not payload or not _cache_matches(payload, metadata):
+        payload = _legacy_cache_payload_from_verdict(
+            feature_active=feature_active,
+            gate_label=gate_label,
+            reviewer_specs=reviewer_specs,
+            metadata=metadata,
+        )
+    if not payload or not _cache_matches(payload, metadata):
+        return [], {}
+
+    specs_by_vendor = {spec.vendor: spec for spec in reviewer_specs}
+    results: list[ReviewerResult] = []
+    reviewers = payload.get("reviewers", {})
+    if isinstance(reviewers, dict):
+        for vendor, entry in reviewers.items():
+            if not isinstance(entry, dict):
+                continue
+            spec = specs_by_vendor.get(vendor)
+            if spec is None or entry.get("model") != spec.model:
+                continue
+            output = entry.get("output")
+            if not isinstance(output, str) or not output.strip():
+                continue
+            results.append(
+                ReviewerResult(
+                    vendor=vendor,
+                    model=spec.model,
+                    ok=True,
+                    output=output.strip(),
+                    elapsed_sec=float(entry.get("elapsed_sec") or 0.0),
+                )
+            )
+
+    failures = payload.get("failures", {})
+    return results, failures if isinstance(failures, dict) else {}
+
+
+def _legacy_cache_payload_from_verdict(
+    *,
+    feature_active: Path,
+    gate_label: str,
+    reviewer_specs: tuple[PanelReviewerSpec, ...],
+    metadata: dict,
+) -> dict:
+    """Convert a pre-fix incomplete final verdict into reviewer cache.
+
+    Old runs persisted missing reviewer transport failures inside
+    panel-<gate>.json. Reusing the successful reviewer raw outputs lets the
+    next restart retry only the reviewers that failed in that old run.
+    """
+    path = feature_active / f"panel-{gate_label}.json"
+    try:
+        v = load_verdict(path)
+    except Exception:
+        return {}
+    if v.gate != gate_label:
+        return {}
+    if v.source != metadata["source"] or v.source_hash != metadata["source_hash"]:
+        return {}
+    if v.consulted_docs != metadata["consulted_docs"]:
+        return {}
+    if not panel_verdict_transport_incomplete(v):
+        return {}
+    specs_by_vendor = {spec.vendor: spec for spec in reviewer_specs}
+    reviewers: dict[str, dict] = {}
+    failures: dict[str, dict] = {}
+    for vendor, raw in v.per_vendor_raw.items():
+        spec = specs_by_vendor.get(vendor)
+        if spec is None:
+            continue
+        if _is_no_response_text(raw):
+            failures[vendor] = {
+                "vendor": vendor,
+                "model": spec.model,
+                "failure_detail": raw,
+                "run_ts": v.run_ts,
+            }
+            continue
+        if raw.strip():
+            reviewers[vendor] = {
+                "vendor": vendor,
+                "model": spec.model,
+                "output": raw.strip(),
+                "elapsed_sec": 0.0,
+                "run_ts": v.run_ts,
+            }
+    if not reviewers:
+        return {}
+    return {**metadata, "reviewers": reviewers, "failures": failures}
+
+
+def _write_reviewer_cache(
+    *,
+    feature_active: Path,
+    gate_label: str,
+    reviewer_specs: tuple[PanelReviewerSpec, ...],
+    metadata: dict,
+    reviewer_results: list[ReviewerResult],
+    prior_failures: dict[str, dict],
+) -> None:
+    specs_by_vendor = {spec.vendor: spec for spec in reviewer_specs}
+    reviewers: dict[str, dict] = {}
+    failures: dict[str, dict] = {}
+    now = datetime.now(timezone.utc).isoformat()
+    for result in reviewer_results:
+        spec = specs_by_vendor.get(result.vendor)
+        if spec is None:
+            continue
+        if result.ok and result.output.strip():
+            reviewers[result.vendor] = {
+                "vendor": result.vendor,
+                "model": spec.model,
+                "output": result.output.strip(),
+                "elapsed_sec": result.elapsed_sec,
+                "run_ts": now,
+            }
+        else:
+            failures[result.vendor] = {
+                "vendor": result.vendor,
+                "model": spec.model,
+                "failure_detail": result.failure_detail,
+                "elapsed_sec": result.elapsed_sec,
+                "run_ts": now,
+            }
+    for vendor, failure in prior_failures.items():
+        if vendor not in failures and vendor not in reviewers:
+            failures[vendor] = failure
+    atomic_write_json(
+        _reviewer_cache_path(feature_active, gate_label),
+        {**metadata, "reviewers": reviewers, "failures": failures},
+    )
+
+
+def _missing_reviewers(
+    reviewer_specs: tuple[PanelReviewerSpec, ...],
+    reviewer_results: list[ReviewerResult],
+) -> list[PanelReviewerSpec]:
+    ok_vendors = {r.vendor for r in reviewer_results if r.ok and r.output.strip()}
+    return [spec for spec in reviewer_specs if spec.vendor not in ok_vendors]
+
+
+def _panel_incomplete_message(
+    *,
+    gate_label: str,
+    reviewer_specs: tuple[PanelReviewerSpec, ...],
+    reviewer_results: list[ReviewerResult],
+) -> str:
+    ok_vendors = [r.vendor for r in reviewer_results if r.ok and r.output.strip()]
+    missing = _missing_reviewers(reviewer_specs, reviewer_results)
+    details = {
+        r.vendor: r.failure_detail
+        for r in reviewer_results
+        if not r.ok and r.failure_detail
+    }
+    return (
+        f"panel {gate_label} incomplete: {len(ok_vendors)} of "
+        f"{len(reviewer_specs)} reviewers responded; missing "
+        f"{[m.vendor for m in missing]!r}. Successful reviewers are cached; "
+        "restart the run to retry only the missing reviewer(s). "
+        f"Debug: {_doctor_hint()}. Details: {details!r}"
+    )
+
+
 def _file_ref_line(*, label: str, path: Path, hash_value: str | None = None) -> str:
     exists = path.exists()
     size = path.stat().st_size if exists else 0
@@ -167,13 +410,12 @@ def _compose_reviewer_prompt(
     prompt_text += f"- GATE: `{gate}`\n"
     prompt_text += "\n## Required file inputs\n\n"
     prompt_text += (
-        "Read the exact files listed here before judging. Use whatever "
-        "file-reading mechanism your CLI provides, such as a Read tool or "
-        "read-only shell commands. Do not infer from this manifest alone. "
-        "When this prompt includes attached context files, treat those "
-        "inlined sections as the exact file contents for the listed paths. "
-        "If a required file cannot be read, report a `risk` finding "
-        "targeting the inaccessible file.\n\n"
+        "The files you must judge are listed below as paths (with hash and "
+        "size_bytes) — their contents are NOT inlined. Read them yourself "
+        "with your CLI's file tools (Read / shell). Use the size_bytes to "
+        "plan your reading order and depth as you see fit. Do not infer from "
+        "this manifest alone. If a required file cannot be read, report a "
+        "`risk` finding targeting the inaccessible file.\n\n"
     )
     prompt_text += _file_ref_line(label="PRIMARY_ARTIFACT", path=artifact_path) + "\n"
     if consulted_docs:
@@ -189,35 +431,9 @@ def _compose_reviewer_prompt(
     return prompt_text
 
 
-def _reviewer_context_files(
-    *, primary_artifact: Path, consulted_docs: list[dict],
-) -> tuple[Path, ...]:
-    paths: list[Path] = []
-    for path in (
-        primary_artifact,
-        *(Path(d["path"]) for d in consulted_docs if d.get("path")),
-    ):
-        if path.exists() and path.is_file() and path not in paths:
-            paths.append(path)
-    return tuple(paths)
-
-
-def _read_only_native_args(vendor: str) -> tuple[str, ...]:
-    """Caller-owned read-only hints; shared vendors only maps model/effort/yolo."""
-    raw = vendor.strip().lower()
-    if raw in {"openai", "codex", "gpt"}:
-        return ("--sandbox", "read-only")
-    if raw in {"claude", "anthropic"}:
-        return ("--allowedTools", "Read,Glob,Grep,LS")
-    if raw in {"gemini", "google"}:
-        return ("--approval-mode", "plan")
-    return ()
-
-
 def _invoke_reviewer(
     spec: PanelReviewerSpec, prompt: str, probe_interval_sec: int,
     *, cwd: Path | None = None,
-    context_files: tuple[Path, ...] = (),
     probe_config: ProbeConfig | None = None,
     log_emit: Callable[[dict], None] | None = None,
 ) -> ReviewerResult:
@@ -270,8 +486,11 @@ def _invoke_reviewer(
                 timeout_sec=hard_backstop,
                 cwd=cwd,
                 effort=spec.effort,
-                context_files=context_files,
-                native_args=_read_only_native_args(spec.vendor),
+                # Reviewers run yolo: sandbox bypassed so they can read
+                # cross-repo material and reach the network. They do NOT
+                # need to write (deliverable is stdout); the write-integrity
+                # guard in panel/__init__.py backstops any stray mutation.
+                yolo=True,
                 idle_callback=idle_callback,
             )
             elapsed = time.monotonic() - t0
@@ -333,10 +552,7 @@ def _compose_synthesizer_prompt(
     feature_active: Path | None = None,
 ) -> str:
     """Build the prompt for the synthesizer given reviewer outputs."""
-    import json as _json
-    import re as _re
-    from autodev.panel.extract_reviewer import parse_reviewer_output
-
+    del feature_active  # retained for call-site compatibility
     base = synthesize_prompt_path().read_text(encoding="utf-8")
     responded = [r.vendor for r in reviewer_results if r.ok]
     missing = [r.vendor for r in reviewer_results if not r.ok]
@@ -354,36 +570,32 @@ def _compose_synthesizer_prompt(
         "\nThe synthesizer is an extractor, not a reviewer. Do not re-review "
         "the artifact and do not add findings absent from reviewer outputs.\n"
     )
-
-    # Get PRD req IDs for coverage gap pre-computation
-    prd_req_ids: set[str] = set()
-    if feature_active is not None:
-        prd_path = feature_active / "prd.md"
-        if prd_path.exists():
-            prd_text = prd_path.read_text(encoding="utf-8")
-            prd_req_ids = set(_re.findall(r'^###\s+(R\d+)\s*:', prd_text, _re.MULTILINE))
-
-    out += "\n## Pre-extracted reviewer findings\n\n"
-    out += (
-        "The harness pre-parsed each reviewer's markdown into structured JSON. "
-        "Use the extracted data directly. When `quality` is `partial` or "
-        "`fallback`, the raw reviewer text is included in `<raw_text>` tags "
-        "for recovery of any fields the parser could not extract.\n\n"
-    )
     for r in reviewer_results:
-        out += f"### Reviewer: {r.vendor} ({r.model})\n\n"
         if r.ok:
-            extracted = parse_reviewer_output(r.output, prd_req_ids or None, gate=gate)
-            out += f"```json\n{_json.dumps(extracted.to_dict(), indent=2)}\n```\n\n"
-            if extracted.quality != "clean":
-                # Include truncated raw text for recovery
-                raw_snip = r.output[:6000]
-                if len(r.output) > 6000:
-                    raw_snip += f"\n... [{len(r.output) - 6000} chars truncated]"
-                out += f"<raw_text>\n{raw_snip}\n</raw_text>\n\n"
+            out += f"### Reviewer: {r.vendor} ({r.model})\n\n{r.output}\n\n"
         else:
-            out += f"NO RESPONSE — {r.failure_detail}\n\n"
+            out += f"### Reviewer: {r.vendor} — NO RESPONSE ({r.failure_detail})\n\n"
     return out
+
+
+def _read_only_native_args(vendor: str) -> tuple[str, ...]:
+    """Read-only sandbox hints for the SYNTHESIZER.
+
+    The synthesizer only reads the reviewer outputs handed to it in its
+    prompt and emits a verdict — it needs no repo access, network, or write.
+    So it stays sandboxed read-only (unlike reviewers, which run yolo to read
+    cross-repo material and reach the network). Shared vendors only maps
+    model/effort/yolo natively; per-vendor read-only is passed through here.
+    """
+    raw = vendor.strip().lower()
+    if raw in {"openai", "codex", "gpt"}:
+        return ("--sandbox", "read-only")
+    if raw in {"claude", "anthropic"}:
+        return ("--allowedTools", "Read,Glob,Grep,LS")
+    if raw in {"gemini", "google"}:
+        return ("--approval-mode", "plan")
+    return ()
+
 
 def _invoke_synthesizer(
     spec: PanelSynthesizerSpec, prompt: str, probe_interval_sec: int,
@@ -813,81 +1025,93 @@ def _run_one_group_pipeline(
     log_emit: Callable[[dict], None] | None,
 ) -> tuple[PanelVerdict, Path, str | None]:
     """Run one reviewer group's complete pipeline: 3 reviewers in parallel,
-    then synthesize (or write a degraded verdict if <2 healthy reviewers).
+    then synthesize once every reviewer has responded.
 
     Returns (verdict, output_path, synth_infra_error_or_None). The caller
     writes the verdict (kept out of this helper so dual-group orchestration
     can decide error-handling policy across groups).
     """
     cfg = panel_config
+    metadata = _reviewer_cache_metadata(
+        gate_label=group_spec["name"],
+        primary_artifact=primary_artifact,
+        prompt_file_for_audit=group_spec["prompt_file_for_audit"],
+        reviewer_prompt=group_spec["reviewer_prompt"],
+        consulted_docs=group_spec["consulted_docs"],
+    )
+    reviewer_results, prior_failures = _load_reviewer_cache(
+        feature_active=feature_active,
+        gate_label=group_spec["name"],
+        reviewer_specs=cfg.reviewers,
+        metadata=metadata,
+    )
+    to_run = _missing_reviewers(cfg.reviewers, reviewer_results)
 
-    # Dispatch this group's reviewers concurrently (3-wide).
-    reviewer_results: list[ReviewerResult] = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max(len(cfg.reviewers), 1),
-        thread_name_prefix=f"panel-{group_spec['name']}",
-    ) as pool:
-        futs = [
-            pool.submit(
-                _invoke_reviewer,
-                r,
-                group_spec["reviewer_prompt"],
-                cfg.reviewer_probe_interval_sec,
-                cwd=vendor_cwd,
-                context_files=group_spec["reviewer_context_files"],
-                probe_config=probe_config,
-                log_emit=log_emit,
-            )
-            for r in cfg.reviewers
-        ]
-        for fut in concurrent.futures.as_completed(futs):
-            reviewer_results.append(fut.result())
+    # Dispatch only reviewers that are not already cached for this exact
+    # artifact/prompt hash. This makes restart retry the failed panel slots
+    # without spending more calls on successful reviewers.
+    if to_run:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(len(to_run), 1),
+            thread_name_prefix=f"panel-{group_spec['name']}",
+        ) as pool:
+            futs = [
+                pool.submit(
+                    _invoke_reviewer,
+                    r,
+                    group_spec["reviewer_prompt"],
+                    cfg.reviewer_probe_interval_sec,
+                    cwd=vendor_cwd,
+                    probe_config=probe_config,
+                    log_emit=log_emit,
+                )
+                for r in to_run
+            ]
+            for fut in concurrent.futures.as_completed(futs):
+                reviewer_results.append(fut.result())
 
     # Sort by configured vendor order for stable audit output.
     order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
     reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
 
-    healthy = [r for r in reviewer_results if r.ok]
     per_vendor_raw = {r.vendor: r.output for r in reviewer_results if r.ok}
     for r in reviewer_results:
         if not r.ok:
-            per_vendor_raw[r.vendor] = f"[NO RESPONSE — {r.failure_detail}]"
+            per_vendor_raw[r.vendor] = f"{NO_RESPONSE_PREFIX} — {r.failure_detail}]"
 
     out_path = feature_active / group_spec["verdict_file"]
-
-    # Degraded path: skip synthesizer, return harness-authored verdict.
-    if len(healthy) < MIN_HEALTHY_REVIEWERS:
-        missing = [r.vendor for r in reviewer_results if not r.ok]
-        finding = PanelFinding(
-            severity="invariant_violation", vendor="harness",
-            summary=(
-                f"panel degraded: only {len(healthy)} of {len(reviewer_results)} "
-                f"reviewers responded (missing: {', '.join(missing) or 'n/a'}). "
-                f"Divergence signal requires ≥{MIN_HEALTHY_REVIEWERS}. "
-                f"Debug: {_doctor_hint()}. Do not skip-gate — fix the vendor(s) "
-                f"or `autodev escalate` the feature for human review."
+    _write_reviewer_cache(
+        feature_active=feature_active,
+        gate_label=group_spec["name"],
+        reviewer_specs=cfg.reviewers,
+        metadata=metadata,
+        reviewer_results=reviewer_results,
+        prior_failures=prior_failures,
+    )
+    missing = _missing_reviewers(cfg.reviewers, reviewer_results)
+    if missing:
+        if log_emit is not None:
+            log_emit({
+                "event": "panel-incomplete",
+                "stage": "gate",
+                "gate": group_spec["name"],
+                "missing_reviewers": [m.vendor for m in missing],
+            })
+        raise GatePending(
+            f"panel-{group_spec['name']}",
+            _panel_incomplete_message(
+                gate_label=group_spec["name"],
+                reviewer_specs=cfg.reviewers,
+                reviewer_results=reviewer_results,
             ),
         )
-        v = PanelVerdict(
-            gate=group_spec["name"], verdict="fail",  # type: ignore[arg-type]
-            findings=[finding],
-            source=str(primary_artifact),
-            source_hash=hash_file(primary_artifact),
-            prompt_file=str(prompt_file_for_audit),
-            prompt_hash=hash_file(prompt_file_for_audit),
-            harness_version=HARNESS_VERSION,
-            run_ts=datetime.now(timezone.utc).isoformat(),
-            consulted_docs=group_spec["consulted_docs"],
-            per_vendor_raw=per_vendor_raw,
-        )
-        return v, out_path, None
 
     # Healthy → synthesize immediately (no barrier waiting for other group).
     return _synthesize_and_build_verdict(
         gate_label=group_spec["name"],
         reviewer_results=reviewer_results,
         primary_artifact=primary_artifact,
-        prompt_file_for_audit=prompt_file_for_audit,
+        prompt_file_for_audit=group_spec["prompt_file_for_audit"],
         consulted_docs=group_spec["consulted_docs"],
         per_vendor_raw=per_vendor_raw,
         panel_config=panel_config,
@@ -927,6 +1151,7 @@ def _run_dual_group_design_review(
         group_specs.append({
             "name": group["name"],
             "prompt_file": group["prompt_file"],
+            "prompt_file_for_audit": PROMPTS_DIR / group["prompt_file"],
             "verdict_file": group["verdict_file"],
             "consulted_docs": group_docs,
             "reviewer_prompt": _compose_reviewer_prompt(
@@ -935,10 +1160,6 @@ def _run_dual_group_design_review(
                 consulted_docs=group_docs,
                 feature_active=feature_active,
                 repo_root=repo_root,
-            ),
-            "reviewer_context_files": _reviewer_context_files(
-                primary_artifact=primary_artifact,
-                consulted_docs=group_docs,
             ),
         })
 
@@ -1053,70 +1274,72 @@ def run_panel_gate_internal(
         feature_active=feature_active, repo_root=repo_root,
     )
     vendor_cwd = repo_root or feature_active
-    reviewer_context_files = _reviewer_context_files(
+    metadata = _reviewer_cache_metadata(
+        gate_label=gate,
         primary_artifact=primary_artifact,
+        prompt_file_for_audit=prompt_file_for_audit,
+        reviewer_prompt=reviewer_prompt,
         consulted_docs=consulted_docs,
     )
-
-    reviewer_results: list[ReviewerResult] = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max(len(cfg.reviewers), 1)
-    ) as pool:
-        futs = {
-            pool.submit(
-                _invoke_reviewer,
-                r,
-                reviewer_prompt,
-                cfg.reviewer_probe_interval_sec,
-                cwd=vendor_cwd,
-                context_files=reviewer_context_files,
-                probe_config=probe_config,
-                log_emit=log_emit,
-            ): r
-            for r in cfg.reviewers
-        }
-        for fut in concurrent.futures.as_completed(futs):
-            reviewer_results.append(fut.result())
+    reviewer_results, prior_failures = _load_reviewer_cache(
+        feature_active=feature_active,
+        gate_label=gate,
+        reviewer_specs=cfg.reviewers,
+        metadata=metadata,
+    )
+    to_run = _missing_reviewers(cfg.reviewers, reviewer_results)
+    if to_run:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(len(to_run), 1)
+        ) as pool:
+            futs = {
+                pool.submit(
+                    _invoke_reviewer,
+                    r,
+                    reviewer_prompt,
+                    cfg.reviewer_probe_interval_sec,
+                    cwd=vendor_cwd,
+                    probe_config=probe_config,
+                    log_emit=log_emit,
+                ): r
+                for r in to_run
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                reviewer_results.append(fut.result())
     # Preserve reviewer order as declared in config (stable audit).
     order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
     reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
 
-    healthy = [r for r in reviewer_results if r.ok]
     per_vendor_raw = {r.vendor: r.output for r in reviewer_results if r.ok}
     for r in reviewer_results:
         if not r.ok:
-            per_vendor_raw[r.vendor] = f"[NO RESPONSE — {r.failure_detail}]"
+            per_vendor_raw[r.vendor] = f"{NO_RESPONSE_PREFIX} — {r.failure_detail}]"
 
-    # Panel degraded: fewer than MIN_HEALTHY_REVIEWERS responded. Without
-    # divergence, there is no panel — just a single-vendor opinion. Stop
-    # and point the operator at doctor.sh. Do NOT synthesize.
-    if len(healthy) < MIN_HEALTHY_REVIEWERS:
-        missing = [r.vendor for r in reviewer_results if not r.ok]
-        finding = PanelFinding(
-            severity="invariant_violation", vendor="harness",
-            summary=(
-                f"panel degraded: only {len(healthy)} of {len(reviewer_results)} "
-                f"reviewers responded (missing: {', '.join(missing) or 'n/a'}). "
-                f"Divergence signal requires ≥{MIN_HEALTHY_REVIEWERS}. "
-                f"Debug: {_doctor_hint()}. Do not skip-gate — fix the vendor(s) "
-                f"or `autodev escalate` the feature for human review."
+    _write_reviewer_cache(
+        feature_active=feature_active,
+        gate_label=gate,
+        reviewer_specs=cfg.reviewers,
+        metadata=metadata,
+        reviewer_results=reviewer_results,
+        prior_failures=prior_failures,
+    )
+    missing = _missing_reviewers(cfg.reviewers, reviewer_results)
+    if missing:
+        if log_emit is not None:
+            log_emit({
+                "event": "panel-incomplete",
+                "stage": "gate",
+                "gate": gate,
+                "missing_reviewers": [m.vendor for m in missing],
+            })
+        raise GatePending(
+            f"panel-{gate}",
+            _panel_incomplete_message(
+                gate_label=gate,
+                reviewer_specs=cfg.reviewers,
+                reviewer_results=reviewer_results,
             ),
         )
-        v = PanelVerdict(
-            gate=gate, verdict="fail",  # type: ignore[arg-type]
-            findings=[finding],
-            source=str(primary_artifact),
-            source_hash=hash_file(primary_artifact),
-            prompt_file=str(prompt_file_for_audit),
-            prompt_hash=hash_file(prompt_file_for_audit),
-            harness_version=HARNESS_VERSION,
-            run_ts=datetime.now(timezone.utc).isoformat(),
-            consulted_docs=consulted_docs,
-            per_vendor_raw=per_vendor_raw,
-        )
-        out_path = feature_active / f"panel-{gate}.json"
-        write_verdict(out_path, v)
-        return v
 
     v, out_path, synth_infra_error = _synthesize_and_build_verdict(
         gate_label=gate,
