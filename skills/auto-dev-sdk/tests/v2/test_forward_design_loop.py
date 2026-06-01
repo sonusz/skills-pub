@@ -873,3 +873,39 @@ def test_base_ref_anchors_grounding_to_base_branch(git_repo):
     git("commit", "-aqm", "upstream change on base")
     git("checkout", "-q", "feature/x")
     assert design_packet_fresh(active / "design-packet.json") is False
+
+
+def test_cumulative_changed_files_excludes_harness_bookkeeping(git_repo):
+    """implementation-index's change-set is the WHOLE feature branch vs its
+    base ref, MINUS the harness's own bookkeeping tree (docs/features/**) —
+    so the spec describes product code, not packets/verdicts/logs."""
+    import subprocess
+
+    from autodev.artifacts.implementation_index import _cumulative_changed_files
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(git_repo), *args],
+            check=True, capture_output=True, text=True,
+        )
+
+    base = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    git("checkout", "-q", "-b", "feature/x")
+
+    # A product code file ...
+    (git_repo / "gothena").mkdir(exist_ok=True)
+    (git_repo / "gothena" / "x.go").write_text("package x\n", encoding="utf-8")
+    # ... and a harness bookkeeping file under the feature's active/ tree.
+    bk = git_repo / "docs" / "features" / "demo" / "active"
+    bk.mkdir(parents=True, exist_ok=True)
+    (bk / "build.json").write_text("{}\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "feature work + bookkeeping")
+
+    files = _cumulative_changed_files(git_repo, base)
+    assert files is not None
+    assert "gothena/x.go" in files
+    assert not any(f.startswith("docs/features/") for f in files), files
+
+    # Unresolvable base ref → None (caller falls back to build.files_changed).
+    assert _cumulative_changed_files(git_repo, "no-such-ref-xyz") is None

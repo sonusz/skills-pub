@@ -48,6 +48,11 @@ def render_stage_prompt(
         "",
         f"- FEATURE: `{feature}`",
         f"- FEATURE_ACTIVE: `{feature_active}`",
+        f"- SCRATCH_DIR: `{feature_active / 'scratch'}` — write ANY ad-hoc "
+        f"analysis, coverage-tracking, or throwaway working files HERE. This "
+        f"is the harness scratch area (under the feature's active/ tree, "
+        f"excluded from the implementation change-set). NEVER drop scratch at "
+        f"the repo root or anywhere in the product source tree.",
         f"- REPO_ROOT: `{repo_root}`",
         f"- PROMPT_FILE: `{prompt_file}`",
         f"- PROMPT_HASH: `{hash_file(prompt_file)}`",
