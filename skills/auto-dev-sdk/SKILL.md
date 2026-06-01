@@ -63,7 +63,7 @@ I may only invoke these:
 |---|---|
 | `autodev prd <f> [--from-file PATH]` | Create/import PRD |
 | `autodev status <f>` | Read state |
-| `autodev run <f> [--watch]` | Advance pipeline through all reachable stages |
+| `autodev run <f> [--watch] [--until design\|build\|spec]` | Advance pipeline through all reachable stages. `--until design` runs the whole design phase (including the design-review gate and any in-design revision reruns) then stops before build; `--until build` stops before spec; omit (or `--until spec`) to run to completion. |
 | `autodev next <f> [--watch]` | Advance exactly one stage |
 | `autodev pause <f>` | Write `.pause` sentinel |
 | `autodev resume <f>` | Remove `.pause` sentinel |

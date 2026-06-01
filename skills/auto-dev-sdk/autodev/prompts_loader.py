@@ -30,6 +30,7 @@ def render_stage_prompt(
     primary_target: Path,
     extra_targets: list[Path],
     context_artifacts: list[str] | None = None,
+    preseeded: bool = False,
 ) -> str:
     """Build the prompt string passed to the shared vendors adapter.
 
@@ -114,16 +115,31 @@ def render_stage_prompt(
     if effective_context:
         ctx_lines.append(f"- CONTEXT_ARTIFACTS: {effective_context}")
         ctx_lines.append("")
+        own_artifact_note = (
+            "Your own prior artifacts are ALREADY loaded as your "
+            "pre-filled `.tmp` working copies (see the write instruction "
+            "below) — do not re-read their CONTEXT_ARTIFACTS copies "
+            "separately; Read and Edit the `.tmp` files."
+            if preseeded else
+            "A previous version of your own artifact (same filename) may "
+            "be present — revise it in place rather than regenerate from "
+            "scratch; preserve stable IDs and incorporate the fixes the "
+            "panel asked for."
+        )
         ctx_lines.append(
             "Read every path in CONTEXT_ARTIFACTS. Use them to inform this "
             "stage's output: a panel verdict file may contain "
             "`invariant_violation` or `risk` findings pointing at this "
             "stage's artifact — address those (MUST fix). `opinion` "
             "findings may be acknowledged but do not require change. "
-            "A previous version of your own artifact (same filename) may "
-            "be present — revise it in place rather than regenerate from "
-            "scratch; preserve stable IDs and incorporate the fixes the "
-            "panel asked for."
+            + own_artifact_note
+            + " An `*-output-rejection.json` file means the harness "
+            "rejected your previous deliverable for a concrete deficiency "
+            "(missing artifact, malformed provenance header, or incomplete "
+            "classification coverage). Read its `instruction` and "
+            "`missing_scope_ids`/`detail` fields and AMEND the prior "
+            "artifact to fix exactly that — keep every entry that was "
+            "already correct; do NOT start over."
         )
     else:
         ctx_lines.append("- CONTEXT_ARTIFACTS: [] (initial run)")
@@ -163,10 +179,24 @@ def render_stage_prompt(
         )
 
     ctx_lines.append("")
-    ctx_lines.append(
-        "Write each TARGET_* to `<path>.tmp`; the orchestrator renames to "
-        "final on exit 0. Exit non-zero on abort."
-    )
+    if preseeded:
+        ctx_lines.append(
+            "Each TARGET_* `.tmp` is PRE-FILLED with your last landed "
+            "version of that artifact. Read each `.tmp` and EDIT it in "
+            "place — change only what this round's feedback requires; "
+            "leave an unchanged artifact's `.tmp` exactly as-is (it lands "
+            "byte-identical, which is correct and cheap). Do NOT "
+            "regenerate any artifact from scratch and do NOT re-emit "
+            "unchanged content. The orchestrator renames each `.tmp` to "
+            "its final name on exit 0; a failed run discards the `.tmp` "
+            "and leaves the landed package untouched. Exit non-zero on "
+            "abort."
+        )
+    else:
+        ctx_lines.append(
+            "Write each TARGET_* to `<path>.tmp`; the orchestrator renames "
+            "to final on exit 0. Exit non-zero on abort."
+        )
     ctx_lines.append("")
 
     return body + "\n".join(ctx_lines)

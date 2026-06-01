@@ -263,3 +263,39 @@ def test_coding_stage_out_of_scope_write_detected(git_repo, monkeypatch, tmp_pat
     assert fpath.exists()
     failure = json.loads(fpath.read_text())
     assert failure["kind"] == "detected_out_of_scope_write"
+
+
+def test_coding_stage_deficient_output_retries_then_succeeds(git_repo, monkeypatch):
+    """A stage that exits 0 but omits a required artifact must NOT halt
+    the run on the first slip. The harness re-dispatches the same agent
+    with a <stage>-output-rejection.json + the prior artifacts, and the
+    amended retry completes the deliverable."""
+    planned, prd = _prd(git_repo)
+    from autodev.state.hashing import hash_file
+
+    env = _fake_env(
+        target_artifact=planned / "design.md",
+        source_path=prd, source_hash=hash_file(prd),
+        behavior="missing_then_success_design",
+    )
+    env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
+    env["AUTODEV_FAKE_TARGET_TRACE"] = str(planned / "trace.md")
+    env["AUTODEV_FAKE_TARGET_TEST_PLAN"] = str(planned / "test-plan.md")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    orch = Orchestrator(OrchestratorConfig(
+        repo_root=git_repo, vendors=_vendors_for_test(git_repo), session_id="t",
+    ))
+    result = orch.advance_one("toy")
+
+    assert result.success
+    # Two attempts: the first omitted scope/trace/test-plan, the second
+    # (amend pass) produced the complete set.
+    assert int((planned / ".fake.design.attempt").read_text()) == 2
+    assert (planned / "design.md").exists()
+    assert (planned / "scope.json").exists()
+    assert (planned / "trace.md").exists()
+    assert (planned / "test-plan.md").exists()
+    # Rejection note is cleared once the stage succeeds.
+    assert not (planned / "design-output-rejection.json").exists()

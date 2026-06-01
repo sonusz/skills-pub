@@ -53,9 +53,11 @@ user wants" (PRD) and "what must be built + how it must be verified"
   validation.
 - `CONTEXT_ARTIFACTS`: list of paths to on-disk artifacts relevant to
   this stage. Empty on initial runs; on re-runs may contain:
-  - your previous design.md / scope.json / trace.md / test-plan.md —
-    revise in place, preserve stable IDs, don't regenerate from
-    scratch
+  - your previous design.md / scope.json / trace.md / test-plan.md.
+    On a rerun these are also PRE-FILLED into your `.tmp` working
+    copies — revise them in place via `Edit` (preserve stable IDs,
+    don't regenerate from scratch). See "## Output" for the write
+    mechanics.
   - `panel-design-review.json` — findings targeting any of your four
     artifacts are yours to address; `invariant_violation` + `risk`
     MUST be fixed, `opinion` may be acknowledged but is optional
@@ -550,6 +552,21 @@ Before writing the four `.tmp` files:
 - `<TARGET_DESIGN>.tmp`, `<TARGET_SCOPE>.tmp`,
   `<TARGET_TRACE>.tmp`, `<TARGET_TEST_PLAN>.tmp`,
   `<TARGET_CHANGELOG>.tmp`.
+- **Initial run** (no pre-filled `.tmp`): author each artifact fresh
+  and write it to its `.tmp`.
+- **Rerun** (the orchestrator context says the `.tmp` are PRE-FILLED
+  with your last landed package): the prior version of each artifact is
+  already sitting in its `.tmp`. **Read and `Edit` the `.tmp` in
+  place** — touch only the artifacts this round actually changes, and
+  within them only the lines that change. Leave an unchanged
+  artifact's `.tmp` exactly as-is (it lands byte-identical, which is
+  correct). Do NOT regenerate any artifact from scratch and do NOT
+  re-emit unchanged content — re-emitting the whole package every round
+  is the primary source of wasted output. This is purely a *how you
+  write* rule; it does NOT relax the rework protocol below — you still
+  consolidate feedback into root causes and apply a coherent redesign,
+  you just express that redesign as in-place edits rather than a full
+  rewrite.
 - Exit 0 on success; non-zero on fatal error (failure to read
   PRD, etc.).
 - Stdout: free-form logging. Not parsed by orchestrator.

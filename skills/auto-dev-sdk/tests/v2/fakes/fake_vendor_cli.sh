@@ -187,6 +187,74 @@ EOF
     # Exit 0 but don't write anything
     exit 0
     ;;
+  missing_then_success_design)
+    # Attempt 1: write design.md only (scope/trace/test-plan missing →
+    # StageOutputInvalid:missing_artifact). Attempt 2+: write everything,
+    # exercising the harness's bounded output-retry/amend path.
+    tgt_design="${AUTODEV_FAKE_TARGET_ARTIFACT:-$target}"
+    tgt_scope="${AUTODEV_FAKE_TARGET_SCOPE:?need scope target}"
+    tgt_trace="${AUTODEV_FAKE_TARGET_TRACE:?need trace target}"
+    tgt_tp="${AUTODEV_FAKE_TARGET_TEST_PLAN:?need test-plan target}"
+    tgt_changelog="${AUTODEV_FAKE_TARGET_CHANGELOG:-$(dirname "$tgt_design")/design-changelog.json}"
+    cnt="$(dirname "$tgt_design")/.fake.design.attempt"
+    n=0; [ -f "$cnt" ] && n=$(cat "$cnt"); n=$((n + 1)); echo "$n" > "$cnt"
+    cat > "${tgt_design}.tmp" <<EOF
+<!-- source: $src_path -->
+<!-- source_hash: $src_hash -->
+<!-- written: $(date +%Y-%m-%d) -->
+
+## 1. Context
+toy context
+
+## 2. Primitives & commitments
+toy primitive
+Validation commands: ["pytest -q"]
+
+## 3. Seams & integration points
+toy seam
+
+## 4. Design decisions
+toy decision
+EOF
+    if [ "$n" -ge 2 ]; then
+      cat > "${tgt_scope}.tmp" <<EOF
+{
+  "source": "$src_path", "source_hash": "$src_hash",
+  "written": "$(date +%Y-%m-%d)", "feature": "$feature",
+  "mode": "fresh", "diff_base": "main",
+  "in_scope": [{"id":"t-1","description":"toy item","prd_ref":["§1"],"design_ref":["§2"],"status":"active"}],
+  "excluded": []
+}
+EOF
+      cat > "${tgt_trace}.tmp" <<EOF
+<!-- source: $src_path -->
+<!-- source_hash: $src_hash -->
+<!-- written: $(date +%Y-%m-%d) -->
+
+| # | Req ID | Scope ID | Requirement | Test(s) | Code Path | Status | Source |
+|---|---|---|---|---|---|---|---|
+| 1 | t-1.r1 | t-1 | toy | -- | -- | pending | Source: prd:§1 |
+EOF
+      cat > "${tgt_tp}.tmp" <<EOF
+<!-- source: $src_path -->
+<!-- source_hash: $src_hash -->
+<!-- written: $(date +%Y-%m-%d) -->
+
+## Test Strategy
+toy
+## Test Cases
+| Scope ID | Desc | Tier | Edges | Fixtures | Source |
+|---|---|---|---|---|---|
+| t-1 | happy | unit | — | — | Source: prd:§1 |
+## Coverage
+t-1 covered.
+EOF
+      cat > "${tgt_changelog}.tmp" <<EOF
+{"kind":"design-changelog","schema_version":1,"entries":[{"round":1,"trigger":"initial","reason":"retry amend (FakeCLI)","artifacts_changed":["design.md","scope.json","trace.md","test-plan.md"],"added":[{"artifact":"scope.json","anchor":"t-1"}],"removed":[]}]}
+EOF
+    fi
+    exit 0
+    ;;
   malformed_provenance)
     # Primary markdown with NO `<!-- source_hash: ... -->` header. The
     # cascade's strict regex won't match → orchestrator must catch

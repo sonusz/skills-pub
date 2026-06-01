@@ -130,10 +130,22 @@ mv docs/features/myfeature/{planned,active}
 # Run until a gate needs you
 autodev run myfeature
 
+# Or advance only through the design phase, then stop before build
+# (runs design + design-review + any in-design revision reruns, then
+# returns cleanly with a stopped-at-boundary event)
+autodev run myfeature --until design
+
 # Inspect state
 autodev status myfeature
 tail docs/features/myfeature/active/log.jsonl
 ```
+
+`run` has three pacings: end-to-end (`autodev run`), one stage at a time
+(`autodev next`), and phase-bounded (`autodev run --until design|build`).
+`--until design` is the common "design, then let me look before we
+build" checkpoint — it does not stop one stage at a time, it carries the
+whole design phase to completion (including the gate) and halts before
+the first build stage.
 
 ## Pipeline stages + gates
 
@@ -150,6 +162,24 @@ Current runtime stages and harness-authored nodes:
 
 `stage-review.md` is retained as a deprecated legacy prompt, but the
 main cascade no longer schedules a post-spec `review.json` stage.
+
+### Output-validation retry (amend, don't restart)
+
+When a stage agent exits 0 but produces a deficient deliverable — a
+missing artifact, a markdown file with no provenance header, or a
+`ralph-review.json` that fails to classify every active scope item or
+isn't valid JSON — the harness does **not** halt the run on the first
+slip. It re-dispatches the *same* agent up to a small fixed cap
+(`STAGE_OUTPUT_RETRY_MAX`, currently 3), handing it a
+`<stage>-output-rejection.json` that names the exact deficiency (e.g.
+`missing_scope_ids`) plus the prior artifact, with an explicit
+instruction to **amend in place** — keep the entries that were already
+correct and fix only what failed, rather than regenerate from scratch.
+Only after the cap is exhausted does the schema error propagate. This is
+distinct from the panel revision loop (which consumes the per-gate `L`
+budget for *semantic* reruns) and from hard subprocess failures or
+out-of-scope writes, which still halt immediately. Watch the
+`output-rejected-retrying` / `output-rejected-exhausted` log events.
 
 Each panel runs its configured claude + gemini + codex/openai reviewers independently,
 then a synthesizer merges their findings into a single verdict.

@@ -62,8 +62,27 @@ For every row in `trace.md`, classify the behavior as one of:
 }
 ```
 
-Every trace row must have exactly one classification entry. `summary`
-counts must match the classification tallies.
+Every trace row must have exactly one classification entry, and every
+**active scope item** must be covered by at least one classification.
+The harness validates this: if any active scope item has no
+classification — or if the JSON is malformed — your output is rejected.
+
+`summary` counts must match the classification tallies.
+
+## Amending after a rejection
+
+If a `ralph-review-output-rejection.json` appears in CONTEXT_ARTIFACTS,
+the harness rejected your previous `ralph-review.json` for a concrete
+reason (incomplete coverage or unparseable JSON). The prior version is
+also in CONTEXT_ARTIFACTS.
+
+- Read the rejection's `missing_scope_ids` and `detail`.
+- **Amend the prior list in place**: keep every classification you
+  already produced and add/repair ONLY the flagged rows (the missing
+  scope items, or whatever made the JSON invalid).
+- Do NOT reclassify rows you already got right, and do NOT regenerate
+  from scratch — the code on disk has not changed; you are only
+  completing/fixing the list the harness could not accept.
 
 ## Discipline
 

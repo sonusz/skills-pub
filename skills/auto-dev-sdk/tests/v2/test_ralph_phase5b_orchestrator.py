@@ -365,22 +365,106 @@ def test_build_loops_until_all_active_items_fully(git_repo, feature_active, monk
     assert str(feature_active / "ralph-state.json") in second_build_prompt
 
 
-def test_malformed_ralph_review_fails_without_retry(git_repo, feature_active, monkeypatch):
+def test_malformed_ralph_review_retries_then_amends_and_succeeds(
+    git_repo, feature_active, monkeypatch,
+):
+    """A malformed ralph-review must NOT kill the run. The harness
+    re-dispatches the SAME review agent, handing it the prior (rejected)
+    review + a rejection note, and the retry produces a valid list."""
     _seed_feature(feature_active, ids=["t-1"])
     ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
     vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
     orch = _orch(git_repo, vendor_bin)
 
     monkeypatch.setenv("AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]))
+    # First ralph-review pass emits invalid JSON; the retry (n=2) emits a
+    # valid list from the sequence.
     monkeypatch.setenv("AUTODEV_PHASE5B_MALFORMED_AT", "1")
 
-    # v3-core: ralph-review is JSON; malformed emits invalid JSON that
-    # the parser rejects.
-    with pytest.raises(SchemaError, match="invalid JSON"):
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert result.stage_name == "build"
+    # Build ran once; ralph-review ran twice (reject + amend).
+    assert _count(feature_active, "build") == 1
+    assert _count(feature_active, "ralph-review") == 2
+    state = ralph.load_ralph_state(feature_active)
+    # Exactly one iteration is RECORDED — the rejected pass does not count.
+    assert state.iter == 1
+    assert state.fully_history[-1] == {"t-1"}
+    # Rejection note is cleaned up once validation passes.
+    assert not (feature_active / "ralph-review-output-rejection.json").exists()
+
+    # The retry prompt must hand the agent the prior review + the
+    # structured rejection so it amends rather than reclassifies blind.
+    retry_prompt = (feature_active / ".ralph-review.2.prompt").read_text(encoding="utf-8")
+    assert "CONTEXT_ARTIFACTS" in retry_prompt
+    assert str(feature_active / "ralph-review.json") in retry_prompt
+    assert str(feature_active / "ralph-review-output-rejection.json") in retry_prompt
+
+
+def test_incomplete_ralph_review_exhausts_retries_then_raises(
+    git_repo, feature_active, monkeypatch,
+):
+    """If the review never covers every active scope item, the harness
+    retries up to the cap and only then surfaces the schema error."""
+    from autodev.orchestrator import STAGE_OUTPUT_RETRY_MAX
+
+    _seed_feature(feature_active, ids=["t-1", "t-2"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+
+    # Every pass classifies only t-1, so t-2 coverage is always missing.
+    monkeypatch.setenv("AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]))
+
+    with pytest.raises(SchemaError, match="missing active scope classifications"):
         orch.advance_one("demo")
 
     assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
+    assert _count(feature_active, "ralph-review") == STAGE_OUTPUT_RETRY_MAX
+    # The rejection note names the uncovered scope item for the operator.
+    rej = json.loads(
+        (feature_active / "ralph-review-output-rejection.json").read_text(encoding="utf-8")
+    )
+    assert rej["missing_scope_ids"] == ["t-2"]
+
+
+def test_run_until_design_stops_before_build(git_repo, feature_active, monkeypatch):
+    """`run --until design` advances through the design phase (which is
+    already sealed by _seed_feature: accepted-design.json present) and
+    stops cleanly before build, rather than entering the Ralph loop."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+
+    # Sanity: with the design phase sealed, the next stage IS build.
+    assert orch._next_stage_name(feature_active) == "build"
+
+    orch.run("demo", stop_before="build")
+
+    # Build never ran; the loop stopped at the phase boundary.
+    assert _count(feature_active, "build") == 0
+    assert not (feature_active / "ralph-state.json").exists()
+    events = [
+        (e.get("stage"), e.get("event")) for e in _read_log(feature_active)
+    ]
+    assert ("orchestrator", "stopped-at-boundary") in events
+    assert ("orchestrator", "pipeline-done") not in events
+
+
+def _read_log(active: Path) -> list[dict]:
+    import json as _json
+    p = active / "log.jsonl"
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            out.append(_json.loads(line))
+    return out
 
 
 def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):

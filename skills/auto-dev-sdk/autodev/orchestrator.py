@@ -25,6 +25,7 @@ from autodev.artifacts.verdict import (
 )
 from autodev.errors import (
     DirtyWorkspace, GateFailed, GatePending, LockConflict, PreflightError,
+    SchemaError, StageOutputInvalid,
 )
 from autodev import overrides_api as ov
 from autodev.panel import run_panel_gate, verdict_exists_and_valid
@@ -45,6 +46,41 @@ ARTIFACT_TO_GATE = {
     "panel_design_review": "design-review",
     "panel_close_approval": "close-approval",
 }
+
+# Bounded retry for "agent exited 0 but produced a deficient artifact"
+# (StageOutputInvalid). A small fixed cap distinct from the panel
+# revision-loop L budget: this is a transport/format/coverage retry —
+# the agent is re-dispatched with the specific deficiency described and
+# its prior artifact handed back for in-place amendment, NOT a semantic
+# design revision. After this many attempts the failure propagates.
+STAGE_OUTPUT_RETRY_MAX = 3
+
+# Position of each cascade artifact, used to express "stop the `run`
+# loop before the pipeline crosses into a later phase" (the --until
+# flag). Derived from the canonical ARTIFACTS order so it cannot drift
+# from the cascade graph.
+from autodev.state.cascade import ARTIFACTS as _CASCADE_ARTIFACTS  # noqa: E402
+
+_ARTIFACT_ORDER: dict[str, int] = {
+    ref.name: i for i, ref in enumerate(_CASCADE_ARTIFACTS)
+}
+
+# --until <phase> → the first artifact of the NEXT phase. The `run`
+# loop stops as soon as the stage it would advance to is at or beyond
+# this boundary. "spec" (and the default) run to completion.
+#   design phase ends once accepted_design is sealed → stop before build
+#   build phase ends once implementation_index is sealed → stop before spec
+PHASE_STOP_BEFORE: dict[str, str | None] = {
+    "design": "build",
+    "build": "spec",
+    "spec": None,
+}
+
+
+def _stage_order_index(stage_name: str) -> int:
+    """Order index of a stage/artifact name; unknown names sort last so
+    a name the cascade does not track never trips a boundary stop."""
+    return _ARTIFACT_ORDER.get(stage_name, len(_ARTIFACT_ORDER) + 1)
 
 
 _VERDICT_ORDER = {"fail": 3, "needs_revision": 2, "pass": 1, "skipped": 0}
@@ -86,7 +122,10 @@ class Orchestrator:
 
     # ---- entry points -----------------------------------------------
 
-    def run(self, feature: str, *, max_stages: int = 20) -> None:
+    def run(
+        self, feature: str, *, max_stages: int = 20,
+        stop_before: str | None = None,
+    ) -> None:
         """Advance through whatever stages are reachable.
 
         On each iteration, _enforce_pending_blocking_verdicts runs FIRST
@@ -99,7 +138,19 @@ class Orchestrator:
         next="done" and pipeline-done emits while the verdict stays
         unresolved on disk. enforce-first turns that into a normal
         revision-loop dispatch.
+
+        ``stop_before`` (a cascade artifact name, e.g. ``"build"``)
+        bounds the run to a phase: the loop returns cleanly the moment
+        the stage it would advance to is at or beyond that boundary.
+        This is how ``autodev run --until design`` advances through the
+        whole design phase — including the design-review gate and any
+        in-design revision reruns — then stops before build, rather than
+        either running end-to-end or stepping one stage at a time. A
+        blocking verdict that routes to a producer at/beyond the
+        boundary also stops here (design-phase reruns stay in design, so
+        this only matters for later boundaries).
         """
+        boundary = _stage_order_index(stop_before) if stop_before else None
         active = self._feature_active(feature)
         self._check_prerequisites_once(active)
         with self._lock(active, verb="run"):
@@ -113,6 +164,15 @@ class Orchestrator:
                 # we're done. HALT_FOR_HUMAN raises inside enforce.
                 pending = self._enforce_pending_blocking_verdicts(active, logger, feature)
                 if pending is not None:
+                    if (
+                        boundary is not None
+                        and pending.stage_to_rerun is not None
+                        and _stage_order_index(pending.stage_to_rerun) >= boundary
+                    ):
+                        self._emit_boundary_stop(
+                            logger, feature, stop_before, pending.stage_to_rerun,
+                        )
+                        return
                     self._check_dirty_blocks(active)
                     if pending.stage_to_rerun is not None:
                         self._advance_coding(
@@ -131,9 +191,20 @@ class Orchestrator:
                 if next_name == "done":
                     logger.emit(stage="orchestrator", event="pipeline-done", feature=feature)
                     return
+                if boundary is not None and _stage_order_index(next_name) >= boundary:
+                    self._emit_boundary_stop(logger, feature, stop_before, next_name)
+                    return
                 result = self._advance_one(feature, active, logger)
                 if not result.success:
                     return
+
+    def _emit_boundary_stop(
+        self, logger: JsonlLog, feature: str, until: str | None, next_stage: str,
+    ) -> None:
+        logger.emit(
+            stage="orchestrator", event="stopped-at-boundary", feature=feature,
+            detail={"until": until, "next_stage": next_stage},
+        )
 
     def advance_one(self, feature: str) -> AdvanceResult:
         """Run exactly the next stage."""
@@ -629,8 +700,6 @@ class Orchestrator:
         Implements G2 (coding-stage wiring) + G3 (out-of-scope-write hook).
         """
         from autodev.prompts_loader import render_stage_prompt
-        from autodev.vendors.subprocess_runner import run_stage_subprocess
-        from autodev.workspace import snapshot, detect_out_of_scope_writes
 
         if stage not in self._STAGE_MANIFEST:
             raise PreflightError(f"unknown coding stage: {stage!r}")
@@ -649,23 +718,36 @@ class Orchestrator:
         if stage == "build":
             allowed_write_paths.append(self.cfg.repo_root)
 
-        context_artifacts = self._context_artifacts_for_stage(
-            active, stage, primary_target, extra_targets,
-        )
+        # On a design rerun the prior package is on disk; pre-fill the
+        # subagent's .tmp working copies (see _run_stage_subprocess_checked)
+        # so it revises in place via Edit instead of regenerating every
+        # artifact. The prompt is told the .tmp are pre-filled only when
+        # the landed primary already exists. This holds across output-retry
+        # attempts too: the deficient prior artifact is still on disk, so a
+        # retry edits it in place rather than starting over.
+        preseeded = stage == "design" and primary_target.exists()
 
-        # Render prompt with variables the subagent needs.
-        prompt = render_stage_prompt(
-            stage=stage,
-            feature=feature,
-            feature_active=active,
-            repo_root=self.cfg.repo_root,
-            primary_target=primary_target,
-            extra_targets=extra_targets,
-            context_artifacts=context_artifacts,
-        )
-
-        # G3: pre-stage workspace snapshot for drift detection.
-        pre_snap = snapshot(self.cfg.repo_root)
+        # Prompt is rendered per attempt: on an output-validation retry the
+        # harness appends <stage>-output-rejection.json (and the prior
+        # artifacts) to CONTEXT_ARTIFACTS so the agent amends in place
+        # rather than regenerating from scratch.
+        def render_prompt(extra_context: list[str]) -> str:
+            merged = list(self._context_artifacts_for_stage(
+                active, stage, primary_target, extra_targets,
+            ))
+            for c in extra_context:
+                if c not in merged:
+                    merged.append(c)
+            return render_stage_prompt(
+                stage=stage,
+                feature=feature,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                primary_target=primary_target,
+                extra_targets=extra_targets,
+                context_artifacts=merged,
+                preseeded=preseeded,
+            )
 
         logger.emit(stage=stage, event="subprocess-dispatch", feature=feature,
                     detail={"vendor": stage_spec.vendor, "model": stage_spec.model,
@@ -673,17 +755,16 @@ class Orchestrator:
                             "extras": [str(p) for p in extra_targets]})
 
         if stage != "build":
-            result = self._run_stage_subprocess_checked(
+            result = self._dispatch_stage_with_output_retry(
                 feature=feature,
                 active=active,
                 stage=stage,
                 logger=logger,
                 stage_spec=stage_spec,
-                prompt=prompt,
+                render_prompt=render_prompt,
                 primary_target=primary_target,
                 extra_targets=extra_targets,
                 allowed_write_paths=allowed_write_paths,
-                pre_snap=pre_snap,
             )
             archive_path = None
             if stage == "design":
@@ -801,6 +882,27 @@ class Orchestrator:
         from autodev.workspace import snapshot, detect_out_of_scope_writes
         from datetime import datetime, timezone
         import os
+        import shutil
+
+        # Design reruns revise the prior package in place: pre-fill each
+        # extra artifact's .tmp from its landed version so the subagent
+        # edits only what changed. The runner pre-seeds the primary
+        # (design.md) itself via preseed=True. A stale extra .tmp with no
+        # landed source is dropped so it can't leak into the next round.
+        preseed = stage == "design"
+        if preseed:
+            for extra_target in extra_targets:
+                extra_tmp = extra_target.with_name(extra_target.name + ".tmp")
+                if extra_target.exists():
+                    try:
+                        shutil.copyfile(extra_target, extra_tmp)
+                    except OSError:
+                        pass
+                elif extra_tmp.exists():
+                    try:
+                        extra_tmp.unlink()
+                    except OSError:
+                        pass
 
         result = run_stage_subprocess(
             stage=stage,
@@ -813,6 +915,7 @@ class Orchestrator:
             log_emit=lambda d: logger.emit(stage=stage, event=d.get("event", "subprocess"),
                                            feature=feature, detail=d),
             probe_config=self.cfg.vendors.probe,
+            preseed=preseed,
         )
 
         if not result.ok:
@@ -835,8 +938,9 @@ class Orchestrator:
                     ts=datetime.now(timezone.utc).isoformat(),
                 )
                 write_failure(active / f"{stage}-failure.json", fr)
-                raise PreflightError(
-                    f"stage {stage} missing extra artifact {extra_target.name}"
+                raise StageOutputInvalid(
+                    stage, "missing_artifact",
+                    f"extra artifact {extra_target.name} not produced",
                 )
 
         # Provenance defense: a markdown primary artifact MUST carry a
@@ -860,10 +964,11 @@ class Orchestrator:
                     ts=datetime.now(timezone.utc).isoformat(),
                 )
                 write_failure(active / f"{stage}-failure.json", fr)
-                raise PreflightError(
-                    f"stage {stage} produced {primary_target.name} without "
-                    f"parseable provenance header (source_hash regex did not "
-                    f"match line 1-5); halting to avoid infinite re-dispatch"
+                raise StageOutputInvalid(
+                    stage, "malformed_artifact",
+                    f"{primary_target.name} has no parseable "
+                    f"`<!-- source_hash: sha256:... -->` header on line 1-5 "
+                    f"(cascade would loop forever)",
                 )
 
         post_snap = snapshot(self.cfg.repo_root)
@@ -886,6 +991,141 @@ class Orchestrator:
                 f"stage {stage} wrote outside allowed scope: {escapes}"
             )
         return result
+
+    def _dispatch_stage_with_output_retry(
+        self,
+        *,
+        feature: str,
+        active: Path,
+        stage: str,
+        logger: JsonlLog,
+        stage_spec,
+        render_prompt: Callable[[list[str]], str],
+        primary_target: Path,
+        extra_targets: list[Path],
+        allowed_write_paths: list[Path],
+    ):
+        """Dispatch a coding stage, retrying on a deficient deliverable.
+
+        A subprocess that exits 0 but produces a missing/malformed
+        artifact raises ``StageOutputInvalid`` from
+        ``_run_stage_subprocess_checked``. Rather than propagating that
+        on the first occurrence (which stalled the whole run on a
+        recoverable transport/format slip), re-dispatch the SAME agent up
+        to ``STAGE_OUTPUT_RETRY_MAX`` times. Each retry hands the agent a
+        ``<stage>-output-rejection.json`` describing exactly what was
+        wrong plus its own prior artifact, with an explicit instruction
+        to amend in place rather than start over.
+
+        Hard subprocess failures (timeout, non-zero exit, interrupted)
+        and containment violations (out-of-scope writes) are NOT
+        ``StageOutputInvalid`` and still propagate immediately — those
+        are not "fix your output" situations.
+        """
+        from autodev.workspace import snapshot
+
+        feedback_path = active / f"{stage}-output-rejection.json"
+        # Clear any stale rejection from a prior dispatch so attempt 1
+        # starts clean (a fresh stage run is not an amendment).
+        feedback_path.unlink(missing_ok=True)
+
+        for attempt in range(1, STAGE_OUTPUT_RETRY_MAX + 1):
+            extra_context: list[str] = []
+            if attempt > 1:
+                # Hand back the deficient artifacts + the structured
+                # rejection so the agent fixes exactly what failed.
+                if primary_target.exists():
+                    extra_context.append(str(primary_target))
+                for et in extra_targets:
+                    if et.exists():
+                        extra_context.append(str(et))
+                extra_context.append(str(feedback_path))
+            prompt = render_prompt(extra_context)
+            pre_snap = snapshot(self.cfg.repo_root)
+            try:
+                result = self._run_stage_subprocess_checked(
+                    feature=feature,
+                    active=active,
+                    stage=stage,
+                    logger=logger,
+                    stage_spec=stage_spec,
+                    prompt=prompt,
+                    primary_target=primary_target,
+                    extra_targets=extra_targets,
+                    allowed_write_paths=allowed_write_paths,
+                    pre_snap=pre_snap,
+                )
+                # Success — drop any rejection note from earlier attempts so
+                # a later dispatch does not mistake it for live feedback.
+                feedback_path.unlink(missing_ok=True)
+                return result
+            except StageOutputInvalid as e:
+                self._write_output_rejection_feedback(
+                    feedback_path, stage=stage, attempt=attempt,
+                    kind=e.kind, detail=e.detail,
+                    primary_target=primary_target, extra_targets=extra_targets,
+                    missing_ids=None,
+                )
+                if attempt >= STAGE_OUTPUT_RETRY_MAX:
+                    logger.emit(
+                        stage=stage, event="output-rejected-exhausted",
+                        feature=feature, detail={
+                            "attempts": attempt, "kind": e.kind,
+                            "detail": str(e.detail)[:300],
+                        },
+                    )
+                    raise
+                logger.emit(
+                    stage=stage, event="output-rejected-retrying",
+                    feature=feature, detail={
+                        "attempt": attempt, "max": STAGE_OUTPUT_RETRY_MAX,
+                        "kind": e.kind, "detail": str(e.detail)[:300],
+                    },
+                )
+        # Unreachable: the final attempt either returns or re-raises.
+        raise PreflightError(f"stage {stage} retry loop exited unexpectedly")
+
+    def _write_output_rejection_feedback(
+        self,
+        feedback_path: Path,
+        *,
+        stage: str,
+        attempt: int,
+        kind: str,
+        detail: str,
+        primary_target: Path,
+        extra_targets: list[Path] | None = None,
+        missing_ids: list[str] | None = None,
+    ) -> None:
+        """Write the structured rejection the next attempt reads.
+
+        Deliberately small and machine-readable. The amend instruction is
+        explicit: keep every valid entry, fix only the flagged problem,
+        do NOT regenerate from scratch — this is what makes the retry a
+        revision of the prior (deficient) artifact rather than a rewrite.
+        """
+        import json as _json
+        from autodev.state.atomic import atomic_write
+
+        payload: dict = {
+            "stage": stage,
+            "rejected_attempt": attempt,
+            "kind": kind,
+            "detail": detail,
+            "artifact": primary_target.name,
+            "instruction": (
+                f"Your previous {primary_target.name} was rejected by the "
+                f"harness ({kind}): {detail}. The prior version is in "
+                f"CONTEXT_ARTIFACTS. AMEND it in place: keep every entry "
+                f"that was already correct and fix ONLY the flagged "
+                f"problem. Do NOT regenerate the artifact from scratch."
+            ),
+        }
+        if extra_targets:
+            payload["extra_artifacts"] = [p.name for p in extra_targets]
+        if missing_ids:
+            payload["missing_scope_ids"] = sorted(missing_ids)
+        atomic_write(feedback_path, _json.dumps(payload, indent=2) + "\n")
 
     def _stamp_build_sealed_ref(self, build_path: Path) -> None:
         """Augment the just-written build.json with the current git HEAD.
@@ -990,41 +1230,107 @@ class Orchestrator:
     def _run_ralph_review(
         self, feature: str, active: Path, logger: JsonlLog,
     ) -> dict[str, bool]:
+        """Dispatch the per-iteration ralph classification, retrying on a
+        deficient classification list.
+
+        The reviewer's output is consumed by Python, so an incomplete list
+        (an active scope item with no classification) or an unparseable /
+        malformed JSON body is a hard schema error. Previously that error
+        propagated and killed the whole run. Now the harness re-dispatches
+        the SAME ralph-review agent up to ``STAGE_OUTPUT_RETRY_MAX`` times,
+        handing it its own prior (rejected) ``ralph-review.json`` plus a
+        ``ralph-review-output-rejection.json`` that names exactly which
+        scope_ids were missing (or what made the JSON unparseable). The
+        prompt instructs the agent to AMEND the prior list — keep the
+        classifications it already produced, add/repair only the flagged
+        rows — rather than reclassify everything from scratch.
+
+        This retry is within a single build iteration: the code on disk is
+        unchanged, the agent simply failed to emit a complete/valid list.
+        Only after the cap is exhausted does the schema error propagate.
+        """
         from autodev.prompts_loader import render_stage_prompt
         from autodev.state.hashing import hash_file
-        from autodev.vendors.subprocess_runner import run_stage_subprocess
-        from autodev.workspace import snapshot, detect_out_of_scope_writes
+        from autodev.workspace import snapshot
 
         review_target = active / "ralph-review.json"
-        prompt = render_stage_prompt(
-            stage="ralph-review",
-            feature=feature,
-            feature_active=active,
-            repo_root=self.cfg.repo_root,
-            primary_target=review_target,
-            extra_targets=[],
-        )
         review_spec = self.cfg.vendors.resolve("review")
-        pre_snap = snapshot(self.cfg.repo_root)
-        result = self._run_stage_subprocess_checked(
-            feature=feature,
-            active=active,
-            stage="ralph-review",
-            logger=logger,
-            stage_spec=review_spec,
-            prompt=prompt,
-            primary_target=review_target,
-            extra_targets=[],
-            allowed_write_paths=[active],
-            pre_snap=pre_snap,
-        )
-        logger.emit(stage="ralph-review", event="stage-complete", feature=feature,
-                    detail={"artifact": str(review_target),
-                            "elapsed_sec": result.elapsed_sec})
-
         active_ids = ralph.active_scope_ids(active / "scope.json")
-        statuses = ralph.parse_review_statuses(review_target)
-        ralph.validate_active_review_coverage(statuses, active_ids)
+        feedback_path = active / "ralph-review-output-rejection.json"
+        # A fresh iteration's first pass is not an amendment.
+        feedback_path.unlink(missing_ok=True)
+
+        statuses: dict[str, str] | None = None
+        last_exc: SchemaError | None = None
+        for attempt in range(1, STAGE_OUTPUT_RETRY_MAX + 1):
+            context_artifacts: list[str] = []
+            if attempt > 1:
+                if review_target.exists():
+                    context_artifacts.append(str(review_target))
+                context_artifacts.append(str(feedback_path))
+            prompt = render_stage_prompt(
+                stage="ralph-review",
+                feature=feature,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                primary_target=review_target,
+                extra_targets=[],
+                context_artifacts=context_artifacts or None,
+            )
+            result = self._run_stage_subprocess_checked(
+                feature=feature,
+                active=active,
+                stage="ralph-review",
+                logger=logger,
+                stage_spec=review_spec,
+                prompt=prompt,
+                primary_target=review_target,
+                extra_targets=[],
+                allowed_write_paths=[active],
+                pre_snap=snapshot(self.cfg.repo_root),
+            )
+            logger.emit(stage="ralph-review", event="stage-complete", feature=feature,
+                        detail={"artifact": str(review_target),
+                                "elapsed_sec": result.elapsed_sec})
+
+            parsed: dict[str, str] = {}
+            try:
+                parsed = ralph.parse_review_statuses(review_target)
+                ralph.validate_active_review_coverage(parsed, active_ids)
+            except SchemaError as e:
+                last_exc = e
+                missing = sorted(active_ids - set(parsed))
+                self._write_output_rejection_feedback(
+                    feedback_path, stage="ralph-review", attempt=attempt,
+                    kind="incomplete_or_malformed_review", detail=str(e),
+                    primary_target=review_target, extra_targets=None,
+                    missing_ids=missing or None,
+                )
+                if attempt >= STAGE_OUTPUT_RETRY_MAX:
+                    logger.emit(
+                        stage="ralph-review", event="output-rejected-exhausted",
+                        feature=feature, detail={
+                            "attempts": attempt, "error": str(e)[:300],
+                        },
+                    )
+                    raise
+                logger.emit(
+                    stage="ralph-review", event="output-rejected-retrying",
+                    feature=feature, detail={
+                        "attempt": attempt, "max": STAGE_OUTPUT_RETRY_MAX,
+                        "missing_scope_ids": missing, "error": str(e)[:300],
+                    },
+                )
+                continue
+            statuses = parsed
+            break
+
+        if statuses is None:  # defensive — loop either set statuses or raised
+            raise last_exc or SchemaError("ralph review produced no valid classification")
+
+        # Validation passed — drop the rejection note so a later iteration
+        # does not mistake it for live feedback.
+        feedback_path.unlink(missing_ok=True)
 
         state = ralph.load_ralph_state(active)
         state.source = str(active / "scope.json")

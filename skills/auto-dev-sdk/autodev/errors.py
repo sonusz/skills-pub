@@ -26,6 +26,30 @@ class PreflightError(AutodevError):
     """Preflight check failed (e.g. non-git directory)."""
 
 
+class StageOutputInvalid(PreflightError):
+    """A stage subprocess exited 0 but produced a deficient artifact
+    (missing expected artifact, malformed provenance header, incomplete
+    classification coverage, unparseable JSON, …).
+
+    Distinct from a hard subprocess failure or a containment violation:
+    the agent did real work, the deliverable is just incomplete or
+    malformed, so re-dispatching the SAME agent with the specific
+    deficiency described — and the prior artifact handed back for
+    in-place amendment — is a sound recovery. The orchestrator retries
+    on this up to a bounded cap before letting it propagate.
+
+    Subclasses ``PreflightError`` so callers that already catch
+    ``PreflightError`` (e.g. the CLI dispatcher) keep treating an
+    *exhausted* retry as a normal hard error.
+    """
+
+    def __init__(self, stage: str, kind: str, detail: str = ""):
+        super().__init__(f"stage {stage} output invalid ({kind}): {detail}")
+        self.stage = stage
+        self.kind = kind
+        self.detail = detail
+
+
 class GatePending(AutodevError):
     """A mandatory gate requires user action."""
 

@@ -124,6 +124,39 @@ def test_cli_status_surfaces_overrides(git_repo, feature_active, capsys):
     assert "skip_gate" in out or "design-review" in out
 
 
+def test_cli_run_until_design_threads_stop_before(git_repo, feature_active, monkeypatch):
+    """`run --until design` must reach the orchestrator as
+    stop_before='build' (stop the loop before the build phase)."""
+    import autodev.cli as cli
+
+    captured = {}
+
+    class FakeOrch:
+        def run(self, feature, *, stop_before=None):
+            captured["feature"] = feature
+            captured["stop_before"] = stop_before
+
+    monkeypatch.setattr(cli, "_orch", lambda args: FakeOrch())
+    code = main(["run", "demo", "--until", "design", "--repo-root", str(git_repo)])
+    assert code == exit_codes.OK
+    assert captured == {"feature": "demo", "stop_before": "build"}
+
+
+def test_cli_run_without_until_runs_to_completion(git_repo, feature_active, monkeypatch):
+    import autodev.cli as cli
+
+    captured = {}
+
+    class FakeOrch:
+        def run(self, feature, *, stop_before=None):
+            captured["stop_before"] = stop_before
+
+    monkeypatch.setattr(cli, "_orch", lambda args: FakeOrch())
+    code = main(["run", "demo", "--repo-root", str(git_repo)])
+    assert code == exit_codes.OK
+    assert captured["stop_before"] is None
+
+
 def test_cli_run_uses_sdk_root_vendors_by_default(git_repo, feature_active, monkeypatch):
     import autodev.cli as cli
 

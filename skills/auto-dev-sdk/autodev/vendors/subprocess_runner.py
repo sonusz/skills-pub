@@ -82,19 +82,34 @@ def run_stage_subprocess(
     log_emit: Callable[[dict], None] | None = None,
     extra_stdin: str = "",
     probe_config: ProbeConfig | None = None,
+    preseed: bool = False,
 ) -> StageRunResult:
     """Execute a single stage subprocess end-to-end.
 
     Writes artifact atomically via `<artifact_target>.tmp` → rename.
     On failure, writes `<stage>-failure.json` in `feature_active` and
     returns `ok=False` with taxonomy.
+
+    When ``preseed`` is set and a landed ``artifact_target`` already
+    exists (i.e. this is a rerun), the ``.tmp`` is pre-filled with the
+    current artifact so the subagent can revise it in place (Edit)
+    instead of regenerating the whole file from scratch. This is purely
+    an output-token optimization — the atomic-rename contract is
+    unchanged: on failure the (possibly half-edited) ``.tmp`` is
+    discarded and the landed artifact stays untouched.
     """
     cwd = cwd or feature_active
     artifact_tmp = artifact_target.with_name(artifact_target.name + ".tmp")
-    # Clean any stale tmp from a prior attempt
+    # Clean any stale tmp from a prior attempt, then optionally pre-seed.
     if artifact_tmp.exists():
         try:
             artifact_tmp.unlink()
+        except OSError:
+            pass
+    if preseed and artifact_target.exists():
+        import shutil
+        try:
+            shutil.copyfile(artifact_target, artifact_tmp)
         except OSError:
             pass
 

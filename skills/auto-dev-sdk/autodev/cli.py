@@ -112,6 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
             help="Emit one-line stdout alerts on key state transitions.",
         )
 
+    # --until: bound `run` to a phase. `run --until design` advances
+    # through the whole design phase (including design-review and any
+    # in-design revision reruns) and stops cleanly before build, instead
+    # of either running end-to-end (plain `run`) or stepping one stage at
+    # a time (`next`). Exit code 0 with a `stopped-at-boundary` event.
+    sub._name_parser_map["run"].add_argument(
+        "--until", dest="until", choices=("design", "build", "spec"), default=None,
+        help="Advance only through the named phase, then stop "
+             "(design=stop before build, build=stop before spec, "
+             "spec=run to completion).",
+    )
+
     # skip-gate
     sg = sub.add_parser("skip-gate", help="Override a mandatory gate with reason")
     sg.add_argument("feature")
@@ -370,10 +382,17 @@ def _dispatch_orch(args, call: str) -> int:
         pass
     try:
         if call == "run":
-            orch.run(args.feature)
+            from autodev.orchestrator import PHASE_STOP_BEFORE
+            until = getattr(args, "until", None)
+            stop_before = PHASE_STOP_BEFORE.get(until) if until else None
+            orch.run(args.feature, stop_before=stop_before)
+            if until:
+                print(f"{args.feature}: run advanced through '{until}' phase")
+            else:
+                print(f"{args.feature}: run complete")
         elif call == "next":
             orch.advance_one(args.feature)
-        print(f"{args.feature}: {call} complete")
+            print(f"{args.feature}: next complete")
     except LockConflict as e:
         print(f"lock conflict: {e}", file=sys.stderr)
         return exit_codes.LOCK_CONFLICT
