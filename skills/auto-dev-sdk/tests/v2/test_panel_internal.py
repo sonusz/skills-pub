@@ -277,7 +277,11 @@ def test_incomplete_panel_one_missing_halts_and_caches_successes(
     missing reviewer."""
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
     artifact = _make_artifact(feature_active)
-    with pytest.raises(GatePending, match="panel design-review incomplete"):
+    # The design-review gate runs the design-review and trace-review groups
+    # concurrently; with a reviewer missing, BOTH groups are incomplete and
+    # which group's GatePending propagates first is a thread race. Accept
+    # either gate's message (both are the correct incomplete-panel signal).
+    with pytest.raises(GatePending, match=r"panel (design-review|trace-review) incomplete"):
         run_panel_gate_internal(
             gate="design-review",
             feature_active=feature_active,

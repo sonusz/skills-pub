@@ -69,6 +69,36 @@ def _extract_architecture_input_section(text: str) -> list[str]:
     return items
 
 
+def _extract_base_ref(text: str) -> str | None:
+    """Parse the optional ``## Base ref`` section of architecture.md.
+
+    Returns the declared git ref (branch or commit) the design's grounding
+    context is anchored to. Grounding-file freshness is then measured against
+    THIS ref, not the working tree: only the base advancing (e.g. ``main``
+    gaining commits that touch a grounding file) invalidates the design —
+    the feature branch's own build commits do not.
+
+    Returns ``None`` when the section is absent (back-compat: callers fall
+    back to working-tree hashing, the pre-base-ref behavior).
+    """
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            if in_section:
+                break
+            header = stripped.lstrip("#").strip().lower()
+            if header in ("base ref", "base"):
+                in_section = True
+            continue
+        if in_section and stripped:
+            # First non-empty content line. Tolerate "- `main`", "`main`", "main".
+            value = stripped.lstrip("-").strip().strip("`").strip()
+            if value:
+                return value
+    return None
+
+
 def _normalize_context_path(repo_root: Path, raw: str) -> str:
     declared = Path(raw)
     if declared.is_absolute():
@@ -106,19 +136,43 @@ def discover_root_context_paths(feature_active: Path) -> list[str]:
     return normalized
 
 
-def write_workflow_state(feature_active: Path, root_context_paths: list[str]) -> Path:
+def discover_base_ref(feature_active: Path) -> str | None:
+    """Read the optional ``## Base ref`` declaration from the feature-local
+    architecture.md. Returns None when the file or section is absent."""
+    arch_path = Path(feature_active) / "architecture.md"
+    if not arch_path.exists():
+        return None
+    try:
+        text = arch_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _extract_base_ref(text)
+
+
+def write_workflow_state(
+    feature_active: Path,
+    root_context_paths: list[str],
+    *,
+    base_ref: str | None = None,
+) -> Path:
     path = workflow_state_path(feature_active)
-    payload = {
+    payload: dict[str, Any] = {
         "kind": "workflow-state",
         "schema_version": 1,
         "root_context_paths": _validate_root_context_paths(root_context_paths),
     }
+    if base_ref:
+        payload["base_ref"] = base_ref
     atomic_write_json(path, payload)
     return path
 
 
 def bootstrap_workflow_state(feature_active: Path) -> Path:
-    return write_workflow_state(feature_active, discover_root_context_paths(feature_active))
+    return write_workflow_state(
+        feature_active,
+        discover_root_context_paths(feature_active),
+        base_ref=discover_base_ref(feature_active),
+    )
 
 
 def ensure_workflow_state(feature_active: Path) -> dict[str, Any]:

@@ -258,6 +258,22 @@ def verdict_exists_and_valid(
         if hash_file(cp) != cd.get("hash", ""):
             return None
     if gate == "design-review":
+        # Defense in depth: `consulted_filter` deliberately narrows what each
+        # REVIEWER reads (token budget) to a subset of the packet's inputs.
+        # That narrowing must NOT shrink the staleness surface. A cached
+        # design-review verdict stays valid only while the FULL design-packet
+        # — including authoritative context_refs the reviewer never reads
+        # (e.g. architecture-proposal.md) — is still fresh. The filtered
+        # consulted_docs hash-checks above cannot see context drift outside
+        # the filter, so re-validate packet freshness independently here.
+        packet_path = feature_active / "design-packet.json"
+        try:
+            from autodev.artifacts.design_packet import design_packet_fresh
+            packet_ok = packet_path.exists() and design_packet_fresh(packet_path)
+        except Exception:
+            packet_ok = False
+        if not packet_ok:
+            return None
         trace_path = feature_active / "panel-trace-review.json"
         if not trace_path.exists():
             return v

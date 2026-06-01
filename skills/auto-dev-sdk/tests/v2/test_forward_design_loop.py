@@ -806,3 +806,70 @@ def test_authoritative_context_drift_stales_cached_acceptance(
         gate="design-review",
         current_source_hash=hash_file(active / "design-packet.json"),
     ) is None
+
+
+def test_extract_base_ref_parses_section():
+    from autodev.artifacts.workflow_state import _extract_base_ref
+    assert _extract_base_ref(
+        "# Architecture: x\n\n## Base ref\n\n`main`\n\n"
+        "## Architecture Input\n\n- `a.go`\n"
+    ) == "main"
+    # tolerate a leading "- " bullet and surrounding backticks
+    assert _extract_base_ref("## Base ref\n- `release/v2`\n") == "release/v2"
+    # absent section -> None (back-compat: callers use working-tree hashing)
+    assert _extract_base_ref(
+        "# Architecture\n\n## Architecture Input\n- `a.go`\n"
+    ) is None
+
+
+def test_base_ref_anchors_grounding_to_base_branch(git_repo):
+    """A declared ``## Base ref`` anchors grounding-file freshness to the
+    BASE branch: the feature branch's own edits/commits (the build's work)
+    do NOT stale the design packet, but the base advancing (an upstream
+    commit touching a grounding file) DOES.
+    """
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(git_repo), *args],
+            check=True, capture_output=True, text=True,
+        )
+
+    base = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    _seed_forward_feature(active)
+    # Re-declare architecture.md with a "## Base ref" section anchoring to base.
+    (active / "architecture.md").write_text(
+        "# Architecture: demo\n\n"
+        f"## Base ref\n\n`{base}`\n\n"
+        "## Architecture Input\n\n- `docs/architecture-proposal.md`\n",
+        encoding="utf-8",
+    )
+    git("add", "-A")
+    git("commit", "-qm", "seed feature on base branch")
+
+    git("checkout", "-q", "-b", "feature/x")
+
+    atomic_write_json(active / "design-packet.json", build_design_packet(active))
+    assert design_packet_fresh(active / "design-packet.json") is True
+
+    proposal = git_repo / "docs" / "architecture-proposal.md"
+
+    # (1) A feature-side change to the grounding file — the kind a build makes
+    #     while implementing — must NOT stale the packet (base ref unchanged).
+    proposal.write_text("# Proposal\n\nfeature/build slimmed this\n", encoding="utf-8")
+    assert design_packet_fresh(active / "design-packet.json") is True
+    git("add", "-A")
+    git("commit", "-qm", "feature commit touches a grounding file")
+    assert design_packet_fresh(active / "design-packet.json") is True
+
+    # (2) The base advancing (a commit ON the base branch touching the
+    #     grounding file) DOES stale the packet.
+    git("checkout", "-q", base)
+    proposal.write_text("# Proposal\n\nupstream changed this on base\n", encoding="utf-8")
+    git("commit", "-aqm", "upstream change on base")
+    git("checkout", "-q", "feature/x")
+    assert design_packet_fresh(active / "design-packet.json") is False

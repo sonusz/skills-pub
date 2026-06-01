@@ -90,6 +90,15 @@ def render_stage_prompt(
         else:
             ctx_lines.append(f"- {name_key}: `{path}` (MISSING — stage will abort)")
 
+    # The design stage authors scope.json's `diff_base`. Surface the declared
+    # base ref (architecture.md "## Base ref") so it has one source of truth
+    # rather than being the agent's guess.
+    if stage == "design":
+        from autodev.artifacts.workflow_state import discover_base_ref
+        base_ref = discover_base_ref(feature_active)
+        if base_ref:
+            ctx_lines.append(f"- DIFF_BASE: `{base_ref}`")
+
     # Target artifacts
     target_map = {
         "design": [

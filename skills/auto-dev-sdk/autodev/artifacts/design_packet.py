@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,11 @@ from autodev.artifacts.verdict import (
     load_verdict,
     panel_verdict_transport_incomplete,
 )
-from autodev.artifacts.workflow_state import ensure_workflow_state, load_workflow_state
+from autodev.artifacts.workflow_state import (
+    discover_base_ref,
+    ensure_workflow_state,
+    load_workflow_state,
+)
 from autodev.errors import SchemaError
 from autodev.paths import find_repo_root
 from autodev.state.atomic import atomic_write_json
@@ -83,21 +88,83 @@ def _parse_validation_commands(design_path: Path) -> list[str]:
     raise SchemaError("design packet missing Validation commands declaration")
 
 
+def _base_ref_resolves(repo_root: Path, base_ref: str) -> bool:
+    """True when ``base_ref`` resolves to a commit inside ``repo_root``."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+             f"{base_ref}^{{commit}}"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _ref_content_hash(repo_root: Path, base_ref: str, rel_path: str) -> str | None:
+    """Hash of ``rel_path``'s content AS OF ``base_ref`` (via ``git show``).
+
+    Returns None when the path does not exist at that ref (e.g. a file the
+    feature CREATES, which has no base version) or git cannot read it. Raw
+    bytes are hashed (no text decoding) so the digest matches ``hash_file``
+    on a byte-identical working-tree copy.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{base_ref}:{rel_path}"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return hash_bytes(proc.stdout)
+
+
 def _authoritative_context_refs(active: Path, *, bootstrap: bool = True) -> list[dict[str, str]]:
     state = ensure_workflow_state(active) if bootstrap else load_workflow_state(active)
     repo_root = find_repo_root(active)
+
+    # Grounding-context freshness is anchored to a declared base ref (the
+    # "## Base ref" section of architecture.md, cached in workflow-state).
+    # When set and resolvable, each grounding file is hashed AS IT EXISTS ON
+    # THAT REF, not in the working tree: the feature branch's own build
+    # commits move the working tree but never the base ref, so they do not
+    # perturb the packet — only the base advancing (upstream drift touching a
+    # grounding file) does. Absent/unresolvable ref → fall back to working-
+    # tree hashing (the pre-base-ref behavior).
+    base_ref = state.get("base_ref") or discover_base_ref(active)
+    use_base = bool(base_ref) and _base_ref_resolves(repo_root, base_ref)
+
     refs: list[dict[str, str]] = []
     seen: set[str] = set()
     for rel_path in state["root_context_paths"]:
         if rel_path in seen:
             raise SchemaError(f"workflow-state.root_context_paths duplicates path {rel_path!r}")
         seen.add(rel_path)
+        if use_base:
+            ref_hash = _ref_content_hash(repo_root, base_ref, rel_path)
+            if ref_hash is None:
+                # Not present at the base ref: a file the FEATURE introduces
+                # (no base version to anchor to) or absent upstream. It cannot
+                # be pinned as base grounding context — drop it rather than
+                # fail (re)generation.
+                continue
+            refs.append({"path": rel_path, "hash": ref_hash})
+            continue
         path = repo_root / rel_path
         if not path.exists():
-            raise SchemaError(f"workflow-state root context path missing: {rel_path}")
+            # No base ref (working-tree mode): a declared path can be removed
+            # by the feature's own build (e.g. an R1 "remove X"); existence was
+            # enforced at bootstrap, so a path missing HERE was deleted since.
+            # Drop it rather than fail (re)generation.
+            continue
         refs.append({"path": rel_path, "hash": hash_file(path)})
-    if len(refs) != len(state["root_context_paths"]):
-        raise SchemaError("workflow-state root context paths could not be resolved exactly")
+    if not refs:
+        raise SchemaError(
+            "workflow-state root context paths all missing — none resolvable: "
+            + ", ".join(state["root_context_paths"])
+        )
     return refs
 
 
