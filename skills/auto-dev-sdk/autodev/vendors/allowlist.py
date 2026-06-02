@@ -30,6 +30,11 @@ VENDOR_ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
         "--oss",                   # OSS provider
         "--image",
     ),
+    "cursor": (
+        "--model",                 # explicit model SKU override (effort encoded in id)
+        "--effort",                # accepted for uniformity (no cursor analog; ignored)
+        "--max-budget-usd",        # cost cap
+    ),
 }
 VENDOR_ALLOWED_FLAGS["openai"] = VENDOR_ALLOWED_FLAGS["codex"]
 

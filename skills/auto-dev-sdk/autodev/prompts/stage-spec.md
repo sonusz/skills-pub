@@ -47,6 +47,27 @@ Read `IMPLEMENTATION_INDEX_PATH`. Use `files_changed` as the starting
 set, then inspect nearby code/tests as needed to understand the shipped
 contract.
 
+**Coverage completeness — account for EVERY entry in `files_changed`.** The
+spec must reflect the WHOLE change-set, not just the headline new components.
+Two classes are routinely under-described; cover them explicitly:
+
+- **Removals / deletions.** A change can be the ABSENCE of code — a deleted
+  route, handler, listening port, service, or whole router removed from a
+  slimmed binary. The removed surface is not present to "inspect", so it is
+  easy to skip. For every change that removes a surface, state what is now
+  GONE (which route / port / handler / module) in §3 (contract) and/or §6
+  (known absences). Diff the changed file against its prior shape if needed
+  to see what was deleted.
+- **Cross-cutting / non-service files.** `files_changed` may include deploy
+  artifacts, CI workflows, diagnostic skills (`skills/**`), architecture
+  docs, etc. — not only the core service code. Describe these too (e.g. a
+  diagnostic skill repointed at a new service, a relocated deploy/alarm
+  artifact) in §5 (architecture) or §8 (operational notes). Do not silently
+  drop a changed file because it is not "service code".
+
+A reviewer reading your spec must be able to see EVERY material change in
+`files_changed` reflected somewhere in the eight sections.
+
 Write `implemented-spec.md` with exactly 8 sections:
 
 1. **Purpose** -- what the implementation appears to do
