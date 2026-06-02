@@ -453,6 +453,7 @@ def cmd_abort(args) -> int:
     """
     import os
     import signal
+    import socket
     import time as _time
 
     fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
@@ -511,9 +512,40 @@ def cmd_abort(args) -> int:
     )
     write_failure(active / failure_name, fr)
 
-    # Release lock
-    from autodev.state.lock import Lock
-    Lock(active, session_id="abort", verb="abort").release()
+    # Step 3: stop the ORCHESTRATOR itself (the `autodev run` process holding
+    # the feature lock) — not just its vendor child. An orchestrator that has
+    # not yet seen `.pause` would otherwise keep advancing the pipeline after
+    # we free its lock, concurrent with the next run. (Defense in depth: the
+    # orchestrator also self-terminates on its next lock heartbeat.)
+    from autodev.state.lock import Lock, read_owner
+    owner = read_owner(active) or {}
+    orch_pid = owner.get("pid")
+    orch_host = owner.get("host")
+    if (
+        isinstance(orch_pid, int)
+        and orch_pid != os.getpid()
+        and (not orch_host or orch_host == socket.gethostname())
+    ):
+        try:
+            os.kill(orch_pid, signal.SIGTERM)
+            for _ in range(50):
+                _time.sleep(0.1)
+                try:
+                    os.kill(orch_pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                try:
+                    os.kill(orch_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            print(f"  stopped orchestrator pid {orch_pid}")
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Release the lock (force: we just stopped the holder, so reclaim it even
+    # though abort's own token doesn't match the orchestrator's).
+    Lock(active, session_id="abort", verb="abort").release(force=True)
     print(
         f"aborted {args.feature}"
         + (f" (killed pid {killed_pid})" if killed_pid else "")

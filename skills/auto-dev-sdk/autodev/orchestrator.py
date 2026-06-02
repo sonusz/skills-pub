@@ -153,9 +153,11 @@ class Orchestrator:
         boundary = _stage_order_index(stop_before) if stop_before else None
         active = self._feature_active(feature)
         self._check_prerequisites_once(active)
-        with self._lock(active, verb="run"):
+        with self._lock(active, verb="run") as lock:
+            self._active_lock = lock
             logger = JsonlLog(active / "log.jsonl")
             for i in range(max_stages):
+                self._heartbeat(logger, feature)
                 if self._check_pause_sentinel(active):
                     logger.emit(stage="orchestrator", event="paused", feature=feature)
                     raise GatePending("pause", "run `autodev resume` to continue")
@@ -210,9 +212,29 @@ class Orchestrator:
         """Run exactly the next stage."""
         active = self._feature_active(feature)
         self._check_prerequisites_once(active)
-        with self._lock(active, verb="next"):
+        with self._lock(active, verb="next") as lock:
+            self._active_lock = lock
             logger = JsonlLog(active / "log.jsonl")
+            self._heartbeat(logger, feature)
             return self._advance_one(feature, active, logger)
+
+    def _heartbeat(self, logger: JsonlLog, feature: str) -> None:
+        """Self-validation: stop the moment we no longer hold the feature lock
+        (it was released, deleted, or reclaimed by another orchestrator).
+        Prevents an orphaned orchestrator from advancing the pipeline
+        concurrently with the new lock owner — the failure mode where an abort
+        freed the lock but this process kept running."""
+        lock = getattr(self, "_active_lock", None)
+        if lock is not None and not lock.validate():
+            logger.emit(
+                stage="orchestrator", event="lock-lost", feature=feature,
+                detail={"reason": "owner.json missing or token mismatch; "
+                                  "another process owns the lock — self-terminating"},
+            )
+            raise LockConflict(
+                "feature lock lost (released or reclaimed by another process); "
+                "orchestrator self-terminating to avoid concurrent runs"
+            )
 
     # ---- guts -------------------------------------------------------
 
@@ -1167,6 +1189,7 @@ class Orchestrator:
     ) -> AdvanceResult:
         self._reset_ralph_state_if_inputs_changed(active, logger, feature)
         while True:
+            self._heartbeat(logger, feature)
             # Pause checkpoint between build rounds: the only outer pause
             # check (_advance_one entry) precedes the whole Ralph loop, so
             # without this a pause set during build round N is not seen
