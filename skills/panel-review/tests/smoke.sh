@@ -3,7 +3,7 @@
 #
 # It puts fake codex/claude/gemini binaries at the front of PATH, then exercises
 # doctor.sh, launch.sh, and synthesize.sh through the shared vendors module.
-set -eo pipefail
+set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$TEST_DIR/.." && pwd)"
@@ -19,8 +19,11 @@ trap cleanup EXIT
 
 BIN_DIR="$WORK/bin"
 RUN_DIR="$WORK/run"
+INLINE_RUN_DIR="$WORK/run-inline"
 PROMPT_FILE="$WORK/prompt.txt"
-mkdir -p "$BIN_DIR" "$RUN_DIR"
+MARKER_PREFIX="$WORK/marker"
+INLINE_MARKER_PREFIX="$WORK/inline-marker"
+mkdir -p "$BIN_DIR" "$RUN_DIR" "$INLINE_RUN_DIR"
 
 cat > "$PROMPT_FILE" <<'PROMPT'
 Review this tiny config for ambiguity:
@@ -32,6 +35,9 @@ PROMPT
 cat > "$BIN_DIR/codex" <<'FAKE_CODEX'
 #!/usr/bin/env bash
 out=""
+if [ -n "${PANEL_SMOKE_MARKERS:-}" ]; then
+  printf "pwd=%s\nargs=%s\n" "$PWD" "$*" > "${PANEL_SMOKE_MARKERS}.codex"
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-last-message)
@@ -69,6 +75,9 @@ FAKE_CODEX
 
 cat > "$BIN_DIR/claude" <<'FAKE_CLAUDE'
 #!/usr/bin/env bash
+if [ -n "${PANEL_SMOKE_MARKERS:-}" ]; then
+  printf "pwd=%s\nargs=%s\n" "$PWD" "$*" > "${PANEL_SMOKE_MARKERS}.claude"
+fi
 prompt=$(cat)
 if printf "%s" "$prompt" | grep -qi 'single word READY'; then
   printf "READY\n"
@@ -95,6 +104,9 @@ FAKE_CLAUDE
 
 cat > "$BIN_DIR/gemini" <<'FAKE_GEMINI'
 #!/usr/bin/env bash
+if [ -n "${PANEL_SMOKE_MARKERS:-}" ]; then
+  printf "pwd=%s\nargs=%s\n" "$PWD" "$*" > "${PANEL_SMOKE_MARKERS}.gemini"
+fi
 prompt=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -141,8 +153,52 @@ if [ -n "$SYNTHESIS_EXPECTED_EFFORT" ] && [[ "$SYNTHESIS_ARG_TEXT" != *"<--effor
 fi
 
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/doctor.sh" "$ROOT_DIR/vendors.yaml" >/dev/null
-PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/launch.sh" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
+PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$MARKER_PREFIX" \
+  "$SCRIPT_DIR/launch.sh" --cwd "$ROOT_DIR" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/synthesize.sh" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
+
+for vendor in codex claude gemini; do
+  marker="$MARKER_PREFIX.$vendor"
+  if [ ! -s "$marker" ]; then
+    printf "FAIL: expected repo-mode marker for %s\n" "$vendor" >&2
+    exit 1
+  fi
+  if ! grep -qx "pwd=$ROOT_DIR" "$marker"; then
+    printf "FAIL: expected %s to run from repo cwd %s\n" "$vendor" "$ROOT_DIR" >&2
+    cat "$marker" >&2
+    exit 1
+  fi
+done
+if ! grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$MARKER_PREFIX.codex"; then
+  printf "FAIL: expected repo-mode codex call to use approval bypass\n" >&2
+  cat "$MARKER_PREFIX.codex" >&2
+  exit 1
+fi
+if ! grep -q -- "--cd $ROOT_DIR" "$MARKER_PREFIX.codex"; then
+  printf "FAIL: expected repo-mode codex call to receive --cd %s\n" "$ROOT_DIR" >&2
+  cat "$MARKER_PREFIX.codex" >&2
+  exit 1
+fi
+if ! grep -q -- '--permission-mode bypassPermissions' "$MARKER_PREFIX.claude"; then
+  printf "FAIL: expected repo-mode claude call to use bypassPermissions\n" >&2
+  cat "$MARKER_PREFIX.claude" >&2
+  exit 1
+fi
+if ! grep -q -- '--yolo' "$MARKER_PREFIX.gemini"; then
+  printf "FAIL: expected repo-mode gemini call to use --yolo\n" >&2
+  cat "$MARKER_PREFIX.gemini" >&2
+  exit 1
+fi
+
+PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$INLINE_MARKER_PREFIX" \
+  "$SCRIPT_DIR/launch.sh" --inline "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$INLINE_RUN_DIR" >/dev/null
+if grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$INLINE_MARKER_PREFIX.codex" \
+    || grep -q -- '--permission-mode bypassPermissions' "$INLINE_MARKER_PREFIX.claude" \
+    || grep -q -- '--yolo' "$INLINE_MARKER_PREFIX.gemini"; then
+  printf "FAIL: inline mode should not pass repo/yolo access flags\n" >&2
+  cat "$INLINE_MARKER_PREFIX.codex" "$INLINE_MARKER_PREFIX.claude" "$INLINE_MARKER_PREFIX.gemini" >&2
+  exit 1
+fi
 
 for file in openai/out claude/out gemini/out synthesis/out openai/status claude/status gemini/status synthesis/status; do
   if [ ! -s "$RUN_DIR/$file" ]; then

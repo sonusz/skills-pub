@@ -15,6 +15,7 @@ from typing import Callable
 
 from autodev.artifacts.failure import FailureReport, write_failure
 from autodev.vendors.config import ProbeConfig, StageSpec
+from autodev.vendors.fallback import build_candidates, resolve_candidate
 from autodev.vendors.probe_agent import ProbeVerdict, run_idle_probe
 from autodev.vendors.shared_call import (
     IdleAction,
@@ -99,6 +100,19 @@ def run_stage_subprocess(
     discarded and the landed artifact stays untouched.
     """
     cwd = cwd or feature_active
+
+    # Quota gate (before any subprocess): pick the primary or the first fallback
+    # whose vendor has enough remaining quota. Raises QuotaHalt (propagated to the
+    # orchestrator to pause + schedule) when no candidate qualifies. Kept OUTSIDE
+    # the try/except below so QuotaHalt is never swallowed as a stage failure.
+    chosen = resolve_candidate(
+        build_candidates(stage_spec),
+        role=stage,
+        logger=(lambda m: log_emit({"event": "quota", "stage": stage, "msg": m}))
+        if log_emit
+        else None,
+    )
+
     artifact_tmp = artifact_target.with_name(artifact_target.name + ".tmp")
     # Clean any stale tmp from a prior attempt, then optionally pre-seed.
     if artifact_tmp.exists():
@@ -116,9 +130,10 @@ def run_stage_subprocess(
     stdout_path = feature_active / f".{stage}.stdout.log"
     stderr_path = feature_active / f".{stage}.stderr.log"
 
-    flags_effort, model_override, native_args = split_common_vendor_flags(stage_spec.flags)
-    effort = stage_spec.effort or flags_effort
-    model = model_override or stage_spec.model
+    flags_effort, model_override, native_args = split_common_vendor_flags(chosen.flags)
+    effort = chosen.effort or flags_effort
+    model = model_override or chosen.model
+    vendor = chosen.vendor
 
     probe_enabled = probe_config is not None
     hard_backstop_sec = (
@@ -129,7 +144,7 @@ def run_stage_subprocess(
 
     if log_emit:
         log_emit({"event": "subprocess-start", "stage": stage,
-                  "vendor": stage_spec.vendor, "model": model,
+                  "vendor": vendor, "model": model,
                   "effort": effort or "<default>",
                   "probe_interval_sec": stage_spec.probe_interval_sec,
                   "hard_backstop_sec": hard_backstop_sec})
@@ -154,7 +169,7 @@ def run_stage_subprocess(
     )
     try:
         result = call_shared_vendor(
-            vendor=stage_spec.vendor,
+            vendor=vendor,
             model=model,
             prompt=prompt + (extra_stdin or ""),
             output_id=stage,

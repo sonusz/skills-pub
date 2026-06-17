@@ -21,7 +21,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from autodev.errors import QuotaHalt
 from autodev.vendors.config import ProbeConfig
+from autodev.vendors.fallback import build_candidates, resolve_candidate
 from autodev.vendors.shared_call import (
     SHARED_VENDORS_DIR,
     call_shared_vendor,
@@ -234,24 +236,43 @@ def run_idle_probe(
                 timeout=timeout,
             )
         else:
-            if vendor_binary is not None and not Path(vendor_binary).exists():
+            # Quota gate (FAIL-SOFT): the probe is a tiny read-only arbiter, so
+            # never let its quota shortage halt the whole feature. If every probe
+            # candidate is below its min, degrade to the normal probe-unavailable
+            # default ("kill") instead of raising QuotaHalt.
+            try:
+                chosen = resolve_candidate(build_candidates(cfg), role="probe")
+            except QuotaHalt as qh:
+                return ProbeVerdict(
+                    action="kill",
+                    rationale=(
+                        f"all {len(qh.diagnostics)} probe candidate(s) below min "
+                        f"quota; defaulting to kill (no feature halt)"
+                    ),
+                )
+            same_vendor = chosen.vendor == cfg.vendor
+            if (
+                same_vendor
+                and vendor_binary is not None
+                and not Path(vendor_binary).exists()
+            ):
                 return ProbeVerdict(
                     action="kill",
                     rationale=(
                         f"no {cfg.vendor} binary found for probe; defaulting to kill"
                     ),
                 )
-            flags_effort, model_override, native_args = split_common_vendor_flags(cfg.flags)
-            effort = cfg.effort or flags_effort
+            flags_effort, model_override, native_args = split_common_vendor_flags(chosen.flags)
+            effort = chosen.effort or flags_effort
             result = call_shared_vendor(
-                vendor=cfg.vendor,
-                model=model_override or cfg.model,
+                vendor=chosen.vendor,
+                model=model_override or chosen.model,
                 prompt=prompt,
                 output_id="probe",
                 timeout_sec=timeout,
                 effort=effort,
                 native_args=native_args,
-                binary_override=vendor_binary,
+                binary_override=vendor_binary if same_vendor else None,
             )
             if result.returncode != 0:
                 if result.timed_out:

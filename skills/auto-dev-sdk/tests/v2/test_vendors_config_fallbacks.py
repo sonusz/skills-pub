@@ -1,0 +1,101 @@
+"""vendors.yml quota-gate schema: min_quota_pct + fallbacks on all roles."""
+from __future__ import annotations
+
+import tempfile
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from autodev.errors import ConfigError
+from autodev.vendors.config import load_vendors_config
+
+
+def _load(yml: str):
+    with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
+        f.write(textwrap.dedent(yml))
+        path = f.name
+    return load_vendors_config(Path(path))
+
+
+_GOOD = """
+stages:
+  design: {vendor: claude, model: claude-opus-4-8, effort: max, min_quota_pct: 20,
+           fallbacks: [{vendor: cursor, model: gpt-5.5-extra-high, effort: max, min_quota_pct: 15},
+                       {vendor: codex, model: gpt-5.5, min_quota_pct: 10}]}
+  build: {vendor: cursor, model: gpt-5.5-extra-high, effort: max}
+  review: {vendor: claude, model: claude-opus-4-8, effort: high}
+  spec: {vendor: cursor, model: gpt-5.5-extra-high, effort: medium}
+panel:
+  reviewers:
+    - {vendor: claude, model: claude-opus-4-8, effort: max, min_quota_pct: 25,
+       fallbacks: [{vendor: gemini, model: gemini-3.1-pro, min_quota_pct: 10}]}
+    - {vendor: gemini, model: gemini-3.1-pro, effort: max}
+  synthesizer: {vendor: claude, model: claude-sonnet-4-6, effort: high, min_quota_pct: 30,
+                fallbacks: [{vendor: codex, model: gpt-5.5, min_quota_pct: 10}]}
+probe: {vendor: claude, model: claude-haiku-4-5, effort: low, min_quota_pct: 5,
+        fallbacks: [{vendor: codex, model: gpt-5.5, min_quota_pct: 5}]}
+"""
+
+
+def test_parses_all_roles():
+    c = _load(_GOOD)
+    d = c.stages["design"]
+    assert d.min_quota_pct == 20.0
+    assert [(f.vendor, f.min_quota_pct) for f in d.fallbacks] == [("cursor", 15.0), ("codex", 10.0)]
+    assert c.panel.reviewers[0].min_quota_pct == 25.0
+    assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["gemini"]
+    assert c.panel.synthesizer.min_quota_pct == 30.0
+    assert [f.vendor for f in c.panel.synthesizer.fallbacks] == ["codex"]
+    assert c.probe.min_quota_pct == 5.0
+    assert [f.vendor for f in c.probe.fallbacks] == ["codex"]
+
+
+def test_backward_compatible_without_quota_fields():
+    c = _load(
+        """
+        stages:
+          design: {vendor: claude, model: m}
+          build: {vendor: claude, model: m}
+          review: {vendor: claude, model: m}
+          spec: {vendor: claude, model: m}
+        panel:
+          reviewers:
+            - {vendor: claude, model: m}
+            - {vendor: gemini, model: m}
+          synthesizer: {vendor: claude, model: m}
+        probe: {vendor: claude, model: m}
+        """
+    )
+    assert c.stages["design"].min_quota_pct is None
+    assert c.stages["design"].fallbacks == ()
+
+
+_BASE = (
+    "stages:\n"
+    "  design: {{vendor: claude, model: m{design}}}\n"
+    "  build: {{vendor: claude, model: m}}\n"
+    "  review: {{vendor: claude, model: m}}\n"
+    "  spec: {{vendor: claude, model: m}}\n"
+    "panel:\n"
+    "  reviewers:\n"
+    "    - {{vendor: claude, model: m{rev}}}\n"
+    "    - {{vendor: gemini, model: m}}\n"
+    "  synthesizer: {{vendor: claude, model: m{syn}}}\n"
+    "probe: {{vendor: claude, model: m}}\n"
+)
+
+
+@pytest.mark.parametrize(
+    "design,rev,syn,why",
+    [
+        (", min_quota_pct: 150", "", "", "min_quota>100"),
+        (", min_quota_pct: -1", "", "", "min_quota<0"),
+        (", fallbacks: [{vendor: gemini, model: g}]", "", "", "stage fallback gemini (panel-only)"),
+        ("", ", fallbacks: [{vendor: claude, model: m2}]", "", "reviewer same-provider fallback"),
+        ("", "", ", fallbacks: [{vendor: gemini, model: g}]", "synth fallback not schema-capable"),
+    ],
+)
+def test_rejections(design, rev, syn, why):
+    with pytest.raises(ConfigError):
+        _load(_BASE.format(design=design, rev=rev, syn=syn))

@@ -67,6 +67,7 @@ I may only invoke these:
 | `autodev next <f> [--watch]` | Advance exactly one stage |
 | `autodev pause <f>` | Write `.pause` sentinel |
 | `autodev resume <f>` | Remove `.pause` sentinel |
+| `autodev quota-resume <f>` | Conditionally resume a quota-paused feature (auto-continues only if still quota-paused, resume_at reached, quota recovered, and repo unchanged; else no-op) |
 | `autodev skip-gate <f> <gate> --reason "..."` | Override a mandatory gate |
 | `autodev acknowledge-dirty <f> --reason "..."` | Override dirty-workspace block |
 | `autodev abort <f>` | Hard-stop the run: write `.pause` sentinel (so orchestrator can't dispatch next stage) + kill running vendor subprocess + write interrupted failure. Run `autodev resume` before next `run`. |
@@ -88,6 +89,34 @@ I **do not**:
 | 1 | Error | Read stderr; surface to user; don't retry blindly |
 | 2 | Gate pending | Run `autodev status` to see which gate; surface to user |
 | 3 | Lock conflict | Another process holds `.lock/`; surface with owner info |
+
+## Quota fallback & pause
+
+`vendors.yml` may give any LLM (stage / panel reviewer / synthesizer / probe) a
+`min_quota_pct` (minimum *remaining* quota %) plus ordered `fallbacks`. Before each
+call the harness checks the vendor's remaining quota and uses the primary, else the
+first fallback with enough quota. The harness owns all of this — I do **not** edit
+`vendors.yml` or pick vendors.
+
+When **every** candidate for a role is below its minimum, `autodev run`/`next`:
+- exits **2 (GATE_PENDING)**,
+- prints a machine line `QUOTA_PAUSE feature=<f> role=<r> resume_at=<ISO8601>`,
+- writes `.pause` + `.quota-pause.json` (earliest recovery time + a repo/feature
+  fingerprint).
+
+**My duty on a `QUOTA_PAUSE` exit:**
+1. Surface it to the user (which role, when quota resets).
+2. Schedule `autodev quota-resume <f>` at `resume_at` (use the `/schedule` skill;
+   or, headless, a `cron`/`launchd`/`at` entry). `quota-resume` is self-guarding
+   and idempotent — it auto-continues **only if** the feature is still
+   quota-paused, the time has been reached, quota has recovered, and the repo is
+   **unchanged**; otherwise it does nothing. So scheduling it early/often is safe.
+3. Do **not** hand-edit the repo or run other stages while quota-paused — any
+   change cancels the automatic resume (by design), and the user would then have
+   to `autodev resume` manually.
+
+If quota still hasn't recovered at `resume_at`, `quota-resume` reschedules itself
+(updates `resume_at`); re-schedule the wake to the new time.
 
 ## Outer-layer duties
 

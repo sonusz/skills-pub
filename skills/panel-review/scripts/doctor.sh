@@ -3,7 +3,7 @@
 #
 # Probes the configured three panel calls and synthesis call through the shared
 # vendors module. Exits 0 when >=2 panel calls and the synthesis call are ready.
-set -eo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=panel-config.sh

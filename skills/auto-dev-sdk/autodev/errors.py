@@ -59,6 +59,31 @@ class GatePending(AutodevError):
         self.detail = detail
 
 
+class QuotaHalt(AutodevError):
+    """Every candidate LLM for a role is below its minimum remaining-quota
+    requirement (fail-closed: unfetchable quota counts as insufficient).
+
+    Raised by the fallback resolver *before* a vendor subprocess launches, so
+    the run can pause cleanly. ``resume_at`` is the earliest time any skipped
+    candidate is expected to recover (``None`` if no candidate exposed a reset);
+    ``diagnostics`` is a per-candidate record of what was seen (vendor, model,
+    remaining_pct, min required, resets_at, error) for the pause record + logs.
+    """
+
+    def __init__(
+        self,
+        role: str,
+        diagnostics: list[dict],
+        resume_at=None,  # datetime | None
+    ):
+        super().__init__(
+            f"quota halt for {role}: no candidate meets its min remaining quota"
+        )
+        self.role = role
+        self.diagnostics = diagnostics
+        self.resume_at = resume_at
+
+
 class GateFailed(AutodevError):
     """A gate was run but the verdict was not pass."""
 

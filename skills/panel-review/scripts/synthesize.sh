@@ -2,7 +2,7 @@
 # Usage: synthesize.sh <prompt_file> <vendors_yaml> <run_dir>
 #
 # Invokes the configured synthesis call through the shared vendors module.
-set -eo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=panel-config.sh

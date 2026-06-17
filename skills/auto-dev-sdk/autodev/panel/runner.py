@@ -41,7 +41,7 @@ from autodev.artifacts.verdict import (
     panel_verdict_transport_incomplete,
     write_verdict,
 )
-from autodev.errors import ConfigError, GatePending, SchemaError
+from autodev.errors import ConfigError, GatePending, QuotaHalt, SchemaError
 from autodev.panel.anchor_filter import filter_anchor_findings
 from autodev.panel.precheck import run_precheck
 from autodev.panel.schemas import synthesizer_output_schema_json
@@ -53,6 +53,7 @@ from autodev.vendors.config import (
     ProbeConfig,
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
+from autodev.vendors.fallback import build_candidates, resolve_candidate
 from autodev.vendors.shared_call import SHARED_VENDORS_DIR, call_shared_vendor
 from autodev.vendors.subprocess_runner import (
     _build_idle_callback,
@@ -450,6 +451,22 @@ def _invoke_reviewer(
     fake = os.environ.get(FAKE_INVOKER_ENV)
     t0 = time.monotonic()
     timeout_sec = probe_interval_sec  # for fake-mode subprocess + error messages
+    # Quota gate (fail-closed; QuotaHalt propagates to the panel runner, which
+    # cancels siblings and re-raises). Resolved BEFORE the try so it is never
+    # swallowed as a reviewer failure. Skipped in fake/test mode. On a fallback,
+    # `spec` is rebound to the chosen LLM so every downstream reference (the call
+    # AND the recorded ReviewerResult vendor/model) reflects what actually ran.
+    if not fake:
+        _cand = resolve_candidate(
+            build_candidates(spec),
+            role=f"reviewer:{spec.vendor}",
+            logger=(lambda m: log_emit({"event": "quota", "role": "reviewer", "msg": m}))
+            if log_emit
+            else None,
+        )
+        spec = PanelReviewerSpec(
+            vendor=_cand.vendor, model=_cand.model, effort=_cand.effort
+        )
     try:
         if fake:
             env = os.environ.copy()
@@ -616,6 +633,20 @@ def _invoke_synthesizer(
     fake = os.environ.get(FAKE_INVOKER_ENV)
     schema_json = synthesizer_output_schema_json()
     timeout_sec = probe_interval_sec  # for fake-mode subprocess + error messages
+    # Quota gate (fail-closed; QuotaHalt propagates). Config validation guarantees
+    # synthesizer fallbacks are schema-capable, so the schema-vendor guard below
+    # still holds after rebinding. Skipped in fake/test mode.
+    if not fake:
+        _cand = resolve_candidate(
+            build_candidates(spec),
+            role="synthesizer",
+            logger=(lambda m: log_emit({"event": "quota", "role": "synthesizer", "msg": m}))
+            if log_emit
+            else None,
+        )
+        spec = PanelSynthesizerSpec(
+            vendor=_cand.vendor, model=_cand.model, effort=_cand.effort
+        )
     try:
         if fake:
             env = os.environ.copy()

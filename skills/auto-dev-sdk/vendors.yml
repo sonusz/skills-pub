@@ -37,8 +37,8 @@ stages:
   # Context: large and repo-heavy; needs enough room for design packet,
   # current source, failures, and test output. Effort: high.
   build:
-    vendor: cursor
-    model: gpt-5.5-extra-high
+    vendor: codex
+    model: gpt-5.5
     probe_interval_sec: 3600
     effort: max
 
@@ -55,8 +55,8 @@ stages:
   # Context: medium; mostly accepted design, implementation index, and changed
   # files. Effort: medium-high.
   spec:
-    vendor: cursor
-    model: gpt-5.5-extra-high
+    vendor: codex
+    model: gpt-5.5
     probe_interval_sec: 900
     effort: medium
 
@@ -71,12 +71,11 @@ panel:
       effort: max
     # Gemini: independent second vendor for divergence signal.
     - vendor: gemini
-      model: gemini-3.1-pro-preview
+      model: gemini-2.5-flash-lite
       effort: max
-    # Cursor (GPT-5.5): code-aware reviewer via cursor-agent; fills the
-    # openai/gpt divergence slot (diversity inferred from the underlying model).
-    - vendor: cursor
-      model: gpt-5.5-extra-high
+    # Codex: code-aware reviewer, useful for implementation/design feasibility.
+    - vendor: codex
+      model: gpt-5.5
       effort: max
   # Synthesizes reviewer outputs only; does not re-review the artifact.
   # Context: medium; reviewer outputs plus schema. Effort: high enough for

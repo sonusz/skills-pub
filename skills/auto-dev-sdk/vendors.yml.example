@@ -20,6 +20,23 @@
 # and extra write directories are intentionally not configurable here.
 # All LLM calls route through the packaged shared/vendors module and its
 # `<id>/out`, `<id>/status`, `<id>/log` contract.
+#
+# QUOTA GATE + FALLBACKS (optional; any role: stages, panel reviewers,
+# synthesizer, probe):
+#   min_quota_pct: minimum *remaining* quota % required to run this LLM. Before
+#     each call the harness reads the vendor's remaining quota (claude/cursor/
+#     gemini/codex, via each provider's usage API + its local credentials). If
+#     remaining < min_quota_pct, the next fallback is tried. Omit = ungated.
+#   fallbacks: ordered alternates, each a full LLM (vendor/model/effort) with its
+#     own min_quota_pct. The first with enough quota is used. If NONE qualify the
+#     run pauses (GATE_PENDING) and records the earliest recovery time + a repo
+#     fingerprint; `autodev quota-resume <feature>` then auto-continues only if
+#     still paused, time reached, quota recovered, and the repo is unchanged.
+#   Fail-closed: a vendor whose quota can't be read counts as insufficient.
+#   Constraints: stage/probe fallback vendors ∈ the role's allowed set; reviewer
+#     fallbacks must use a different underlying provider than their primary;
+#     synthesizer fallbacks must be schema-capable (claude/codex/openai). codex
+#     `credits` remaining is coarse (binary), so its rate-limit windows drive %.
 
 stages:
   design:
@@ -27,6 +44,18 @@ stages:
     model: gpt-5.5
     probe_interval_sec: 1200
     effort: max
+    # Example quota gate: prefer codex while it has >=20% of its window left;
+    # otherwise fall back to claude (>=15%), then cursor (>=10%).
+    min_quota_pct: 20
+    fallbacks:
+      - vendor: claude
+        model: claude-opus-4-8
+        effort: max
+        min_quota_pct: 15
+      - vendor: cursor
+        model: gpt-5.5-extra-high
+        effort: max
+        min_quota_pct: 10
 
   build:
     vendor: codex

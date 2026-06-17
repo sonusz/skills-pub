@@ -39,6 +39,23 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
 - **Consensus ≠ validation.** Vendors share training data, cutoffs, and upstream inputs — they can agree on the same mistake. Unanimous concerns are actionable; unanimous approval is not proof.
 - **Outlier = investigate.** When 2 agree and 1 disagrees (or only 2 vendors successful and they disagree), read the outlier's output carefully and decide whether to surface it — not launch an autonomous deep-dive. The outlier may have caught something or misunderstood the prompt; both are worth knowing.
 
+## Guardrails
+
+- Repo-discovery mode gives reviewers real repo/tool access through `--cwd` +
+  `--yolo`; use it only for read-only review. Do not ask panel vendors to edit
+  files, commit, push, install dependencies, apply infrastructure, or run
+  destructive commands.
+- Use `--inline` when reviewer tool access is not acceptable or the artifact
+  is not available from a local repo/source path.
+- Never send credentials, tokens, `.env` contents, or production secrets to
+  panel vendors. Redact before launch, regardless of mode.
+- In git worktrees, `launch.sh` snapshots status and diffs before and after
+  repo-mode panel calls. If the workspace changes, stop and report it. Do not
+  auto-revert or commit unless the user explicitly asks.
+- Keep local-machine setup such as SSL certificates, proxies, auth refreshes,
+  and vendor sandbox workarounds outside this skill source and outside
+  `vendors.yaml`.
+
 ## Workflow
 
 ### 1. Preflight — all four must pass
@@ -50,7 +67,16 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
 
 ### 2. Build the prompt
 
-One prompt for all vendors. **Inline all referenced artifacts as text** — each vendor has different file-access rules, and a divergence report is meaningless if one couldn't read the file. ~50KB inlined is fine; larger → ask the user to narrow scope or split into focused rounds (no built-in multi-round protocol).
+One prompt for all vendors. Default to **repo discovery**: provide the
+repo/source root, artifact paths, sizes, and hashes, then tell reviewers to
+inspect the files themselves with their available tools. Do not inline artifact
+bodies by default. If a required file cannot be read, the reviewer should
+report that as a failed or risky review, not infer from the manifest alone.
+
+Use the old inline style only as an explicit option. In inline mode, inline all
+referenced artifacts as text so every vendor receives identical bytes. ~50KB
+inlined is fine; larger → prefer repo discovery, or ask the user to narrow
+scope or split into focused rounds (no built-in multi-round protocol).
 
 Strip credentials and tokens before sending. Panel members cannot prompt the user mid-run, so the orchestrator owns security up front.
 
@@ -60,25 +86,59 @@ Write the finalized prompt to a file (e.g., `/tmp/panel-prompt.XXXX.txt`) — `l
 
 ### 3. Approval checkpoint — explicit, before launch
 
-Inlined artifacts go to the configured panel calls and then to the configured synthesis call as part of the synthesis prompt. Before launching, show the user: (1) review question, (2) artifact list (paths + sizes, not full text), (3) redactions applied, (4) configured calls from `vendors.yaml` to be invoked. Wait for explicit approval. Re-ask when the prompt materially changes (different artifact, question, redactions, or added vendor). Minor reformatting doesn't need re-approval.
+Repo-discovery prompts go to the configured panel calls, which then run with
+repo/tool access from the selected `--cwd`. Inline prompts send artifact
+contents directly. In both modes, panel outputs and the original prompt go to
+the configured synthesis call. Before launching, show the user: (1) review
+question, (2) mode (`repo` or `inline`), (3) repo/source cwd when in repo mode,
+(4) artifact list (paths + sizes, not full text), (5) redactions applied,
+(6) configured calls from `vendors.yaml` to be invoked. Wait for explicit
+approval. Re-ask when the prompt materially changes (different artifact,
+question, mode/cwd, redactions, or added vendor). Minor reformatting doesn't
+need re-approval.
 
 ### 4. Launch panel calls in parallel
 
 The four configured calls live in [vendors.yaml](vendors.yaml): three `panel` calls and one `synthesis` call, each with vendor/model/effort settings. Vendor CLI differences are handled by the packaged module at `shared/vendors`; panel-review should not duplicate vendor-specific CLI flags or quirks.
 
-A configured call that fails mid-run is marked failed and never substituted — substitution would silently weaken the divergence signal. `launch.sh` aborts if fewer than 2 panel outputs succeed. Each vendor call has a **5 minute** timeout by default via `PANEL_CALL_TIMEOUT=300`. If a prompt needs more, split into focused rounds — long single-shot reviews tend to produce surface-level analysis.
+A configured call that fails mid-run is marked failed and never substituted —
+substitution would silently weaken the divergence signal. `launch.sh` aborts
+if fewer than 2 panel outputs succeed. Each vendor call has a **5 minute**
+timeout by default via `PANEL_CALL_TIMEOUT=300`; override with
+`PANEL_CALL_TIMEOUT=<seconds>` only for a focused prompt.
+
+Default repo-discovery mode drives `shared/vendors/scripts/call.sh` with
+`--cwd <repo/source>` and `--yolo` for each panel vendor. The shared wrapper
+maps that access per vendor: Codex gets
+`--dangerously-bypass-approvals-and-sandbox`, Claude gets
+`--permission-mode bypassPermissions`, and Gemini gets `--yolo`. `--cwd` is
+honored by Codex via `--cd` and by Claude/Gemini through the wrapper's cwd
+execution.
+
+In repo mode, keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
+rejects in-worktree output dirs, then records git status/diff snapshots under
+`$RUN_DIR/.repo-state` before and after panel calls. Any tracked, staged, or
+status-visible workspace change fails the launch and is not reverted
+automatically.
 
 Each call writes `$RUN_DIR/<id>/out`, `$RUN_DIR/<id>/log`, `$RUN_DIR/<id>/status`, and `$RUN_DIR/<id>/call.log`. Use `out` for review content; use `status`, `log`, and `call.log` only when diagnosing failed or slow vendor calls.
 
 ```bash
 RUN_DIR=$(mktemp -d /tmp/panel-review.XXXXXX)
 echo "RUN_DIR=$RUN_DIR"   # echo so the agent captures the path for §5
-scripts/launch.sh <prompt_file> vendors.yaml "$RUN_DIR"
+REVIEW_CWD=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+scripts/launch.sh --cwd "$REVIEW_CWD" <prompt_file> vendors.yaml "$RUN_DIR"
 # §5 runs the configured synthesis call next.
 # Clean up with `rm -rf "$RUN_DIR"` after synthesis — don't `trap ... EXIT`,
 # the trap fires when the shell that ran launch.sh exits and some runtimes
 # execute §4 and §5 in separate shells, which would delete the
 # outputs before the synthesizer reads them.
+```
+
+To preserve the original inline-only behavior:
+
+```bash
+scripts/launch.sh --inline <prompt_file> vendors.yaml "$RUN_DIR"
 ```
 
 ### 5. Synthesize with the configured synthesis call

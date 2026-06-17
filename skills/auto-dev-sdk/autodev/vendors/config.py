@@ -123,6 +123,29 @@ def _flags_define_effort(flags: tuple[str, ...] | list[str]) -> bool:
     return any(f == "--effort" or f.startswith("--effort=") for f in flags)
 
 
+def _normalize_min_quota(value: Any, *, path: Path, field: str) -> float | None:
+    """A minimum *remaining* quota percent (0-100) gate, or None for ungated."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{path}: {field} must be a number 0-100")
+    v = float(value)
+    if not (0.0 <= v <= 100.0):
+        raise ConfigError(f"{path}: {field} must be between 0 and 100")
+    return v
+
+
+@dataclass(frozen=True)
+class FallbackSpec:
+    """An alternate LLM to use when the primary (or a higher-priority fallback)
+    is below its remaining-quota floor. A runnable LLM in its own right."""
+    vendor: str
+    model: str
+    effort: str = ""
+    min_quota_pct: float | None = None
+    flags: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class StageSpec:
     stage: str
@@ -136,6 +159,10 @@ class StageSpec:
     probe_interval_sec: int = DEFAULT_TIMEOUT_SEC
     effort: str = ""
     flags: tuple[str, ...] = ()
+    # Minimum remaining-quota % to run on this vendor (None = ungated), and
+    # ordered fallbacks tried when below it. See autodev.vendors.fallback.
+    min_quota_pct: float | None = None
+    fallbacks: tuple[FallbackSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -143,6 +170,8 @@ class PanelReviewerSpec:
     vendor: str
     model: str
     effort: str = ""
+    min_quota_pct: float | None = None
+    fallbacks: tuple[FallbackSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,6 +179,8 @@ class PanelSynthesizerSpec:
     vendor: str
     model: str
     effort: str = ""
+    min_quota_pct: float | None = None
+    fallbacks: tuple[FallbackSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,6 +202,8 @@ class ProbeConfig:
     timeout_sec: int = DEFAULT_PROBE_TIMEOUT_SEC
     effort: str = ""
     flags: tuple[str, ...] = ()
+    min_quota_pct: float | None = None
+    fallbacks: tuple[FallbackSpec, ...] = ()
 
 
 @dataclass
@@ -184,6 +217,74 @@ class VendorsConfig:
         if stage not in self.stages:
             raise ConfigError(f"vendors.yml: missing stage {stage!r}")
         return self.stages[stage]
+
+
+def _parse_fallbacks(
+    raw: Any,
+    *,
+    path: Path,
+    field: str,
+    allowed_vendors: set[str],
+    flags_label: str,
+    forbid_provider: str | None = None,
+    allow_flags: bool = True,
+) -> tuple[FallbackSpec, ...]:
+    """Validate + build the ordered fallback list for any role.
+
+    ``allowed_vendors`` restricts the fallback vendor to that role's allowed set.
+    ``forbid_provider`` (reviewers) rejects a fallback that resolves to the same
+    underlying provider as its own reviewer primary (a same-provider fallback is
+    pointless and would not preserve panel diversity if selected). ``allow_flags``
+    is False for roles whose specs carry no native flags (panel reviewers /
+    synthesizer), matching their primaries."""
+    if raw in (None, []):
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"{path}: {field} must be a list")
+    from autodev.vendors.allowlist import validate_flags  # lazy: avoid import cycle
+
+    out: list[FallbackSpec] = []
+    for i, entry in enumerate(raw):
+        fld = f"{field}[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{path}: {fld} must be a mapping")
+        for k in ("vendor", "model"):
+            if k not in entry:
+                raise ConfigError(f"{path}: {fld} missing {k!r}")
+        vendor = _normalize_vendor_value(entry["vendor"], path=path, field=f"{fld}.vendor")
+        if vendor not in allowed_vendors:
+            raise ConfigError(f"{path}: {fld}.vendor {vendor!r} not in {allowed_vendors}")
+        model = entry["model"]
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigError(f"{path}: {fld}.model must be non-empty string")
+        effort = _normalize_effort_value(entry.get("effort", ""), path=path, field=f"{fld}.effort")
+        min_q = _normalize_min_quota(entry.get("min_quota_pct"), path=path, field=f"{fld}.min_quota_pct")
+        flags_raw = entry.get("flags", [])
+        if not isinstance(flags_raw, list):
+            raise ConfigError(f"{path}: {fld}.flags must be a list")
+        if flags_raw and not allow_flags:
+            raise ConfigError(f"{path}: {fld} does not support `flags` for this role")
+        for f in flags_raw:
+            if not isinstance(f, str):
+                raise ConfigError(f"{path}: {fld}.flags entries must be strings")
+        if effort and _flags_define_effort(flags_raw):
+            raise ConfigError(f"{path}: {fld} cannot set both `effort` and flags `--effort`")
+        flags_tuple = tuple(flags_raw)
+        if allow_flags:
+            validate_flags(vendor=vendor, stage=flags_label, flags=flags_tuple)
+        if forbid_provider is not None:
+            eff = _infer_cursor_underlying_vendor(model) if vendor == "cursor" else vendor
+            if eff == forbid_provider:
+                raise ConfigError(
+                    f"{path}: {fld} resolves to provider {eff!r}, same as its reviewer "
+                    f"primary; a reviewer fallback must use a different provider"
+                )
+        out.append(
+            FallbackSpec(
+                vendor=vendor, model=model, effort=effort, min_quota_pct=min_q, flags=flags_tuple
+            )
+        )
+    return out
 
 
 def _validate_raw(raw: Any, path: Path) -> dict[str, dict[str, Any]]:
@@ -286,7 +387,23 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
         effort = _normalize_effort_value(
             entry.get("effort", ""), path=path, field=f"panel.reviewers[{i}].effort"
         )
-        rs.append(PanelReviewerSpec(vendor=v, model=model, effort=effort))
+        min_q = _normalize_min_quota(
+            entry.get("min_quota_pct"), path=path, field=f"panel.reviewers[{i}].min_quota_pct"
+        )
+        fbs = _parse_fallbacks(
+            entry.get("fallbacks"),
+            path=path,
+            field=f"panel.reviewers[{i}].fallbacks",
+            allowed_vendors=PANEL_REVIEWER_VENDORS,
+            flags_label=f"reviewer:{v}",
+            forbid_provider=effective_provider,
+            allow_flags=False,
+        )
+        rs.append(
+            PanelReviewerSpec(
+                vendor=v, model=model, effort=effort, min_quota_pct=min_q, fallbacks=fbs
+            )
+        )
     reviewers = tuple(rs)
 
     synth_raw = raw.get("synthesizer")
@@ -310,8 +427,23 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
     synth_effort = _normalize_effort_value(
         synth_raw.get("effort", ""), path=path, field="panel.synthesizer.effort"
     )
+    synth_min_q = _normalize_min_quota(
+        synth_raw.get("min_quota_pct"), path=path, field="panel.synthesizer.min_quota_pct"
+    )
+    synth_fbs = _parse_fallbacks(
+        synth_raw.get("fallbacks"),
+        path=path,
+        field="panel.synthesizer.fallbacks",
+        allowed_vendors=PANEL_SYNTHESIZER_VENDORS,
+        flags_label="synthesizer",
+        allow_flags=False,
+    )
     synthesizer = PanelSynthesizerSpec(
-        vendor=synth_vendor, model=synth_model, effort=synth_effort
+        vendor=synth_vendor,
+        model=synth_model,
+        effort=synth_effort,
+        min_quota_pct=synth_min_q,
+        fallbacks=synth_fbs,
     )
 
     def _int_field(key: str, default: int) -> int:
@@ -371,12 +503,22 @@ def _parse_probe(raw: Any, path: Path) -> ProbeConfig:
         flags.append(f)
     if effort and _flags_define_effort(flags):
         raise ConfigError(f"{path}: probe cannot set both `effort` and flags `--effort`")
+    min_q = _normalize_min_quota(raw.get("min_quota_pct"), path=path, field="probe.min_quota_pct")
+    fbs = _parse_fallbacks(
+        raw.get("fallbacks"),
+        path=path,
+        field="probe.fallbacks",
+        allowed_vendors=PROBE_VENDORS,
+        flags_label="probe",
+    )
     return ProbeConfig(
         vendor=vendor,
         model=model,
         timeout_sec=timeout_sec,
         effort=effort,
         flags=tuple(flags),
+        min_quota_pct=min_q,
+        fallbacks=fbs,
     )
 
 
@@ -402,6 +544,16 @@ def load_vendors_config(path: Path) -> VendorsConfig:
             probe_interval_sec=entry.get("probe_interval_sec", DEFAULT_TIMEOUT_SEC),
             effort=entry.get("effort", ""),
             flags=flags_tuple,
+            min_quota_pct=_normalize_min_quota(
+                entry.get("min_quota_pct"), path=p, field=f"stages.{stage_name}.min_quota_pct"
+            ),
+            fallbacks=_parse_fallbacks(
+                entry.get("fallbacks"),
+                path=p,
+                field=f"stages.{stage_name}.fallbacks",
+                allowed_vendors=ALLOWED_VENDORS,
+                flags_label=stage_name,
+            ),
         )
 
     panel = _parse_panel(raw.get("panel") if isinstance(raw, dict) else None, p)

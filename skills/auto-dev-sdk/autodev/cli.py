@@ -15,7 +15,7 @@ from autodev import overrides_api as ov
 from autodev.artifacts.failure import FailureReport, write_failure
 from autodev.errors import (
     AutodevError, ConfigError, DirtyWorkspace, GateFailed, GatePending,
-    LockConflict, PreflightError,
+    LockConflict, PreflightError, QuotaHalt,
 )
 from autodev.orchestrator import Orchestrator, OrchestratorConfig
 from autodev.paths import FeaturePaths, find_repo_root
@@ -73,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("next", "Advance one stage"),
         ("pause", "Write .pause sentinel"),
         ("resume", "Remove .pause sentinel"),
+        ("quota-resume", "Conditionally resume a quota-paused feature (only if still "
+                         "paused, time reached, quota recovered, repo unchanged)"),
         ("abort", "Kill running subprocess; write interrupted failure.json"),
         ("retry", "Retry failed current stage"),
         ("invalidate", "Invalidate a stage artifact (rollback)"),
@@ -396,6 +398,27 @@ def _dispatch_orch(args, call: str) -> int:
     except LockConflict as e:
         print(f"lock conflict: {e}", file=sys.stderr)
         return exit_codes.LOCK_CONFLICT
+    except QuotaHalt as e:
+        # All candidate LLMs for a role are below their min remaining quota.
+        # Pause cleanly + record the earliest recovery time and a state
+        # fingerprint, then exit GATE_PENDING. A later `autodev quota-resume`
+        # (scheduled at resume_at) auto-continues only if still paused, time
+        # reached, quota recovered, and the repo/feature is unchanged.
+        from autodev.quota_pause import write_quota_pause
+        active = FeaturePaths(repo_root=_repo_root(args), feature=args.feature).active()
+        rec = write_quota_pause(
+            active, role=e.role, resume_at=e.resume_at, diagnostics=e.diagnostics
+        )
+        print(
+            f"QUOTA_PAUSE feature={args.feature} role={e.role} "
+            f"resume_at={rec['resume_at']}"
+        )
+        print(
+            f"gate pending: quota — all candidates for {e.role!r} below min quota; "
+            f"schedule `autodev quota-resume {args.feature}` at {rec['resume_at']}",
+            file=sys.stderr,
+        )
+        return exit_codes.GATE_PENDING
     except GatePending as e:
         print(f"gate pending: {e.gate} — {e.detail}", file=sys.stderr)
         return exit_codes.GATE_PENDING
@@ -435,6 +458,89 @@ def cmd_resume(args) -> int:
     if sent.exists():
         sent.unlink()
     print(f"resumed {args.feature}; run `autodev run` or `autodev next`")
+    return exit_codes.OK
+
+
+def cmd_quota_resume(args) -> int:
+    """Conditionally auto-resume a quota-paused feature.
+
+    Auto-continues ONLY if ALL guards hold; otherwise it does nothing and never
+    overrides a human/other process: (1) still quota-paused, (2) resume_at
+    reached, (3) repo/feature fingerprint unchanged, (4) quota actually
+    recovered. If quota has not recovered, reschedule to the new earliest reset
+    (preserving the original fingerprint)."""
+    from datetime import datetime, timezone
+
+    from autodev.state.atomic import atomic_write_json
+    from autodev.quota_pause import (
+        QUOTA_PAUSE_FILE,
+        clear_quota_pause,
+        compute_fingerprint,
+        is_quota_paused,
+        read_quota_pause,
+        recheck_recovery,
+    )
+
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    rec = read_quota_pause(active)
+    if rec is None:
+        print(f"{args.feature}: no quota-pause record; nothing to do")
+        return exit_codes.OK
+
+    # Guard 1: still quota-paused (not manually resumed / aborted / superseded).
+    if not is_quota_paused(active):
+        try:
+            (active / QUOTA_PAUSE_FILE).unlink()
+        except OSError:
+            pass
+        print(
+            f"{args.feature}: no longer quota-paused (resumed/aborted elsewhere); "
+            f"not auto-resuming"
+        )
+        return exit_codes.OK
+
+    # Guard 2: resume_at reached.
+    resume_at = rec.get("resume_at")
+    if resume_at:
+        try:
+            ra = datetime.fromisoformat(resume_at)
+            if ra.tzinfo is None:
+                ra = ra.replace(tzinfo=timezone.utc)
+        except ValueError:
+            ra = None
+        if ra is not None and datetime.now(timezone.utc) < ra:
+            print(
+                f"{args.feature}: quota window not reached yet "
+                f"(resume_at={resume_at}); staying paused"
+            )
+            return exit_codes.OK
+
+    # Guard 3: repo/feature unchanged since pause (any commit/edit/abort cancels).
+    if compute_fingerprint(active) != rec.get("fingerprint"):
+        print(
+            f"{args.feature}: repo changed since quota pause; not auto-resuming — "
+            f"run `autodev resume` manually if this is intended"
+        )
+        return exit_codes.OK
+
+    # Guard 4: quota actually recovered for at least one recorded candidate.
+    recovered, earliest = recheck_recovery(rec)
+    if not recovered:
+        rec["resume_at"] = earliest.isoformat() if earliest else resume_at
+        atomic_write_json(active / QUOTA_PAUSE_FILE, rec)  # keep original fingerprint
+        print(
+            f"{args.feature}: quota still below min; rescheduled "
+            f"resume_at={rec['resume_at']}"
+        )
+        return exit_codes.OK
+
+    # All guards pass → resume.
+    clear_quota_pause(active)
+    print(
+        f"{args.feature}: quota recovered and repo unchanged; resumed. "
+        f"Run `autodev run` or `autodev next`."
+    )
     return exit_codes.OK
 
 
@@ -796,6 +902,7 @@ _DISPATCH = {
     "next": cmd_next,
     "pause": cmd_pause,
     "resume": cmd_resume,
+    "quota-resume": cmd_quota_resume,
     "abort": cmd_abort,
     "retry": cmd_retry,
     "invalidate": cmd_invalidate,

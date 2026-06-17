@@ -3,6 +3,7 @@
 #
 # This is intentionally a tiny parser for the fixed config shape in this skill,
 # not a general YAML implementation.
+set -euo pipefail
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   printf "panel-config.sh is a library; source it from panel-review scripts.\n" >&2
