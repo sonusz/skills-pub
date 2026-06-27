@@ -116,7 +116,8 @@ table before chasing it from scratch:
 | Stray binary chars (`^D`, `^H`) in vendor output | extra control-char strip in vendor-launch |
 | `script: invalid option` on macOS | BSD `script` argument form with Linux fallback |
 | Vendor returning gpt-5.4 deprecation warning | stale `vendors.conf` |
-| Gemini reviewer 109-byte stub or "not found" | stale `gemini-3-flash-preview` in `vendors.conf` |
+| Gemini reviewer 109-byte stub or "not found" | stale model in `vendors.conf` (current live id: `gemini-3-flash`; `gemini-3-flash-preview` is gone) |
+| Gemini exits non-zero with "not running in a trusted directory" | missing `--skip-trust` in `vendors_run_gemini()` (gemini-3.x added a headless workspace-trust gate) |
 
 ## Why this folder exists at all
 

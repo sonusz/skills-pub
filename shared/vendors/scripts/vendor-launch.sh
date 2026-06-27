@@ -773,6 +773,15 @@ vendors_run_gemini() {
 
   prompt=$(cat "$prompt_file")
 
+  # Gemini gates headless runs on a workspace-trust check; without an opt-in it
+  # exits non-zero ("not running in a trusted directory") before producing any
+  # output. `--skip-trust` is the documented non-interactive bypass (equivalent
+  # to GEMINI_CLI_TRUST_WORKSPACE=true) and grants no capability beyond what the
+  # caller already implies by invoking the wrapper from their cwd — it mirrors
+  # cursor's `--trust` baseline.
+  if ! vendors_native_arg_present "--skip-trust"; then
+    command+=(--skip-trust)
+  fi
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
   fi

@@ -28,8 +28,8 @@ stages:
   # Context: largest stage; reads PRD, repo structure, prior completed specs,
   # and panel feedback during rework. Effort: highest.
   design:
-    vendor: claude
-    model: claude-opus-4-8
+    vendor: openai
+    model: gpt-5.5
     probe_interval_sec: 2400
     effort: max
 
