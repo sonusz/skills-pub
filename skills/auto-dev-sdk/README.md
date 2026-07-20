@@ -51,8 +51,7 @@ panel:
     - vendor: claude
       model: claude-sonnet-4-6
       effort: high
-    - vendor: gemini
-      model: gemini-3-flash-preview
+    - vendor: agy
       effort: high
     - vendor: codex
       model: gpt-5.4
@@ -76,7 +75,8 @@ Notes:
   `AUTODEV_VENDORS_YML`, then SDK-root `vendors.yml`, then legacy
   target-repo `vendors.yml` for compatibility.
 - Vendor labels are case-insensitive and normalized to lowercase. `codex`
-  and `openai` both route through the Codex CLI.
+  and `openai` both route through the Codex CLI. An Agy panel reviewer may
+  omit `model` to use the model selected in agy's own configuration.
 - All harness-owned LLM calls go through the packaged
   `shared/vendors/scripts/call.sh` interface and use its unified
   `<id>/out`, `<id>/status`, `<id>/log`, `<id>/stream` output contract.
@@ -94,7 +94,7 @@ Notes:
 - Panel reviewers (`design-review` and `close-approval`) and the
   synthesizer are configured under top-level `panel`. The synthesizer
   uses `--schema-file` through `shared/vendors` to enforce its output
-  schema, which works on `claude` and `codex`/`openai`. `gemini` is not
+  schema, which works on `claude` and `codex`/`openai`. `agy` is not
   supported as a synthesizer because its CLI has no native schema
   enforcement.
 - `probe` configures the read-only idle-timeout LLM probe. It is not a
@@ -108,7 +108,7 @@ Notes:
 autodev --help
 autodev status <any-feature-name>    # "not found" if feature absent
 scripts/llm-test.sh --vendor claude  # real shared-vendors adapter smoke
-python3 -m pytest -q                 # source checkout verification
+PYTHONPATH=. python3 -m pytest -q    # source checkout verification
 ```
 
 ## First feature
@@ -181,7 +181,7 @@ budget for *semantic* reruns) and from hard subprocess failures or
 out-of-scope writes, which still halt immediately. Watch the
 `output-rejected-retrying` / `output-rejected-exhausted` log events.
 
-Each panel runs its configured claude + gemini + codex/openai reviewers independently,
+Each panel runs its configured claude + agy + codex/openai reviewers independently,
 then a synthesizer merges their findings into a single verdict.
 Blocking findings (`invariant_violation` or `risk`) either dispatch
 a producer rerun (bumping the gate's L counter, cap L_MAX=3) or

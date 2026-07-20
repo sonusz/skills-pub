@@ -76,7 +76,7 @@ def _vendors_fake_everywhere(repo_root: Path) -> VendorsConfig:
         panel=PanelConfig(
             reviewers=(
                 PanelReviewerSpec(vendor="claude", model="fake-panel-claude"),
-                PanelReviewerSpec(vendor="gemini", model="fake-panel-gemini"),
+                PanelReviewerSpec(vendor="agy", model="fake-panel-agy"),
                 PanelReviewerSpec(vendor="codex", model="fake-panel-codex"),
             ),
             synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake-panel-synth"),

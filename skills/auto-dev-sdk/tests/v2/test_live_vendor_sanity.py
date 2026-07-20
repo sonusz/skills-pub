@@ -74,7 +74,7 @@ def test_live_scope_stage_completes_fast(live_git_repo):
         panel=PanelConfig(
             reviewers=(
                 PanelReviewerSpec(vendor="claude", model="claude-sonnet-4-6"),
-                PanelReviewerSpec(vendor="gemini", model="gemini-3-flash-preview"),
+                PanelReviewerSpec(vendor="agy", model=""),
                 PanelReviewerSpec(vendor="codex", model="gpt-5.4"),
             ),
             synthesizer=PanelSynthesizerSpec(vendor="claude", model="claude-sonnet-4-6"),

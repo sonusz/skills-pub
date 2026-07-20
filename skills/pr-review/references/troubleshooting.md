@@ -39,9 +39,8 @@ One of:
   prompts → longer responses. Either trim the prompt (Phase 1: scope to
   files the doc names; Phase 2: split into one-file-per-round) or raise
   `PANEL_CALL_TIMEOUT` via env.
-- **Auth drifted mid-session.** For Gemini, the most common cause is stdin
-  not being redirected to `/dev/null`, causing the CLI to hang on an
-  interactive auth prompt. Check the launcher script.
+- **Auth drifted mid-session.** For Agy, run `agy` once interactively to refresh
+  sign-in, then confirm the configured/default model with `agy models`.
 
 Don't lower the bar to 1 vendor — that defeats the purpose of panel review.
 

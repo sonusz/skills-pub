@@ -24,7 +24,7 @@ def _deprecation_warn(path: Path, old: str, new: str) -> None:
 # Coding stages — vendors.yml must cover all.
 STAGES = ("design", "build", "spec", "review")
 
-# Vendors allowed for coding (R3: gemini excluded; panel-review handles gemini separately).
+# Vendors allowed for coding (R3: agy excluded; panel-review handles agy separately).
 # `openai` and `codex` both route through the Codex CLI in shared/vendors.
 # `cursor` (cursor-agent) is allowed for stages too — it pins a model SKU with
 # effort encoded in the model id (e.g. `gpt-5.5-high`); the `--effort` flag has
@@ -32,12 +32,12 @@ STAGES = ("design", "build", "spec", "review")
 ALLOWED_VENDORS = {"claude", "codex", "openai", "cursor"}
 
 # Panel review vendors. `cursor` is allowed as a reviewer (it proxies a
-# backing provider — e.g. a gemini or claude model — under cursor's own auth);
+# backing provider — e.g. a Gemini or Claude model — under cursor's own auth);
 # diversity is enforced on the inferred underlying provider, not the literal
 # `cursor` label (see _infer_cursor_underlying_vendor).
-PANEL_REVIEWER_VENDORS = {"claude", "codex", "openai", "gemini", "cursor"}
+PANEL_REVIEWER_VENDORS = {"claude", "codex", "openai", "agy", "cursor"}
 # Synthesizer requires native JSON-schema output (claude via --json-schema,
-# codex/openai via --output-schema; gemini and cursor lack native enforcement).
+# codex/openai via --output-schema; agy and cursor lack native enforcement).
 PANEL_SYNTHESIZER_VENDORS = {"claude", "codex", "openai"}
 # The idle probe is a short, read-only LLM call. Keep it on coding-capable
 # CLIs that accept prompt-on-stdin in headless mode.
@@ -104,6 +104,17 @@ def _normalize_vendor_value(value: Any, *, path: Path, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{path}: {field} must be non-empty string")
     return value.strip().lower()
+
+
+def _normalize_model_value(
+    value: Any, *, vendor: str, path: Path, field: str
+) -> str:
+    """Normalize a model, allowing Agy to use its configured CLI default."""
+    if value in (None, "") and vendor == "agy":
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{path}: {field} must be non-empty string")
+    return value.strip()
 
 
 def _normalize_effort_value(value: Any, *, path: Path, field: str) -> str:
@@ -248,15 +259,15 @@ def _parse_fallbacks(
         fld = f"{field}[{i}]"
         if not isinstance(entry, dict):
             raise ConfigError(f"{path}: {fld} must be a mapping")
-        for k in ("vendor", "model"):
+        for k in ("vendor",):
             if k not in entry:
                 raise ConfigError(f"{path}: {fld} missing {k!r}")
         vendor = _normalize_vendor_value(entry["vendor"], path=path, field=f"{fld}.vendor")
         if vendor not in allowed_vendors:
             raise ConfigError(f"{path}: {fld}.vendor {vendor!r} not in {allowed_vendors}")
-        model = entry["model"]
-        if not isinstance(model, str) or not model.strip():
-            raise ConfigError(f"{path}: {fld}.model must be non-empty string")
+        model = _normalize_model_value(
+            entry.get("model"), vendor=vendor, path=path, field=f"{fld}.model"
+        )
         effort = _normalize_effort_value(entry.get("effort", ""), path=path, field=f"{fld}.effort")
         min_q = _normalize_min_quota(entry.get("min_quota_pct"), path=path, field=f"{fld}.min_quota_pct")
         flags_raw = entry.get("flags", [])
@@ -309,7 +320,7 @@ def _validate_raw(raw: Any, path: Path) -> dict[str, dict[str, Any]]:
         if entry["vendor"] not in ALLOWED_VENDORS:
             raise ConfigError(
                 f"{path}: stages.{s}.vendor = {entry['vendor']!r} not in {ALLOWED_VENDORS} "
-                f"(gemini is panel-review-only in v2)"
+                f"(agy is panel-review-only in v2)"
             )
         if not isinstance(entry["model"], str) or not entry["model"].strip():
             raise ConfigError(f"{path}: stages.{s}.model must be non-empty string")
@@ -359,7 +370,7 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
     for i, entry in enumerate(reviewers_raw):
         if not isinstance(entry, dict):
             raise ConfigError(f"{path}: panel.reviewers[{i}] must be a mapping")
-        for k in ("vendor", "model"):
+        for k in ("vendor",):
             if k not in entry:
                 raise ConfigError(f"{path}: panel.reviewers[{i}] missing {k!r}")
         v = _normalize_vendor_value(
@@ -369,9 +380,12 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
             raise ConfigError(
                 f"{path}: panel.reviewers[{i}].vendor {v!r} not in {PANEL_REVIEWER_VENDORS}"
             )
-        model = entry["model"]
-        if not isinstance(model, str) or not model.strip():
-            raise ConfigError(f"{path}: panel.reviewers[{i}].model must be non-empty string")
+        model = _normalize_model_value(
+            entry.get("model"),
+            vendor=v,
+            path=path,
+            field=f"panel.reviewers[{i}].model",
+        )
         effective_provider = (
             _infer_cursor_underlying_vendor(model) if v == "cursor" else v
         )

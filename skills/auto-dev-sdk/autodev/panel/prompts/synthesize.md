@@ -7,7 +7,7 @@ from their markdown output, exactly as they stated them.
 
 ## Reviewer text indirection
 
-Some reviewer CLIs (e.g. gemini in agentic mode) write the actual
+Some reviewer CLIs (e.g. agy in agentic mode) write the actual
 review to a file on disk and emit only a short status line on stdout
 like:
 

@@ -88,7 +88,7 @@ wait for a single go/no-go:
 - Phases that will run: "Phase 1 if anchor docs are found in the diff,
   Phase 2 always"
 - Vendors panel-review is configured to invoke (read from
-  `panel-review`'s `models.conf` — e.g. Claude, Gemini, Codex)
+  `panel-review`'s `vendors.yaml` — e.g. Claude, Agy, Codex)
 - (gh mode) That findings will be cross-referenced against existing PR
   threads, and that posting inline threads is opt-in and requires a
   second confirmation later
@@ -311,7 +311,7 @@ intermediate prompts. Some users want them for their own records.
 USER: review PR 21
 AGENT: Plan: gh mode, PR #21. I'll gather the diff, run Phase 1
        (docs-compliance) if I find anchor docs in the diff, then Phase 2
-       (bug hunt) always. Panel-review will call Claude/Gemini/Codex.
+       (bug hunt) always. Panel-review will call Claude/Agy/Codex.
        After Phase 2 I'll cross-reference against existing PR threads
        and report findings. Posting inline threads is opt-in and I'll
        ask separately. OK?
@@ -337,7 +337,7 @@ AGENT: [runs gather-context.sh --pr 21]
 USER: pre-PR check on my feature branch
 AGENT: Plan: local mode, base=main, head=feature/foo. I'll gather the
        diff, run Phase 1 if I find anchor docs, then Phase 2 always.
-       Panel-review will call Claude/Gemini/Codex. Local mode so no
+       Panel-review will call Claude/Agy/Codex. Local mode so no
        PR-thread cross-reference and no posting. OK?
 USER: go
 AGENT: [runs gather-context.sh --branches main feature/foo]

@@ -3,7 +3,7 @@
 Flow:
   1. Compose per-reviewer prompt (gate-specific review-<gate>.md +
      file manifest with paths + hashes for the artifact and consulted docs).
-  2. Dispatch the configured reviewers (claude / gemini / codex/openai, per
+  2. Dispatch the configured reviewers (claude / agy / codex/openai, per
      vendors.yml panel config) in parallel.
   3. Invoke the configured synthesizer with the three reviewer
      outputs under a pinned synthesize.md prompt and the pinned JSON
@@ -609,8 +609,8 @@ def _read_only_native_args(vendor: str) -> tuple[str, ...]:
         return ("--sandbox", "read-only")
     if raw in {"claude", "anthropic"}:
         return ("--allowedTools", "Read,Glob,Grep,LS")
-    if raw in {"gemini", "google"}:
-        return ("--approval-mode", "plan")
+    if raw in {"agy", "antigravity"}:
+        return ("--mode", "plan")
     return ()
 
 
@@ -631,7 +631,6 @@ def _invoke_synthesizer(
     a wall-clock cap.
     """
     fake = os.environ.get(FAKE_INVOKER_ENV)
-    schema_json = synthesizer_output_schema_json()
     timeout_sec = probe_interval_sec  # for fake-mode subprocess + error messages
     # Quota gate (fail-closed; QuotaHalt propagates). Config validation guarantees
     # synthesizer fallbacks are schema-capable, so the schema-vendor guard below
@@ -646,6 +645,22 @@ def _invoke_synthesizer(
         )
         spec = PanelSynthesizerSpec(
             vendor=_cand.vendor, model=_cand.model, effort=_cand.effort
+        )
+    openai_compatible = (
+        not fake
+        and spec.vendor.strip().lower() in {"openai", "codex", "gpt"}
+    )
+    schema_json = synthesizer_output_schema_json(
+        openai_compatible=openai_compatible,
+    )
+    if openai_compatible:
+        prompt += (
+            "\n\n## OpenAI strict-schema field discipline\n\n"
+            "Emit every field declared by the schema. Use [] when a reviewer "
+            "has no findings, targets, or coverage; use an empty string when "
+            "a coverage row has no notes; and always emit prd_targeted for a "
+            "design decision. When the Gate in the context is not "
+            "design-review, emit the top-level decision field as null.\n"
         )
     try:
         if fake:
@@ -669,7 +684,7 @@ def _invoke_synthesizer(
             parsed = raw.get("structured_output") if isinstance(raw, dict) and "structured_output" in raw else raw
             return True, parsed, ""
 
-        if spec.vendor in {"gemini", "cursor"}:
+        if spec.vendor in {"agy", "cursor"}:
             return False, None, (
                 f"synthesizer vendor {spec.vendor!r} not supported: "
                 f"{spec.vendor} CLI has no native JSON-schema enforcement"
@@ -704,6 +719,27 @@ def _invoke_synthesizer(
             idle_callback=idle_callback,
         )
         if result.returncode != 0:
+            if debug_dir is not None:
+                try:
+                    (debug_dir / "panel-synthesizer-raw.txt").write_text(
+                        f"--- synthesizer raw output ({len(result.output)} chars) ---\n"
+                        f"{result.output}\n"
+                        f"--- end raw ---\n\n"
+                        f"--- shared-call returncode: {result.returncode} ---\n"
+                        f"--- timed_out: {result.timed_out} ---\n\n"
+                        f"--- shared-call status ({len(repr(result.status))} chars) ---\n"
+                        f"{result.status!r}\n"
+                        f"--- end status ---\n\n"
+                        f"--- shared-call log ({len(result.log)} chars) ---\n"
+                        f"{result.log}\n"
+                        f"--- end log ---\n\n"
+                        f"--- summary_stderr ({len(result.summary_stderr)} chars) ---\n"
+                        f"{result.summary_stderr}\n"
+                        f"--- end stderr ---\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
             if result.timed_out:
                 return False, None, f"timeout after {timeout_sec}s"
             return False, None, (

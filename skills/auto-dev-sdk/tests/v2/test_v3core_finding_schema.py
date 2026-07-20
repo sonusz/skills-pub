@@ -71,7 +71,7 @@ def test_finding_without_targets_loads_with_empty_list(tmp_path):
 
 def test_dropped_finding_dataclass_has_drop_reason():
     df = DroppedFinding(
-        severity="risk", vendor="gemini", summary="x",
+        severity="risk", vendor="agy", summary="x",
         targets=["anchor.prd.md"], drop_reason="all-anchor-targets",
     )
     d = df.to_dict()

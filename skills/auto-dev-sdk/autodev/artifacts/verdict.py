@@ -96,7 +96,7 @@ class ReviewDecision:
 @dataclass
 class PanelFinding:
     severity: Severity
-    vendor: str                        # claude / gemini / codex
+    vendor: str                        # claude / agy / codex
     summary: str
     cited_artifact_span: dict[str, Any] = field(default_factory=dict)
     # v3-core R1: filename-qualified target strings — "primary_pair.<filename>"

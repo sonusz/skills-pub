@@ -27,7 +27,7 @@ def _happy_panel():
     return {
         "reviewers": [
             {"vendor": "claude", "model": "fake-panel-claude"},
-            {"vendor": "gemini", "model": "fake-panel-gemini"},
+            {"vendor": "agy", "model": "fake-panel-agy"},
             {"vendor": "codex", "model": "fake-panel-codex"},
         ],
         "synthesizer": {"vendor": "claude", "model": "fake-panel-synth"},
@@ -75,6 +75,16 @@ def test_vendor_labels_are_case_insensitive(tmp_path):
     assert cfg.probe.vendor == "openai"
 
 
+def test_agy_reviewer_may_use_cli_default_model(tmp_path):
+    panel = _happy_panel()
+    del panel["reviewers"][1]["model"]
+    cfg = load_vendors_config(
+        _write(tmp_path, _yaml_dump(_happy_doc(panel=panel)))
+    )
+    assert cfg.panel.reviewers[1].vendor == "agy"
+    assert cfg.panel.reviewers[1].model == ""
+
+
 def test_missing_stages_key(tmp_path):
     body = _yaml_dump({"design": {"vendor": "claude", "model": "m"}})
     with pytest.raises(ConfigError):
@@ -90,7 +100,7 @@ def test_missing_one_stage(tmp_path):
 
 def test_unknown_vendor_rejected(tmp_path):
     stages = _happy_stages()
-    stages["design"]["vendor"] = "gemini"  # not allowed for coding
+    stages["design"]["vendor"] = "agy"  # not allowed for coding
     with pytest.raises(ConfigError):
         load_vendors_config(_write(tmp_path, _yaml_dump(_happy_doc(stages=stages))))
 
@@ -225,7 +235,7 @@ def test_probe_config_loaded_from_top_level(tmp_path):
 
 def test_probe_unknown_vendor_rejected(tmp_path):
     body = _yaml_dump(_happy_doc(
-        probe={"vendor": "gemini", "model": "fake-probe-gemini"},
+        probe={"vendor": "agy", "model": "fake-probe-agy"},
     ))
     with pytest.raises(ConfigError):
         load_vendors_config(_write(tmp_path, body))

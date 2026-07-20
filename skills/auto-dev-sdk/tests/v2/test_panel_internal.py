@@ -43,7 +43,7 @@ def panel_config():
     return PanelConfig(
         reviewers=(
             PanelReviewerSpec(vendor="claude", model="fake-sonnet"),
-            PanelReviewerSpec(vendor="gemini", model="fake-gemini"),
+            PanelReviewerSpec(vendor="agy", model="fake-agy"),
             PanelReviewerSpec(vendor="codex", model="fake-codex"),
         ),
         synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake-sonnet"),
@@ -86,6 +86,25 @@ def test_schema_is_per_reviewer_extraction():
     }
 
 
+def test_openai_schema_requires_every_property_and_allows_null_decision():
+    schema = synthesizer_output_schema(openai_compatible=True)
+
+    def assert_strict(node):
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                assert set(node["required"]) == set(properties)
+            for value in node.values():
+                assert_strict(value)
+        elif isinstance(node, list):
+            for value in node:
+                assert_strict(value)
+
+    assert_strict(schema)
+    decision_options = schema["properties"]["decision"]["anyOf"]
+    assert any(option.get("type") == "null" for option in decision_options)
+
+
 def test_compose_reviewer_prompt_references_artifact_file(feature_active):
     artifact = _make_artifact(feature_active)
     prompt = _compose_reviewer_prompt(
@@ -113,7 +132,8 @@ def test_compose_reviewer_prompt_uses_file_refs_for_consulted_docs(feature_activ
 
 def test_reviewer_vendor_labels_route_through_shared_vendors():
     assert normalize_shared_vendor("Claude") == "claude"
-    assert normalize_shared_vendor("gemini") == "gemini"
+    assert normalize_shared_vendor("agy") == "agy"
+    assert normalize_shared_vendor("Antigravity") == "agy"
     assert normalize_shared_vendor("codex") == "openai"
     assert cli_name_for_vendor("openai") == "codex"
 
@@ -126,7 +146,7 @@ def test_synthesizer_uses_vendor_native_read_only_hints():
     assert _read_only_native_args("claude") == (
         "--allowedTools", "Read,Glob,Grep,LS",
     )
-    assert _read_only_native_args("gemini") == ("--approval-mode", "plan")
+    assert _read_only_native_args("agy") == ("--mode", "plan")
 
 
 def test_compose_synthesizer_prompt_lists_responding_vendors(feature_active):
@@ -135,7 +155,7 @@ def test_compose_synthesizer_prompt_lists_responding_vendors(feature_active):
     results = [
         ReviewerResult(vendor="claude", model="m", ok=True,
                        output="Verdict: pass", elapsed_sec=1.0),
-        ReviewerResult(vendor="gemini", model="m", ok=False, output="",
+        ReviewerResult(vendor="agy", model="m", ok=False, output="",
                        elapsed_sec=0.5, failure_detail="empty stdout"),
         ReviewerResult(vendor="codex", model="m", ok=True,
                        output="Verdict: needs_revision", elapsed_sec=2.0),
@@ -147,7 +167,7 @@ def test_compose_synthesizer_prompt_lists_responding_vendors(feature_active):
     assert "claude" in sp
     assert "codex" in sp
     assert "Reviewers who did NOT respond" in sp
-    assert "gemini" in sp
+    assert "agy" in sp
     # Synthesize prompt body itself is included (pure extractor wording)
     assert "extractor" in sp.lower()
     assert "Pre-extracted reviewer findings" not in sp
@@ -187,7 +207,7 @@ def test_reviewer_invocation_via_fake(fake_invoker, monkeypatch):
 
 def test_reviewer_empty_output_marked_not_ok(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
-    spec = PanelReviewerSpec(vendor="gemini", model="fake")
+    spec = PanelReviewerSpec(vendor="agy", model="fake")
     r = _invoke_reviewer(spec, "test prompt", probe_interval_sec=10)
     assert not r.ok
     assert r.output == ""
@@ -220,6 +240,37 @@ def test_synthesizer_malformed_triggers_failure(fake_invoker, monkeypatch):
     assert "json" in detail.lower()
 
 
+def test_synthesizer_nonzero_persists_diagnostics(monkeypatch, tmp_path):
+    class _Result:
+        returncode = 1
+        timed_out = False
+        output = "provider failure body"
+        log = "launcher log"
+        summary_stderr = "provider stderr"
+        status = {"exit_code": "1", "failure_kind": "provider"}
+
+    monkeypatch.delenv(FAKE_INVOKER_ENV, raising=False)
+    monkeypatch.setattr(
+        "autodev.panel.runner.call_shared_vendor",
+        lambda **_kwargs: _Result(),
+    )
+    spec = PanelSynthesizerSpec(vendor="claude", model="fake-sonnet")
+
+    ok, parsed, detail = _invoke_synthesizer(
+        spec,
+        "prompt",
+        probe_interval_sec=10,
+        debug_dir=tmp_path,
+    )
+
+    assert not ok
+    assert parsed is None
+    assert "exit 1" in detail
+    debug = (tmp_path / "panel-synthesizer-raw.txt").read_text(encoding="utf-8")
+    assert "provider failure body" in debug
+    assert "provider stderr" in debug
+
+
 def test_end_to_end_all_pass(fake_invoker, monkeypatch, feature_active, panel_config):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
     artifact = _make_artifact(feature_active)
@@ -235,7 +286,7 @@ def test_end_to_end_all_pass(fake_invoker, monkeypatch, feature_active, panel_co
     assert v.verdict == "pass"
     assert not v.has_invariant_violation()
     # All 3 reviewers must be present in per_vendor_raw (audit)
-    assert set(v.per_vendor_raw.keys()) == {"claude", "gemini", "codex"}
+    assert set(v.per_vendor_raw.keys()) == {"claude", "agy", "codex"}
     # verdict file written atomically
     written = feature_active / "panel-design-review.json"
     assert written.exists()
@@ -266,7 +317,7 @@ def test_end_to_end_inv_violation_fails(fake_invoker, monkeypatch, feature_activ
     # Each finding carries its single reviewer's vendor label verbatim.
     vendors_on_findings = {f.vendor for f in inv_findings}
     assert "claude" in vendors_on_findings
-    assert "gemini" in vendors_on_findings
+    assert "agy" in vendors_on_findings
 
 
 def test_incomplete_panel_one_missing_halts_and_caches_successes(
@@ -296,7 +347,7 @@ def test_incomplete_panel_one_missing_halts_and_caches_successes(
         (feature_active / "panel-design-review.reviewers.json").read_text()
     )
     assert set(cache["reviewers"]) == {"claude", "codex"}
-    assert "gemini" in cache["failures"]
+    assert "agy" in cache["failures"]
 
 
 def test_incomplete_panel_restart_retries_missing_reviewer_only(
@@ -306,7 +357,7 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
 
     artifact = _make_artifact(feature_active)
 
-    # First run: gemini fails; claude/codex succeed and should be cached.
+    # First run: agy fails; claude/codex succeed and should be cached.
     fd, path_str = tempfile.mkstemp(suffix=".sh")
     os.close(fd)
     first = Path(path_str)
@@ -317,7 +368,7 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
         "role=\"${AUTODEV_PANEL_FAKE_ROLE:-}\"\n"
         "vendor=\"${AUTODEV_PANEL_FAKE_VENDOR:-}\"\n"
         "if [[ \"$role\" == \"reviewer\" ]]; then\n"
-        "  if [[ \"$vendor\" == \"gemini\" ]]; then exit 0; fi\n"
+        "  if [[ \"$vendor\" == \"agy\" ]]; then exit 0; fi\n"
         "  echo \"cached $vendor\"\n"
         "  echo 'Verdict: pass'\n"
         "  exit 0\n"
@@ -337,7 +388,7 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
             panel_config=panel_config,
         )
 
-    # Second run: only gemini may be invoked; claude/codex must come from cache.
+    # Second run: only agy may be invoked; claude/codex must come from cache.
     calls = feature_active / "second-calls.txt"
     fd, path_str = tempfile.mkstemp(suffix=".sh")
     os.close(fd)
@@ -350,14 +401,14 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
         "vendor=\"${AUTODEV_PANEL_FAKE_VENDOR:-}\"\n"
         f"echo \"$role:$vendor\" >> {calls}\n"
         "if [[ \"$role\" == \"reviewer\" ]]; then\n"
-        "  if [[ \"$vendor\" != \"gemini\" ]]; then exit 97; fi\n"
-        "  echo 'fresh gemini'\n"
+        "  if [[ \"$vendor\" != \"agy\" ]]; then exit 97; fi\n"
+        "  echo 'fresh agy'\n"
         "  echo 'Verdict: pass'\n"
         "  exit 0\n"
         "fi\n"
         "cat <<'EOF'\n"
         '{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},'
-        '{"vendor":"gemini","verdict":"pass","findings":[]},'
+        '{"vendor":"agy","verdict":"pass","findings":[]},'
         '{"vendor":"codex","verdict":"pass","findings":[]}]}\n'
         "EOF\n"
         "exit 0\n"
@@ -376,7 +427,7 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
     assert v.verdict == "pass"
     observed = calls.read_text().splitlines()
     assert "reviewer:claude" not in observed
-    assert observed.count("reviewer:gemini") == 2  # design + trace groups
+    assert observed.count("reviewer:agy") == 2  # design + trace groups
     assert "reviewer:codex" not in observed
 
 
@@ -458,7 +509,7 @@ def test_parallel_dispatch_uses_threadpool(fake_invoker, monkeypatch, feature_ac
         "  echo \"Verdict: pass\"\n"
         "  exit 0\n"
         "fi\n"
-        '  echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},{"vendor":"gemini","verdict":"pass","findings":[]},{"vendor":"codex","verdict":"pass","findings":[]}]}\'\n'
+        '  echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},{"vendor":"agy","verdict":"pass","findings":[]},{"vendor":"codex","verdict":"pass","findings":[]}]}\'\n'
         "exit 0\n"
     )
     wrapper.chmod(0o755)

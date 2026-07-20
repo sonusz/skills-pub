@@ -1,7 +1,7 @@
 """Per-vendor quota parsing (binding-window min + reset), with HTTP/creds stubbed.
 
 Fixtures are shaped like the real provider usage payloads (cf. Mana's
-ManaTests/Fixtures/{claude,cursor,gemini,codex}). We stub credential discovery
+ManaTests fixtures for Claude, Cursor, and Codex). We stub credential discovery
 and the HTTP getter so no network/creds are needed.
 """
 from __future__ import annotations
@@ -9,7 +9,14 @@ from __future__ import annotations
 import base64
 import json
 
-from autodev.vendors.quota import claude, codex, cursor, gemini
+from autodev.vendors.quota import (
+    agy,
+    claude,
+    codex,
+    cursor,
+    get_remaining,
+    normalize_quota_vendor,
+)
 
 
 def test_claude_binding_window(monkeypatch):
@@ -48,18 +55,13 @@ def test_cursor_plan_and_ondemand(monkeypatch):
     assert r.resets_at is not None
 
 
-def test_gemini_family_filter(monkeypatch):
-    monkeypatch.setattr(gemini, "read_json_file", lambda p: {"access_token": "t"})
-    monkeypatch.setattr(gemini, "_project", lambda token: None)
-    quota = {
-        "models": [
-            {"name": "gemini-pro", "windows": [{"utilization": 30, "resets_at": "2026-05-02T09:00:00+00:00"}]},
-            {"name": "gemini-flash", "windows": [{"utilization": 90, "resets_at": "2026-05-02T09:00:00+00:00"}]},
-        ]
-    }
-    monkeypatch.setattr(gemini, "http_json", lambda url, **k: (200, quota))
-    r = gemini.fetch(model="gemini-3.1-pro")
-    assert r.ok and r.remaining_pct == 70.0  # pro family only (flash excluded)
+def test_agy_quota_is_unknown():
+    r = agy.fetch(model=None)
+    assert r.vendor == "agy"
+    assert r.remaining_pct is None and not r.ok
+    assert r.error is not None and "machine-readable" in r.error
+    assert normalize_quota_vendor("Antigravity") == "agy"
+    assert get_remaining("agy", force=True).vendor == "agy"
 
 
 def test_codex_rate_limit_windows(monkeypatch):

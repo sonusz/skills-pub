@@ -227,7 +227,7 @@ def _orch(repo_root: Path, vendor_bin: Path) -> Orchestrator:
         panel=PanelConfig(
             reviewers=(
                 PanelReviewerSpec(vendor="claude", model="fake-panel-claude"),
-                PanelReviewerSpec(vendor="gemini", model="fake-panel-gemini"),
+                PanelReviewerSpec(vendor="agy", model="fake-panel-agy"),
                 PanelReviewerSpec(vendor="codex", model="fake-panel-codex"),
             ),
             synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake-panel-synth"),

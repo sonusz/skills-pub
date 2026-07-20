@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test for panel-review without real model calls.
 #
-# It puts fake codex/claude/gemini binaries at the front of PATH, then exercises
+# It puts fake codex/claude/agy binaries at the front of PATH, then exercises
 # doctor.sh, launch.sh, and synthesize.sh through the shared vendors module.
 set -euo pipefail
 
@@ -55,7 +55,7 @@ if printf "%s" "$prompt" | grep -qi 'single word READY'; then
 elif printf "%s" "$prompt" | grep -qi 'Panel outputs:'; then
   response="━━━ Panel Review ━━━
 Task: smoke test
-Vendors: openai ✅ | claude ✅ | gemini ✅
+Vendors: openai ✅ | claude ✅ | agy ✅
 
 ## Consensus
 Smoke consensus.
@@ -85,7 +85,7 @@ elif printf "%s" "$prompt" | grep -qi 'Panel outputs:'; then
   cat <<'OUT'
 ━━━ Panel Review ━━━
 Task: smoke test
-Vendors: openai ✅ | claude ✅ | gemini ✅
+Vendors: openai ✅ | claude ✅ | agy ✅
 
 ## Consensus
 Smoke consensus.
@@ -102,15 +102,15 @@ else
 fi
 FAKE_CLAUDE
 
-cat > "$BIN_DIR/gemini" <<'FAKE_GEMINI'
+cat > "$BIN_DIR/agy" <<'FAKE_AGY'
 #!/usr/bin/env bash
 if [ -n "${PANEL_SMOKE_MARKERS:-}" ]; then
-  printf "pwd=%s\nargs=%s\n" "$PWD" "$*" > "${PANEL_SMOKE_MARKERS}.gemini"
+  printf "pwd=%s\nargs=%s\n" "$PWD" "$*" > "${PANEL_SMOKE_MARKERS}.agy"
 fi
 prompt=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prompt|-p)
+    --print|-p)
       prompt="$2"
       shift 2
       ;;
@@ -122,11 +122,11 @@ done
 if printf "%s" "$prompt" | grep -qi 'single word READY'; then
   printf "READY\n"
 else
-  printf "gemini panel smoke output\n"
+  printf "agy panel smoke output\n"
 fi
-FAKE_GEMINI
+FAKE_AGY
 
-chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/gemini"
+chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/agy"
 
 OPENAI_ARGS=()
 while IFS= read -r -d '' arg; do
@@ -157,7 +157,7 @@ PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$MARKER_PREFIX" \
   "$SCRIPT_DIR/launch.sh" --cwd "$ROOT_DIR" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/synthesize.sh" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
 
-for vendor in codex claude gemini; do
+for vendor in codex claude agy; do
   marker="$MARKER_PREFIX.$vendor"
   if [ ! -s "$marker" ]; then
     printf "FAIL: expected repo-mode marker for %s\n" "$vendor" >&2
@@ -184,9 +184,9 @@ if ! grep -q -- '--permission-mode bypassPermissions' "$MARKER_PREFIX.claude"; t
   cat "$MARKER_PREFIX.claude" >&2
   exit 1
 fi
-if ! grep -q -- '--yolo' "$MARKER_PREFIX.gemini"; then
-  printf "FAIL: expected repo-mode gemini call to use --yolo\n" >&2
-  cat "$MARKER_PREFIX.gemini" >&2
+if ! grep -q -- '--dangerously-skip-permissions' "$MARKER_PREFIX.agy"; then
+  printf "FAIL: expected repo-mode agy call to skip permission prompts\n" >&2
+  cat "$MARKER_PREFIX.agy" >&2
   exit 1
 fi
 
@@ -194,20 +194,20 @@ PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$INLINE_MARKER_PREFIX" \
   "$SCRIPT_DIR/launch.sh" --inline "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$INLINE_RUN_DIR" >/dev/null
 if grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$INLINE_MARKER_PREFIX.codex" \
     || grep -q -- '--permission-mode bypassPermissions' "$INLINE_MARKER_PREFIX.claude" \
-    || grep -q -- '--yolo' "$INLINE_MARKER_PREFIX.gemini"; then
+    || grep -q -- '--dangerously-skip-permissions' "$INLINE_MARKER_PREFIX.agy"; then
   printf "FAIL: inline mode should not pass repo/yolo access flags\n" >&2
-  cat "$INLINE_MARKER_PREFIX.codex" "$INLINE_MARKER_PREFIX.claude" "$INLINE_MARKER_PREFIX.gemini" >&2
+  cat "$INLINE_MARKER_PREFIX.codex" "$INLINE_MARKER_PREFIX.claude" "$INLINE_MARKER_PREFIX.agy" >&2
   exit 1
 fi
 
-for file in openai/out claude/out gemini/out synthesis/out openai/status claude/status gemini/status synthesis/status; do
+for file in openai/out claude/out agy/out synthesis/out openai/status claude/status agy/status synthesis/status; do
   if [ ! -s "$RUN_DIR/$file" ]; then
     printf "FAIL: expected non-empty smoke output %s\n" "$RUN_DIR/$file" >&2
     exit 1
   fi
 done
 
-for id in openai claude gemini synthesis; do
+for id in openai claude agy synthesis; do
   status_file="$RUN_DIR/$id/status"
   expected_kind="panel"
   [ "$id" = "synthesis" ] && expected_kind="synthesis"

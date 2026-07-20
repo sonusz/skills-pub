@@ -3,7 +3,7 @@
 G15 replaces the previous `panel-review` skill + markdown regex wrapper
 (`autodev/panel_wrapper.py`) with a harness-owned implementation:
 
-  1. Parallel reviewer dispatch (claude / gemini / codex) with open-ended
+  1. Parallel reviewer dispatch (claude / agy / codex) with open-ended
      markdown prompts — reviewers write judgment prose, not JSON.
   2. Configured synthesizer LLM call that reads the three markdown
      outputs and produces one schema-constrained

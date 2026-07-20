@@ -14,13 +14,13 @@ import time
 from autodev.vendors.quota import claude as _claude
 from autodev.vendors.quota import codex as _codex
 from autodev.vendors.quota import cursor as _cursor
-from autodev.vendors.quota import gemini as _gemini
+from autodev.vendors.quota import agy as _agy
 from autodev.vendors.quota.base import QuotaResult
 
 _FETCHERS = {
     "claude": _claude.fetch,
     "cursor": _cursor.fetch,
-    "gemini": _gemini.fetch,
+    "agy": _agy.fetch,
     "codex": _codex.fetch,
 }
 
@@ -33,8 +33,8 @@ def normalize_quota_vendor(vendor: str) -> str:
         return "claude"
     if raw in {"cursor", "cursor-agent", "anysphere"}:
         return "cursor"
-    if raw in {"gemini", "google"}:
-        return "gemini"
+    if raw in {"agy", "antigravity"}:
+        return "agy"
     if raw in {"codex", "openai", "gpt"}:
         return "codex"
     return raw

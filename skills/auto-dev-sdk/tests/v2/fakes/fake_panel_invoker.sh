@@ -2,13 +2,13 @@
 # Fake invoker for G15 panel runner tests.
 #
 # Driven by env vars set by tests BEFORE running. Stdin is the composed
-# prompt. Role ∈ {reviewer, synthesizer}, vendor ∈ {claude, gemini, codex}.
+# prompt. Role ∈ {reviewer, synthesizer}, vendor ∈ {claude, agy, codex}.
 #
 # Behaviors (AUTODEV_PANEL_FAKE_BEHAVIOR):
 #   reviewers_all_pass       — 3 reviewers emit "Verdict: pass" markdown
-#   reviewers_two_fail       — claude + gemini fail with invariant_violation,
+#   reviewers_two_fail       — claude + agy fail with invariant_violation,
 #                              codex passes
-#   reviewers_one_empty      — gemini returns empty stdout (simulates empty output)
+#   reviewers_one_empty      — agy returns empty stdout (simulates empty output)
 #   reviewers_one_timeout    — codex sleeps past test timeout
 #   synth_pass               — synthesizer emits per_reviewer with pass
 #   synth_fail_inv           — synthesizer emits per_reviewer with fail + invariant
@@ -47,7 +47,7 @@ if [[ "$role" == "reviewer" ]]; then
       fi
       ;;
     reviewers_one_empty)
-      if [[ "$vendor" == "gemini" ]]; then
+      if [[ "$vendor" == "agy" ]]; then
         # emit nothing
         exit 0
       fi
@@ -74,7 +74,7 @@ if [[ "$role" == "synthesizer" ]]; then
       cat <<'EOF'
 {"per_reviewer":[
   {"vendor":"claude","verdict":"pass","findings":[]},
-  {"vendor":"gemini","verdict":"pass","findings":[]},
+  {"vendor":"agy","verdict":"pass","findings":[]},
   {"vendor":"codex","verdict":"pass","findings":[]}
 ]}
 EOF
@@ -86,7 +86,7 @@ EOF
   {"vendor":"claude","verdict":"fail","findings":[
     {"severity":"invariant_violation","summary":"R3 vs R7 contradiction"}
   ]},
-  {"vendor":"gemini","verdict":"fail","findings":[
+  {"vendor":"agy","verdict":"fail","findings":[
     {"severity":"invariant_violation","summary":"requirement 3 cannot coexist with requirement 7"}
   ]},
   {"vendor":"codex","verdict":"pass","findings":[]}

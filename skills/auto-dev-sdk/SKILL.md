@@ -33,7 +33,7 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Dispatches all harness-owned LLM calls through the packaged
   `shared/vendors/scripts/call.sh` interface per repo-root `vendors.yml`.
 - Runs `design-review` over the unified design packet and `close-approval` over `implemented-spec.md` + PRD + judgment-free PRD checklist.
-- Uses configured `claude` + `gemini` + `codex`/`openai` panel reviewers
+- Uses configured `claude` + `agy` + `codex`/`openai` panel reviewers
   for review diversity.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
 - Writes bridge artifacts: `design-packet.json`, `accepted-design.json`, `implementation-index.json`, `prd-checklist.json`.

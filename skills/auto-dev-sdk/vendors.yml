@@ -7,7 +7,7 @@
 # `--vendors-yml`, `AUTODEV_VENDORS_YML`, or a legacy repo-root vendors.yml.
 #
 # Required: `stages` mapping with every coding stage below.
-# Allowed coding vendors: claude, codex, openai. Gemini is panel-review-only.
+# Allowed coding vendors: claude, codex, openai. Agy is panel-review-only.
 # Vendor labels are case-insensitive and normalized to lowercase.
 # `codex` and `openai` both route through the Codex CLI.
 # `probe_interval_sec` (per stage) is the idle threshold for the
@@ -29,7 +29,7 @@ stages:
   # and panel feedback during rework. Effort: highest.
   design:
     vendor: openai
-    model: gpt-5.5
+    model: gpt-5.6-sol
     probe_interval_sec: 2400
     effort: max
 
@@ -38,7 +38,7 @@ stages:
   # current source, failures, and test output. Effort: high.
   build:
     vendor: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     probe_interval_sec: 3600
     effort: max
 
@@ -47,7 +47,7 @@ stages:
   # exploration. Effort: medium-high.
   review:
     vendor: claude
-    model: claude-opus-4-8
+    model: opus
     probe_interval_sec: 900
     effort: high
 
@@ -56,7 +56,7 @@ stages:
   # files. Effort: medium-high.
   spec:
     vendor: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     probe_interval_sec: 900
     effort: medium
 
@@ -67,22 +67,21 @@ panel:
   reviewers:
     # Claude: strong natural-language critique and ambiguity detection.
     - vendor: claude
-      model: claude-opus-4-8
+      model: opus
       effort: max
-    # Gemini: independent second vendor for divergence signal.
-    - vendor: gemini
-      model: gemini-2.5-flash-lite
+    # Agy: independent second CLI run, using its configured default model.
+    - vendor: agy
       effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
-      model: gpt-5.5
+      model: gpt-5.6-sol
       effort: max
   # Synthesizes reviewer outputs only; does not re-review the artifact.
   # Context: medium; reviewer outputs plus schema. Effort: high enough for
   # faithful extraction, lower than design generation.
   synthesizer:
     vendor: claude
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300

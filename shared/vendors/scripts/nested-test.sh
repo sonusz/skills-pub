@@ -16,8 +16,8 @@ Usage:
 
 Options:
   --run-real-nested        Required guard; this test makes real nested calls
-  --outer-vendor NAME      openai, claude, gemini, or cursor; repeatable. Default: all
-  --inner-vendor NAME      openai, claude, gemini, or cursor; repeatable. Default: all
+  --outer-vendor NAME      openai, claude, agy, or cursor; repeatable. Default: all
+  --inner-vendor NAME      openai, claude, agy, or cursor; repeatable. Default: all
   --timeout SECONDS        Timeout for each outer vendor call (default: 420)
   --inner-timeout SECONDS  Timeout each outer call passes to inner call.sh (default: 120)
   --output-dir DIR         Keep outputs in DIR. Default: temp dir kept and printed
@@ -126,10 +126,10 @@ case "$INNER_TIMEOUT_SECONDS" in
 esac
 
 if [ "${#OUTER_VENDORS[@]}" -eq 0 ]; then
-  OUTER_VENDORS=(openai claude gemini cursor)
+  OUTER_VENDORS=(openai claude agy cursor)
 fi
 if [ "${#INNER_VENDORS[@]}" -eq 0 ]; then
-  INNER_VENDORS=(openai claude gemini cursor)
+  INNER_VENDORS=(openai claude agy cursor)
 fi
 
 if [ -z "$OUTPUT_DIR" ]; then
@@ -142,7 +142,7 @@ normalize_id() {
   case "$(lower "$1")" in
     openai|codex|gpt) printf "openai\n" ;;
     claude|anthropic) printf "claude\n" ;;
-    gemini|google) printf "gemini\n" ;;
+    agy|antigravity) printf "agy\n" ;;
     cursor|cursor-agent|anysphere) printf "cursor\n" ;;
     *) return 1 ;;
   esac
@@ -212,7 +212,7 @@ You are running a nested vendor integration test.
 
 Run this exact shell command once:
 
-"$CALL_SCRIPT"$INNER_VENDOR_ARGS --prompt "Nested test invoked by outer vendor: $outer_id. Who are you?" --output-dir "$inner_dir" --min-success ${#INNER_VENDORS[@]} --timeout "$INNER_TIMEOUT_SECONDS"
+"$CALL_SCRIPT"$INNER_VENDOR_ARGS --effort low --prompt "Nested test invoked by outer vendor: $outer_id. Who are you?" --output-dir "$inner_dir" --min-success ${#INNER_VENDORS[@]} --timeout "$INNER_TIMEOUT_SECONDS"
 
 After the command finishes, reply with one short sentence saying whether it completed.
 Do not ask follow-up questions.
@@ -222,6 +222,7 @@ PROMPT
     --vendor "$outer" \
     --id "outer-$outer_id" \
     --yolo \
+    --effort low \
     --prompt-file "$prompt_file" \
     --output-dir "$outer_call_dir" \
     --min-success 1 \

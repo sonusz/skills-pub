@@ -37,7 +37,7 @@ Signs of **working** (→ extend):
 - A descendant process matches a known long task:
   `pytest`, `cargo build`, `cargo test`, `npm install`, `pip install`,
   `tsc`, `webpack`, `make`, `mvn`, `gradle`, `docker build`,
-  vendor LLM CLIs (`claude`, `codex`, `gemini` — they can think
+  vendor LLM CLIs (`claude`, `codex`, `agy` — they can think
   silently for minutes).
 - Stderr tail shows recent progress lines (test names, compile unit
   names, download progress) even if stdout is quiet.

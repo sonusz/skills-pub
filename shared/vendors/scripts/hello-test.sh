@@ -15,7 +15,7 @@ Usage:
   scripts/hello-test.sh [options]
 
 Options:
-  --vendor NAME             openai, claude, gemini, or cursor; repeatable. Default: all
+  --vendor NAME             openai, claude, agy, or cursor; repeatable. Default: all
   --config FILE             Model mapping config passed to call.sh
   --effort min|low|medium|high|xhigh|max
                           Best-effort reasoning hint (default: min)
@@ -127,7 +127,7 @@ case "$TIMEOUT_SECONDS" in
 esac
 
 if [ "${#REQUESTED_VENDORS[@]}" -eq 0 ]; then
-  REQUESTED_VENDORS=(openai claude gemini cursor)
+  REQUESTED_VENDORS=(openai claude agy cursor)
 fi
 
 if [ -z "$OUTPUT_DIR" ]; then

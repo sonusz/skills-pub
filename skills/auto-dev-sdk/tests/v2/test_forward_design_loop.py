@@ -160,7 +160,7 @@ def _panel_config() -> PanelConfig:
     return PanelConfig(
         reviewers=(
             PanelReviewerSpec(vendor="claude", model="fake"),
-            PanelReviewerSpec(vendor="gemini", model="fake"),
+            PanelReviewerSpec(vendor="agy", model="fake"),
             PanelReviewerSpec(vendor="codex", model="fake"),
         ),
         synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake"),

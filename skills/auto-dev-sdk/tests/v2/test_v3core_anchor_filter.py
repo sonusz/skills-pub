@@ -122,11 +122,11 @@ def test_anchor_plus_unknown_kept():
 
 
 def test_dropped_preserves_severity_and_vendor():
-    f = _f(severity="opinion", vendor="gemini",
+    f = _f(severity="opinion", vendor="agy",
            targets=["anchor.prd.md"])
     kept, dropped = filter_anchor_findings([f])
     assert dropped[0].severity == "opinion"
-    assert dropped[0].vendor == "gemini"
+    assert dropped[0].vendor == "agy"
 
 
 def test_multiple_findings_mixed_outcomes():

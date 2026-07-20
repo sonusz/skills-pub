@@ -2,7 +2,7 @@
 
 This folder is the canonical home of the `shared/vendors` module
 shared across skills (auto-dev-sdk, alpha-miner-sdk, panel-review,
-others). The module wraps Claude / Codex / Gemini CLIs behind a
+others). The module wraps Claude / Codex / Agy CLIs behind a
 uniform `call.sh` + `vendor-launch.sh` interface so callers do not
 have to know vendor-specific argument shapes.
 
@@ -41,14 +41,14 @@ back-ported to this canonical folder.
 
 | Patch | Location | Symptom this fixes |
 |---|---|---|
-| `vendors.conf` model defaults: `openai.model=gpt-5.5`, `gemini.model=gemini-2.5-flash` | `vendors.conf` | Downloads still names `gpt-5.4` and the broken `gemini-3-flash-preview`. Anything reading the canonical conf will pick stale models |
+| `vendors.conf` model defaults, including an empty `agy.model` to use agy's configured default | `vendors.conf` | Avoids pinning a display-name model that may not exist on every Agy account |
 
 ### Recently ported to Downloads (now in both)
 
 | Patch | Ported on | Notes |
 |---|---|---|
 | `structured_output` envelope preservation when `--json-schema` is passed (`vendor-launch.sh`) | 2026-04-30 | Coexists with the line-by-line JSON extraction fallback already in Downloads — both run on the same `data` dict |
-| Unified `--schema-file` shared option in `call.sh` + codex envelope wrap in `vendor-launch.sh` | 2026-04-30 | Replaces vendor-specific `--json-schema`/`--output-schema` plumbing at call sites. Output is `{"structured_output": <obj>}` for both `claude` and `openai`; `gemini` is rejected (no native schema enforcement). Auto-dev-sdk synth no longer pinned to claude. |
+| Unified `--schema-file` shared option in `call.sh` + codex envelope wrap in `vendor-launch.sh` | 2026-04-30 | Replaces vendor-specific `--json-schema`/`--output-schema` plumbing at call sites. Output is `{"structured_output": <obj>}` for both `claude` and `openai`; `agy` is rejected (no native schema enforcement). Auto-dev-sdk synth no longer pinned to claude. |
 
 ### Other observed file diffs
 
@@ -100,7 +100,7 @@ grep -q 'VENDORS_SCHEMA_FILE' shared/vendors/scripts/call.sh && echo OK
 grep -q 'vendors_lower' shared/vendors/scripts/vendor-launch.sh && echo OK
 
 # vendors.conf models current?
-grep -E 'openai.model=gpt-5\.5|gemini.model=gemini-2\.5-flash' shared/vendors/vendors.conf
+grep -E 'openai.model=gpt-5\.5|agy.model=' shared/vendors/vendors.conf
 ```
 
 ## Common bug signatures and the fix that covers each
@@ -116,8 +116,8 @@ table before chasing it from scratch:
 | Stray binary chars (`^D`, `^H`) in vendor output | extra control-char strip in vendor-launch |
 | `script: invalid option` on macOS | BSD `script` argument form with Linux fallback |
 | Vendor returning gpt-5.4 deprecation warning | stale `vendors.conf` |
-| Gemini reviewer 109-byte stub or "not found" | stale model in `vendors.conf` (current live id: `gemini-3-flash`; `gemini-3-flash-preview` is gone) |
-| Gemini exits non-zero with "not running in a trusted directory" | missing `--skip-trust` in `vendors_run_gemini()` (gemini-3.x added a headless workspace-trust gate) |
+| Agy rejects `--model` | configured value is not an exact display name from `agy models`; leave `agy.model=` empty to use its configured default |
+| Agy print mode pauses for permissions | use `--yolo` only for an explicitly approved workflow; it maps to `--dangerously-skip-permissions` |
 
 ## Why this folder exists at all
 

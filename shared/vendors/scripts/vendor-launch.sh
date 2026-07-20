@@ -31,13 +31,13 @@ vendors_read_models() {
 
   VENDORS_OPENAI_MODEL=$(vendors_conf_get "$config_file" "openai.model")
   VENDORS_CLAUDE_MODEL=$(vendors_conf_get "$config_file" "claude.model")
-  VENDORS_GEMINI_MODEL=$(vendors_conf_get "$config_file" "gemini.model")
+  VENDORS_AGY_MODEL=$(vendors_conf_get "$config_file" "agy.model")
   VENDORS_CURSOR_MODEL=$(vendors_conf_get "$config_file" "cursor.model")
 
   # Backward-compatible fallback for configs created before speed was removed.
   [ -n "$VENDORS_OPENAI_MODEL" ] || VENDORS_OPENAI_MODEL=$(vendors_conf_get "$config_file" "openai.normal")
   [ -n "$VENDORS_CLAUDE_MODEL" ] || VENDORS_CLAUDE_MODEL=$(vendors_conf_get "$config_file" "claude.normal")
-  [ -n "$VENDORS_GEMINI_MODEL" ] || VENDORS_GEMINI_MODEL=$(vendors_conf_get "$config_file" "gemini.normal")
+  [ -n "$VENDORS_AGY_MODEL" ] || VENDORS_AGY_MODEL=$(vendors_conf_get "$config_file" "agy.normal")
   [ -n "$VENDORS_CURSOR_MODEL" ] || VENDORS_CURSOR_MODEL=$(vendors_conf_get "$config_file" "cursor.normal")
 }
 
@@ -55,16 +55,16 @@ vendors_normalize_vendor() {
       VENDORS_VENDOR_ID="claude"
       VENDORS_VENDOR_CLI="claude"
       ;;
-    gemini|google)
-      VENDORS_VENDOR_ID="gemini"
-      VENDORS_VENDOR_CLI="gemini"
+    agy|antigravity)
+      VENDORS_VENDOR_ID="agy"
+      VENDORS_VENDOR_CLI="agy"
       ;;
     cursor|cursor-agent|anysphere)
       VENDORS_VENDOR_ID="cursor"
       VENDORS_VENDOR_CLI="cursor-agent"
       ;;
     *)
-      printf "unknown vendor: %s (expected openai, claude, gemini, or cursor)\n" "$1" >&2
+      printf "unknown vendor: %s (expected openai, claude, agy, or cursor)\n" "$1" >&2
       return 2
       ;;
   esac
@@ -87,8 +87,8 @@ vendors_select_model() {
     claude)
       selected="$VENDORS_CLAUDE_MODEL"
       ;;
-    gemini)
-      selected="$VENDORS_GEMINI_MODEL"
+    agy)
+      selected="$VENDORS_AGY_MODEL"
       ;;
     cursor)
       selected="$VENDORS_CURSOR_MODEL"
@@ -136,7 +136,7 @@ vendors_supported_efforts() {
   case "$1" in
     openai) printf "low medium high xhigh\n" ;;
     claude) printf "low medium high xhigh max\n" ;;
-    gemini) printf "\n" ;;
+    agy) printf "\n" ;;
     cursor) printf "\n" ;;
     *)
       printf "unknown vendor %s\n" "$1" >&2
@@ -298,38 +298,6 @@ def write_usage(payload):
     usage_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def gemini_stats_total(stats):
-    models = stats.get("models", {}) if isinstance(stats, dict) else {}
-    total = 0
-    if isinstance(models, dict):
-        for model_stats in models.values():
-            if not isinstance(model_stats, dict):
-                continue
-            model_total = parse_int(model_stats.get("total_tokens"))
-            if model_total > 0:
-                total += model_total
-                continue
-            tokens = model_stats.get("tokens", {})
-            if isinstance(tokens, dict):
-                model_total = parse_int(tokens.get("total"))
-                if model_total > 0:
-                    total += model_total
-                    continue
-            roles = model_stats.get("roles", {})
-            role_total = 0
-            if isinstance(roles, dict):
-                for role_stats in roles.values():
-                    if not isinstance(role_stats, dict):
-                        continue
-                    role_tokens = role_stats.get("tokens", {})
-                    if isinstance(role_tokens, dict):
-                        role_total += parse_int(role_tokens.get("total"))
-            total += role_total
-    if total <= 0 and isinstance(stats, dict):
-        total = parse_int(stats.get("total_tokens"))
-    return total or None
-
-
 payload = {
     "provider": vendor,
     "model": model or None,
@@ -399,52 +367,6 @@ if vendor == "claude":
                 "cache_read_input_tokens": parse_int(raw_usage.get("cache_read_input_tokens")),
                 "output_tokens": parse_int(raw_usage.get("output_tokens")),
                 "raw": raw_usage,
-            })
-elif vendor == "gemini":
-    try:
-        data = json.loads(raw_out)
-    except Exception:
-        data = None
-    if not isinstance(data, dict):
-        last_result_event = None
-        delta_parts = []
-        last_full_message = None
-        for line in raw_out.splitlines():
-            candidate = line.strip()
-            if not (candidate.startswith("{") and candidate.endswith("}")):
-                continue
-            try:
-                event = json.loads(candidate)
-            except Exception:
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") == "result":
-                last_result_event = event
-                continue
-            if event.get("type") == "message" and event.get("role") == "assistant":
-                content = event.get("content")
-                if isinstance(content, str):
-                    if event.get("delta") is True:
-                        delta_parts.append(content)
-                    else:
-                        last_full_message = content
-        data = last_result_event
-        if delta_parts:
-            output.write_text("".join(delta_parts))
-        elif last_full_message is not None:
-            output.write_text(last_full_message)
-    if isinstance(data, dict):
-        if "response" in data:
-            output.write_text(str(data.get("response", "")))
-        stats = data.get("stats")
-        total = gemini_stats_total(stats)
-        if total is not None:
-            payload.update({
-                "available": True,
-                "source": "gemini_stats",
-                "total_tokens": total,
-                "raw": {"stats": stats},
             })
 elif vendor == "cursor":
     # cursor-agent --output-format stream-json emits one JSON event per line.
@@ -570,25 +492,7 @@ PY
 }
 
 vendors_output_error_reason() {
-  local vendor="$1"
-  local output_file="$2"
-
-  [ -s "$output_file" ] || return 1
-
-  case "$vendor" in
-    gemini)
-      if grep -Eqi \
-          'GaxiosError|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|rateLimitExceeded|No capacity available|Too Many Requests|Attempt [0-9]+ failed with status [0-9]+|"error"[[:space:]]*:' \
-          "$output_file" \
-          && grep -Eqi \
-          'status[[:space:]]*[:= ][[:space:]]*([45][0-9][0-9])|with status ([45][0-9][0-9])|"code"[[:space:]]*:[[:space:]]*([45][0-9][0-9])|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|rateLimitExceeded' \
-          "$output_file"; then
-        printf "vendor_error"
-        return 0
-      fi
-      ;;
-  esac
-
+  : "$1" "$2"
   return 1
 }
 
@@ -765,34 +669,22 @@ vendors_run_claude() {
   fi
 }
 
-vendors_run_gemini() {
+vendors_run_agy() {
   local prompt_file="$1"
   local output_file="$2"
   local prompt
-  local -a command=(gemini)
+  local -a command=(agy)
 
   prompt=$(cat "$prompt_file")
 
-  # Gemini gates headless runs on a workspace-trust check; without an opt-in it
-  # exits non-zero ("not running in a trusted directory") before producing any
-  # output. `--skip-trust` is the documented non-interactive bypass (equivalent
-  # to GEMINI_CLI_TRUST_WORKSPACE=true) and grants no capability beyond what the
-  # caller already implies by invoking the wrapper from their cwd — it mirrors
-  # cursor's `--trust` baseline.
-  if ! vendors_native_arg_present "--skip-trust"; then
-    command+=(--skip-trust)
-  fi
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
   fi
-  if ! vendors_native_arg_present "--output-format"; then
-    command+=(--output-format stream-json)
-  fi
   if [ "${VENDORS_YOLO:-0}" = "1" ]; then
-    command+=(--yolo)
+    command+=(--dangerously-skip-permissions)
   fi
 
-  command+=("${VENDORS_NATIVE_ARGS[@]}" --prompt "$prompt")
+  command+=("${VENDORS_NATIVE_ARGS[@]}" --print "$prompt")
 
   if [ "${VENDORS_DRY_RUN:-0}" = "1" ]; then
     vendors_run_with_redirect "$prompt_file" "$output_file" "${command[@]}"
@@ -869,7 +761,7 @@ vendors_run() {
   case "$vendor" in
     openai) vendors_run_codex "$prompt_file" "$output_file" ;;
     claude) vendors_run_claude "$prompt_file" "$output_file" ;;
-    gemini) vendors_run_gemini "$prompt_file" "$output_file" ;;
+    agy) vendors_run_agy "$prompt_file" "$output_file" ;;
     cursor) vendors_run_cursor "$prompt_file" "$output_file" ;;
     *)
       printf "unknown normalized vendor: %s\n" "$vendor" >&2

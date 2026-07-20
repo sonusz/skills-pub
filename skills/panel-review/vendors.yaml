@@ -14,10 +14,9 @@ panel:
     vendor: claude
     effort: medium
     model: claude-opus-4-8
-  - id: gemini
-    vendor: gemini
+  - id: agy
+    vendor: agy
     effort: medium
-    model: gemini-3.1-pro-preview
 
 synthesis:
   id: synthesis

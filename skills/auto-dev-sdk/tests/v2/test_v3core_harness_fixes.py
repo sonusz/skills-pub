@@ -238,7 +238,7 @@ def test_orchestrator_routes_on_disk_blocking_verdict(tmp_path):
             panel=PanelConfig(
                 reviewers=(
                     PanelReviewerSpec(vendor="claude", model="fake-panel-claude"),
-                    PanelReviewerSpec(vendor="gemini", model="fake-panel-gemini"),
+                    PanelReviewerSpec(vendor="agy", model="fake-panel-agy"),
                     PanelReviewerSpec(vendor="codex", model="fake-panel-codex"),
                 ),
                 synthesizer=PanelSynthesizerSpec(
@@ -304,7 +304,7 @@ def test_orchestrator_skips_enforcement_on_skip_gate(tmp_path):
             panel=PanelConfig(
                 reviewers=(
                     PanelReviewerSpec(vendor="claude", model="fake-panel-claude"),
-                    PanelReviewerSpec(vendor="gemini", model="fake-panel-gemini"),
+                    PanelReviewerSpec(vendor="agy", model="fake-panel-agy"),
                     PanelReviewerSpec(vendor="codex", model="fake-panel-codex"),
                 ),
                 synthesizer=PanelSynthesizerSpec(

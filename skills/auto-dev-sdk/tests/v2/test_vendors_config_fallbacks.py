@@ -29,8 +29,8 @@ stages:
 panel:
   reviewers:
     - {vendor: claude, model: claude-opus-4-8, effort: max, min_quota_pct: 25,
-       fallbacks: [{vendor: gemini, model: gemini-3.1-pro, min_quota_pct: 10}]}
-    - {vendor: gemini, model: gemini-3.1-pro, effort: max}
+       fallbacks: [{vendor: agy, model: agy-3.1-pro, min_quota_pct: 10}]}
+    - {vendor: agy, model: agy-3.1-pro, effort: max}
   synthesizer: {vendor: claude, model: claude-sonnet-4-6, effort: high, min_quota_pct: 30,
                 fallbacks: [{vendor: codex, model: gpt-5.5, min_quota_pct: 10}]}
 probe: {vendor: claude, model: claude-haiku-4-5, effort: low, min_quota_pct: 5,
@@ -44,7 +44,7 @@ def test_parses_all_roles():
     assert d.min_quota_pct == 20.0
     assert [(f.vendor, f.min_quota_pct) for f in d.fallbacks] == [("cursor", 15.0), ("codex", 10.0)]
     assert c.panel.reviewers[0].min_quota_pct == 25.0
-    assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["gemini"]
+    assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["agy"]
     assert c.panel.synthesizer.min_quota_pct == 30.0
     assert [f.vendor for f in c.panel.synthesizer.fallbacks] == ["codex"]
     assert c.probe.min_quota_pct == 5.0
@@ -62,7 +62,7 @@ def test_backward_compatible_without_quota_fields():
         panel:
           reviewers:
             - {vendor: claude, model: m}
-            - {vendor: gemini, model: m}
+            - {vendor: agy, model: m}
           synthesizer: {vendor: claude, model: m}
         probe: {vendor: claude, model: m}
         """
@@ -80,7 +80,7 @@ _BASE = (
     "panel:\n"
     "  reviewers:\n"
     "    - {{vendor: claude, model: m{rev}}}\n"
-    "    - {{vendor: gemini, model: m}}\n"
+    "    - {{vendor: agy, model: m}}\n"
     "  synthesizer: {{vendor: claude, model: m{syn}}}\n"
     "probe: {{vendor: claude, model: m}}\n"
 )
@@ -91,9 +91,9 @@ _BASE = (
     [
         (", min_quota_pct: 150", "", "", "min_quota>100"),
         (", min_quota_pct: -1", "", "", "min_quota<0"),
-        (", fallbacks: [{vendor: gemini, model: g}]", "", "", "stage fallback gemini (panel-only)"),
+        (", fallbacks: [{vendor: agy, model: g}]", "", "", "stage fallback agy (panel-only)"),
         ("", ", fallbacks: [{vendor: claude, model: m2}]", "", "reviewer same-provider fallback"),
-        ("", "", ", fallbacks: [{vendor: gemini, model: g}]", "synth fallback not schema-capable"),
+        ("", "", ", fallbacks: [{vendor: agy, model: g}]", "synth fallback not schema-capable"),
     ],
 )
 def test_rejections(design, rev, syn, why):

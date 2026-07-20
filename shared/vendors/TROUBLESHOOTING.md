@@ -67,7 +67,8 @@ The per-vendor transport is deliberately different:
 - Codex/OpenAI reads the normalized prompt from stdin and writes the final
   message with `--output-last-message`.
 - Claude runs in print mode and reads the prompt from stdin.
-- Gemini receives `--prompt` and runs with stdin redirected from `/dev/null`.
+- Agy receives `--print <prompt>` and runs with stdin redirected from
+  `/dev/null`.
 - Cursor receives the prompt as a positional argument after `--`, runs with
   `cursor-agent -p --trust --output-format stream-json`, and has stdin
   redirected from `/dev/null`. `--trust` is required because every fresh cwd
@@ -108,14 +109,14 @@ needs Claude tool controls, pass native args explicitly, for example
 `--native-arg --allowedTools --native-arg Read,Glob,Grep,LS`. Avoid Claude's
 variadic `--tools` unless you have tested the exact argv shape.
 
-### Gemini Hangs In Headless Runs
+### Agy Fails In Headless Runs
 
-Cause: Gemini can open an interactive auth/OAuth flow or wait on stdin when run
-non-interactively.
+Cause: Agy may need a one-time interactive sign-in, or a requested model name
+may not match one of the names returned by `agy models`.
 
-Fix: the launcher passes the prompt via `--prompt` and redirects stdin from
-`/dev/null`. If this regresses, `doctor.sh` or `hello-test.sh` usually fails by
-timeout rather than producing a useful error message.
+Fix: run `agy` once in a normal shell to sign in, check available model names
+with `agy models`, then run `doctor.sh --vendor agy`. The launcher deliberately
+omits `--model` when `agy.model` is empty so agy's configured default is used.
 
 ### Cursor Reports `Not authenticated` Or Hangs On First Probe
 
@@ -157,9 +158,9 @@ Cause: ordinary autonomous mode was not enough for the outer Codex agent to
 execute the nested command in this environment.
 
 Fix: nested real tests pass `--yolo` to the outer call. The shared launcher maps
-that to Codex approval bypass, Claude `bypassPermissions`, Gemini `--yolo`, or
-Cursor `--yolo`. This is only appropriate for explicit nested command-execution
-tests, not routine vendor calls.
+that to Codex approval bypass, Claude `bypassPermissions`, Agy
+`--dangerously-skip-permissions`, or Cursor `--yolo`. This is only appropriate
+for explicit nested command-execution tests, not routine vendor calls.
 
 ### Smoke Passes But Doctor Fails
 

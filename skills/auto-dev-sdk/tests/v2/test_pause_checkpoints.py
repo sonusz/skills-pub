@@ -44,7 +44,7 @@ def _vendors(tmp_path) -> VendorsConfig:
         panel=PanelConfig(
             reviewers=(
                 PanelReviewerSpec(vendor="claude", model="fake"),
-                PanelReviewerSpec(vendor="gemini", model="fake"),
+                PanelReviewerSpec(vendor="agy", model="fake"),
             ),
             synthesizer=PanelSynthesizerSpec(vendor="claude", model="fake"),
         ),

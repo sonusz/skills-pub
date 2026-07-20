@@ -137,18 +137,13 @@ else
 fi
 FAKE_CLAUDE
 
-cat > "$BIN_DIR/gemini" <<'FAKE_GEMINI'
+cat > "$BIN_DIR/agy" <<'FAKE_AGY'
 #!/usr/bin/env bash
 prompt=""
-format=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prompt|-p)
+    --print|-p)
       prompt="$2"
-      shift 2
-      ;;
-    --output-format)
-      format="${2-}"
       shift 2
       ;;
     *)
@@ -158,67 +153,11 @@ while [ "$#" -gt 0 ]; do
 done
 if printf "%s" "$prompt" | grep -qi 'single word READY'; then
   response="READY"
-elif printf "%s" "$prompt" | grep -qi 'semantic gemini error'; then
-  cat <<'OUT'
-Attempt 1 failed with status 429. Retrying with backoff... _GaxiosError: [{
-  "error": {
-    "code": 429,
-    "message": "No capacity available for model fake-gemini on the server",
-    "status": "RESOURCE_EXHAUSTED"
-  }
-}]
-OUT
-  exit 0
 else
-  response="gemini received: $prompt"
+  response="agy received: $prompt"
 fi
-if [ "$format" = "stream-json" ]; then
-  python3 - "$response" <<'PY'
-import json
-import sys
-
-response = sys.argv[1]
-print(json.dumps({"type": "init", "model": "fake-gemini"}))
-print(json.dumps({
-    "type": "message",
-    "role": "assistant",
-    "content": response,
-    "delta": True,
-}))
-print(json.dumps({
-    "type": "result",
-    "status": "success",
-    "stats": {
-        "total_tokens": 127,
-        "models": {
-            "fake-gemini": {
-                "total_tokens": 127,
-                "input_tokens": 111,
-                "output_tokens": 16,
-            }
-        },
-    },
-}))
-PY
-elif [ "$format" = "json" ]; then
-  python3 - "$response" <<'PY'
-import json
-import sys
-print(json.dumps({
-    "response": sys.argv[1],
-    "stats": {
-        "models": {
-            "fake-gemini": {
-                "tokens": {"total": 127}
-            }
-        }
-    },
-}))
-PY
-else
-  printf "%s\n" "$response"
-fi
-FAKE_GEMINI
+printf "%s\n" "$response"
+FAKE_AGY
 
 cat > "$BIN_DIR/cursor-agent" <<'FAKE_CURSOR'
 #!/usr/bin/env bash
@@ -322,22 +261,22 @@ else
 fi
 FAKE_CURSOR
 
-chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/gemini" "$BIN_DIR/cursor-agent"
+chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/agy" "$BIN_DIR/cursor-agent"
 
-for caller in openai claude gemini cursor; do
+for caller in openai claude agy cursor; do
   call_dir="$RUN_ROOT/$caller"
   mkdir -p "$call_dir"
 
   PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
     --vendor OpenAI \
     --vendor Claude \
-    --vendor Gemini \
+    --vendor Agy \
     --vendor Cursor \
-    --prompt "caller=$caller fan out to openai, claude, gemini, cursor" \
+    --prompt "caller=$caller fan out to openai, claude, agy, cursor" \
     --output-dir "$call_dir" \
     --min-success 4 >/dev/null
 
-  for vendor in openai claude gemini cursor; do
+  for vendor in openai claude agy cursor; do
     for suffix in out status usage.json; do
       file="$call_dir/$vendor/$suffix"
       if [ ! -s "$file" ]; then
@@ -371,7 +310,14 @@ for caller in openai claude gemini cursor; do
       cat "$call_dir/$vendor/status" >&2
       exit 1
     fi
-    if ! grep -q '"available": true' "$call_dir/$vendor/usage.json" \
+    if [ "$vendor" = "agy" ]; then
+      if ! grep -q '"available": false' "$call_dir/$vendor/usage.json" \
+          || ! grep -q '"total_tokens": null' "$call_dir/$vendor/usage.json"; then
+        printf "FAIL: expected unavailable token usage for %s in caller %s\n" "$vendor" "$caller" >&2
+        cat "$call_dir/$vendor/usage.json" >&2
+        exit 1
+      fi
+    elif ! grep -q '"available": true' "$call_dir/$vendor/usage.json" \
         || ! grep -q '"total_tokens":' "$call_dir/$vendor/usage.json"; then
       printf "FAIL: expected available token usage for %s in caller %s\n" "$vendor" "$caller" >&2
       cat "$call_dir/$vendor/usage.json" >&2
@@ -441,37 +387,36 @@ if ! grep -q -- '--output-format json' "$dry_dir/claude-json-output/log" \
 fi
 
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
-  --vendor Gemini \
-  --prompt "dry run gemini yolo mapping" \
+  --vendor Agy \
+  --prompt "dry run agy yolo mapping" \
   --output-dir "$dry_dir" \
-  --id gemini-yolo \
+  --id agy-yolo \
   --yolo \
   --dry-run >/dev/null
 
-if ! grep -q -- '--yolo' "$dry_dir/gemini-yolo/log"; then
-  printf "FAIL: expected Gemini yolo dry-run to use --yolo\n" >&2
-  cat "$dry_dir/gemini-yolo/log" >&2
+if ! grep -q -- '--dangerously-skip-permissions' "$dry_dir/agy-yolo/log"; then
+  printf "FAIL: expected Agy yolo dry-run to skip permission prompts\n" >&2
+  cat "$dry_dir/agy-yolo/log" >&2
   exit 1
 fi
-if ! grep -q -- '--output-format stream-json' "$dry_dir/gemini-yolo/log"; then
-  printf "FAIL: expected Gemini default dry-run to use stream-json\n" >&2
-  cat "$dry_dir/gemini-yolo/log" >&2
+if ! grep -q -- '--print' "$dry_dir/agy-yolo/log"; then
+  printf "FAIL: expected Agy default dry-run to use print mode\n" >&2
+  cat "$dry_dir/agy-yolo/log" >&2
   exit 1
 fi
 
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
-  --vendor Gemini \
-  --prompt "dry run gemini explicit json output" \
+  --vendor Agy \
+  --prompt "dry run agy plan mode" \
   --output-dir "$dry_dir" \
-  --id gemini-json-output \
-  --native-arg --output-format \
-  --native-arg json \
+  --id agy-plan-mode \
+  --native-arg --mode \
+  --native-arg plan \
   --dry-run >/dev/null
 
-if ! grep -q -- '--output-format json' "$dry_dir/gemini-json-output/log" \
-    || grep -q -- '--output-format stream-json' "$dry_dir/gemini-json-output/log"; then
-  printf "FAIL: expected explicit Gemini output-format json to suppress stream-json defaults\n" >&2
-  cat "$dry_dir/gemini-json-output/log" >&2
+if ! grep -q -- '--mode plan' "$dry_dir/agy-plan-mode/log"; then
+  printf "FAIL: expected Agy native mode args to pass through unchanged\n" >&2
+  cat "$dry_dir/agy-plan-mode/log" >&2
   exit 1
 fi
 
@@ -523,7 +468,7 @@ expected_effort() {
     Claude:high) printf "high\n" ;;
     Claude:xhigh) printf "xhigh\n" ;;
     Claude:max) printf "max\n" ;;
-    Gemini:*) printf "<default>\n" ;;
+    Agy:*) printf "<default>\n" ;;
     Cursor:*) printf "<default>\n" ;;
     *) printf "unknown\n" ;;
   esac
@@ -533,7 +478,7 @@ lower() {
   printf "%s" "$1" | tr '[:upper:]' '[:lower:]'
 }
 
-for effort_vendor in OpenAI Claude Gemini Cursor; do
+for effort_vendor in OpenAI Claude Agy Cursor; do
   for effort in min low medium high xhigh max; do
     effort_id="effort-$(lower "$effort_vendor")-$effort"
     PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
@@ -553,26 +498,6 @@ for effort_vendor in OpenAI Claude Gemini Cursor; do
     fi
   done
 done
-
-gemini_error_dir="$RUN_ROOT/gemini-semantic-error"
-mkdir -p "$gemini_error_dir"
-if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
-    --vendor Gemini \
-    --prompt "semantic gemini error" \
-    --output-dir "$gemini_error_dir" \
-    --id gemini-error \
-    --min-success 1 >/dev/null 2>&1; then
-  printf "FAIL: expected Gemini semantic error output to fail even with CLI exit 0\n" >&2
-  cat "$gemini_error_dir/gemini-error/out" >&2
-  exit 1
-fi
-
-if ! grep -q '^exit_code=1$' "$gemini_error_dir/gemini-error/status" \
-    || ! grep -q '^reason=vendor_error$' "$gemini_error_dir/gemini-error/status"; then
-  printf "FAIL: expected Gemini semantic error status to record vendor_error\n" >&2
-  cat "$gemini_error_dir/gemini-error/status" >&2
-  exit 1
-fi
 
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
   --vendor Claude \
@@ -654,6 +579,26 @@ fi
 if ! grep -q -- '--schema-file is not supported on cursor' "$cursor_schema_log"; then
   printf "FAIL: expected Cursor schema rejection message\n" >&2
   cat "$cursor_schema_log" >&2
+  exit 1
+fi
+
+agy_schema_dir="$RUN_ROOT/agy-schema-rejected"
+mkdir -p "$agy_schema_dir"
+agy_schema_log="$WORK/agy-schema-reject.log"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Agy \
+    --prompt "schema rejection probe" \
+    --schema-file "$schema_file" \
+    --output-dir "$agy_schema_dir" \
+    --id agy-schema \
+    --min-success 1 >"$agy_schema_log" 2>&1; then
+  printf "FAIL: expected --schema-file with Agy to be rejected\n" >&2
+  cat "$agy_schema_log" >&2
+  exit 1
+fi
+if ! grep -q -- '--schema-file is not supported on agy' "$agy_schema_log"; then
+  printf "FAIL: expected Agy schema rejection message\n" >&2
+  cat "$agy_schema_log" >&2
   exit 1
 fi
 

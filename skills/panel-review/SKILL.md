@@ -111,9 +111,9 @@ Default repo-discovery mode drives `shared/vendors/scripts/call.sh` with
 `--cwd <repo/source>` and `--yolo` for each panel vendor. The shared wrapper
 maps that access per vendor: Codex gets
 `--dangerously-bypass-approvals-and-sandbox`, Claude gets
-`--permission-mode bypassPermissions`, and Gemini gets `--yolo`. `--cwd` is
-honored by Codex via `--cd` and by Claude/Gemini through the wrapper's cwd
-execution.
+`--permission-mode bypassPermissions`, and Agy gets
+`--dangerously-skip-permissions`. `--cwd` is honored by Codex via `--cd` and by
+Claude/Agy through the wrapper's cwd execution.
 
 In repo mode, keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
 rejects in-worktree output dirs, then records git status/diff snapshots under

@@ -10,7 +10,7 @@ TIMEOUT="120"
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/llm-test.sh [--vendor claude|openai|codex|gemini] [--model MODEL] [--timeout SECONDS]
+  scripts/llm-test.sh [--vendor claude|openai|codex|agy] [--model MODEL] [--timeout SECONDS]
 
 Runs one real model call through auto-dev-sdk's Python adapter and the packaged
 shared/vendors module. Success means the call returned any non-empty output.
@@ -81,8 +81,8 @@ def read_only_native_args(name: str) -> tuple[str, ...]:
         return ("--sandbox", "read-only")
     if normalized in {"claude", "anthropic"}:
         return ("--allowedTools", "Read")
-    if normalized in {"gemini", "google"}:
-        return ("--approval-mode", "plan")
+    if normalized in {"agy", "antigravity"}:
+        return ("--mode", "plan")
     return ()
 
 
