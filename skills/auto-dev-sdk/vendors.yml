@@ -69,8 +69,9 @@ panel:
     - vendor: claude
       model: opus
       effort: max
-    # Agy: independent second CLI run, using its configured default model.
+    # Agy: independent Gemini-backed reviewer for divergence signal.
     - vendor: agy
+      model: gemini-3.6-flash-high
       effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
