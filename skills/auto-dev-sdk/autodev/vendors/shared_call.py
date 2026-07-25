@@ -2,7 +2,8 @@
 
 auto-dev-sdk keeps its v2 `vendors.yml` vocabulary (`codex` for the
 OpenAI/Codex CLI), while the shared module exposes the stable
-`openai|claude|agy` interface and the `<id>/out,status,log` contract.
+`openai|claude|agy|cursor|grok` interface and the
+`<id>/out,status,log` contract.
 This file is the only place that should know how to bridge those details.
 """
 from __future__ import annotations
@@ -53,6 +54,8 @@ def normalize_shared_vendor(vendor: str) -> str:
         return "agy"
     if raw in {"cursor", "cursor-agent", "anysphere"}:
         return "cursor"
+    if raw in {"grok", "xai"}:
+        return "grok"
     raise ValueError(f"unknown vendor: {vendor!r}")
 
 

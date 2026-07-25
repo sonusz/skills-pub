@@ -7,7 +7,7 @@
 # `--vendors-yml`, `AUTODEV_VENDORS_YML`, or a legacy repo-root vendors.yml.
 #
 # Required: `stages` mapping with every coding stage below.
-# Allowed coding vendors: claude, codex, openai. Agy is panel-review-only.
+# Allowed coding vendors: claude, codex, openai. Agy and Grok are panel-review-only.
 # Vendor labels are case-insensitive and normalized to lowercase.
 # `codex` and `openai` both route through the Codex CLI.
 # `probe_interval_sec` (per stage) is the idle threshold for the
@@ -69,9 +69,9 @@ panel:
     - vendor: claude
       model: opus
       effort: max
-    # Agy: independent Gemini-backed reviewer for divergence signal.
-    - vendor: agy
-      model: gemini-3.6-flash-high
+    # Grok: independent xAI-backed reviewer for divergence signal.
+    - vendor: grok
+      model: grok-4.5
       effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex

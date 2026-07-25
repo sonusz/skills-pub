@@ -3,7 +3,7 @@
 Flow:
   1. Compose per-reviewer prompt (gate-specific review-<gate>.md +
      file manifest with paths + hashes for the artifact and consulted docs).
-  2. Dispatch the configured reviewers (claude / agy / codex/openai, per
+  2. Dispatch the configured reviewers (claude / grok / codex/openai, per
      vendors.yml panel config) in parallel.
   3. Invoke the configured synthesizer with the three reviewer
      outputs under a pinned synthesize.md prompt and the pinned JSON

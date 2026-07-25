@@ -134,6 +134,8 @@ def test_reviewer_vendor_labels_route_through_shared_vendors():
     assert normalize_shared_vendor("Claude") == "claude"
     assert normalize_shared_vendor("agy") == "agy"
     assert normalize_shared_vendor("Antigravity") == "agy"
+    assert normalize_shared_vendor("grok") == "grok"
+    assert normalize_shared_vendor("XAI") == "grok"
     assert normalize_shared_vendor("codex") == "openai"
     assert cli_name_for_vendor("openai") == "codex"
 

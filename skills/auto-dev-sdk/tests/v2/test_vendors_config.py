@@ -27,7 +27,7 @@ def _happy_panel():
     return {
         "reviewers": [
             {"vendor": "claude", "model": "fake-panel-claude"},
-            {"vendor": "agy", "model": "fake-panel-agy"},
+            {"vendor": "grok", "model": "fake-panel-grok"},
             {"vendor": "codex", "model": "fake-panel-codex"},
         ],
         "synthesizer": {"vendor": "claude", "model": "fake-panel-synth"},
@@ -77,7 +77,7 @@ def test_vendor_labels_are_case_insensitive(tmp_path):
 
 def test_agy_reviewer_may_use_cli_default_model(tmp_path):
     panel = _happy_panel()
-    del panel["reviewers"][1]["model"]
+    panel["reviewers"][1] = {"vendor": "agy"}
     cfg = load_vendors_config(
         _write(tmp_path, _yaml_dump(_happy_doc(panel=panel)))
     )
