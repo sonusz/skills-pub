@@ -33,12 +33,14 @@ vendors_read_models() {
   VENDORS_CLAUDE_MODEL=$(vendors_conf_get "$config_file" "claude.model")
   VENDORS_AGY_MODEL=$(vendors_conf_get "$config_file" "agy.model")
   VENDORS_CURSOR_MODEL=$(vendors_conf_get "$config_file" "cursor.model")
+  VENDORS_GROK_MODEL=$(vendors_conf_get "$config_file" "grok.model")
 
   # Backward-compatible fallback for configs created before speed was removed.
   [ -n "$VENDORS_OPENAI_MODEL" ] || VENDORS_OPENAI_MODEL=$(vendors_conf_get "$config_file" "openai.normal")
   [ -n "$VENDORS_CLAUDE_MODEL" ] || VENDORS_CLAUDE_MODEL=$(vendors_conf_get "$config_file" "claude.normal")
   [ -n "$VENDORS_AGY_MODEL" ] || VENDORS_AGY_MODEL=$(vendors_conf_get "$config_file" "agy.normal")
   [ -n "$VENDORS_CURSOR_MODEL" ] || VENDORS_CURSOR_MODEL=$(vendors_conf_get "$config_file" "cursor.normal")
+  [ -n "$VENDORS_GROK_MODEL" ] || VENDORS_GROK_MODEL=$(vendors_conf_get "$config_file" "grok.normal")
 }
 
 vendors_normalize_vendor() {
@@ -63,8 +65,12 @@ vendors_normalize_vendor() {
       VENDORS_VENDOR_ID="cursor"
       VENDORS_VENDOR_CLI="cursor-agent"
       ;;
+    grok|xai)
+      VENDORS_VENDOR_ID="grok"
+      VENDORS_VENDOR_CLI="grok"
+      ;;
     *)
-      printf "unknown vendor: %s (expected openai, claude, agy, or cursor)\n" "$1" >&2
+      printf "unknown vendor: %s (expected openai, claude, agy, cursor, or grok)\n" "$1" >&2
       return 2
       ;;
   esac
@@ -92,6 +98,9 @@ vendors_select_model() {
       ;;
     cursor)
       selected="$VENDORS_CURSOR_MODEL"
+      ;;
+    grok)
+      selected="$VENDORS_GROK_MODEL"
       ;;
     *)
       printf "unknown normalized vendor: %s\n" "$vendor" >&2
@@ -138,6 +147,7 @@ vendors_supported_efforts() {
     claude) printf "low medium high xhigh max\n" ;;
     agy) printf "\n" ;;
     cursor) printf "\n" ;;
+    grok) printf "low medium high\n" ;;
     *)
       printf "unknown vendor %s\n" "$1" >&2
       return 2
@@ -249,6 +259,12 @@ vendors_collect_usage() {
 
   py=$(vendors_python)
   if [ -z "$py" ]; then
+    if [ "$vendor" = "grok" ]; then
+      mkdir -p "$(dirname "$usage_file")"
+      printf '%s\n' \
+        '{"available":false,"provider":"grok","total_tokens":null,"reason":"python3 or python is required for Grok streaming JSON normalization"}' \
+        > "$usage_file"
+    fi
     return 0
   fi
 
@@ -366,6 +382,53 @@ if vendor == "claude":
                 "cache_creation_input_tokens": parse_int(raw_usage.get("cache_creation_input_tokens")),
                 "cache_read_input_tokens": parse_int(raw_usage.get("cache_read_input_tokens")),
                 "output_tokens": parse_int(raw_usage.get("output_tokens")),
+                "raw": raw_usage,
+            })
+elif vendor == "grok":
+    # Grok Build --output-format streaming-json emits NDJSON `text`,
+    # `thought`, and terminal `end` events. Keep that protocol transcript in
+    # `stream`, while exposing only concatenated final text (or the shared
+    # structured-output envelope) through `out`.
+    try:
+        lines = transcript.read_text(errors="replace").splitlines() if transcript.exists() else []
+    except OSError:
+        lines = []
+    text_parts = []
+    end_event = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "text" and isinstance(event.get("data"), str):
+            text_parts.append(event["data"])
+        elif event.get("type") == "end":
+            end_event = event
+    if schema_file and isinstance(end_event, dict) and "structuredOutput" in end_event:
+        output.write_text(json.dumps({
+            "structured_output": end_event.get("structuredOutput")
+        }))
+    elif text_parts:
+        output.write_text("".join(text_parts))
+    if isinstance(end_event, dict):
+        raw_usage = end_event.get("usage")
+        if isinstance(raw_usage, dict):
+            input_tokens = parse_int(raw_usage.get("input_tokens"))
+            cache_read_tokens = parse_int(raw_usage.get("cache_read_input_tokens"))
+            output_tokens = parse_int(raw_usage.get("output_tokens"))
+            total = parse_int(raw_usage.get("total_tokens"))
+            if total <= 0:
+                total = input_tokens + cache_read_tokens + output_tokens
+            payload.update({
+                "available": total > 0,
+                "source": "grok_jsonl",
+                "total_tokens": total or None,
+                "input_tokens": input_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": parse_int(raw_usage.get("reasoning_tokens")),
                 "raw": raw_usage,
             })
 elif vendor == "cursor":
@@ -492,8 +555,59 @@ PY
 }
 
 vendors_output_error_reason() {
-  : "$1" "$2"
-  return 1
+  local vendor="$1"
+  local output_file="$2"
+  local transcript_file="${VENDORS_TRANSCRIPT_FILE:-$output_file}"
+  local py
+
+  [ "$vendor" = "grok" ] || return 1
+  py=$(vendors_python)
+  [ -n "$py" ] || return 1
+
+  "$py" - "$transcript_file" "${VENDORS_SCHEMA_FILE:-}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+transcript_path, schema_file = sys.argv[1:3]
+try:
+    lines = Path(transcript_path).read_text(errors="replace").splitlines()
+except OSError:
+    lines = []
+events = []
+for line in lines:
+    try:
+        event = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(event, dict):
+        events.append(event)
+for event in events:
+    if event.get("type") == "error":
+        print("Grok error: " + str(event.get("message") or "unspecified error"))
+        raise SystemExit(0)
+end = next((event for event in reversed(events) if event.get("type") == "end"), None)
+if end is None:
+    print("Grok streaming JSON ended without an end event")
+    raise SystemExit(0)
+if schema_file:
+    error = end.get("structuredOutputError")
+    if error:
+        print("Grok structured output failed: " + str(error))
+        raise SystemExit(0)
+    if "structuredOutput" not in end:
+        print("Grok structured output failed: end event omitted structuredOutput")
+        raise SystemExit(0)
+elif not any(
+    event.get("type") == "text"
+    and isinstance(event.get("data"), str)
+    and event.get("data")
+    for event in events
+):
+    print("Grok streaming JSON ended without response text")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 vendors_run_with_redirect() {
@@ -753,6 +867,59 @@ vendors_run_cursor() {
   fi
 }
 
+vendors_run_grok() {
+  local prompt_file="$1"
+  local output_file="$2"
+  local transcript_file="${VENDORS_TRANSCRIPT_FILE:-$output_file.grok-jsonl}"
+  local py
+  local -a command=(grok --output-format streaming-json)
+
+  if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
+    command+=(--model "$VENDORS_RESOLVED_MODEL")
+  fi
+  if [ -n "${VENDORS_RESOLVED_EFFORT:-}" ]; then
+    command+=(--reasoning-effort "$VENDORS_RESOLVED_EFFORT")
+  fi
+  if [ -n "${VENDORS_CWD:-}" ]; then
+    command+=(--cwd "$VENDORS_CWD")
+  fi
+  if [ "${VENDORS_YOLO:-0}" = "1" ]; then
+    command+=(--yolo)
+  fi
+  if [ -n "${VENDORS_SCHEMA_FILE:-}" ] \
+      && ! vendors_native_arg_present "--json-schema"; then
+    command+=(--json-schema "$(cat "$VENDORS_SCHEMA_FILE")")
+  fi
+
+  command+=("${VENDORS_NATIVE_ARGS[@]}" --prompt-file "$prompt_file")
+
+  if [ "${VENDORS_DRY_RUN:-0}" = "1" ]; then
+    vendors_run_with_redirect "$prompt_file" "$output_file" "${command[@]}"
+    printf "transcript_file=%s\n" "$transcript_file"
+    return 0
+  fi
+
+  py=$(vendors_python)
+  if [ -z "$py" ]; then
+    printf "Grok vendor requires python3 or python for streaming JSON normalization; refusing native invocation\n" >&2
+    return 69
+  fi
+
+  if [ "${#VENDORS_ENV[@]}" -gt 0 ]; then
+    if [ -n "${VENDORS_CWD:-}" ]; then
+      ( cd "$VENDORS_CWD" && env "${VENDORS_ENV[@]}" "${command[@]}" < /dev/null ) > "$transcript_file" 2>&1
+    else
+      env "${VENDORS_ENV[@]}" "${command[@]}" < /dev/null > "$transcript_file" 2>&1
+    fi
+  else
+    if [ -n "${VENDORS_CWD:-}" ]; then
+      ( cd "$VENDORS_CWD" && "${command[@]}" < /dev/null ) > "$transcript_file" 2>&1
+    else
+      "${command[@]}" < /dev/null > "$transcript_file" 2>&1
+    fi
+  fi
+}
+
 vendors_run() {
   local vendor="$1"
   local prompt_file="$2"
@@ -763,6 +930,7 @@ vendors_run() {
     claude) vendors_run_claude "$prompt_file" "$output_file" ;;
     agy) vendors_run_agy "$prompt_file" "$output_file" ;;
     cursor) vendors_run_cursor "$prompt_file" "$output_file" ;;
+    grok) vendors_run_grok "$prompt_file" "$output_file" ;;
     *)
       printf "unknown normalized vendor: %s\n" "$vendor" >&2
       return 2

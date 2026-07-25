@@ -1,135 +1,106 @@
 # Vendors module — maintainer notes
 
-This folder is the canonical home of the `shared/vendors` module
-shared across skills (auto-dev-sdk, alpha-miner-sdk, panel-review,
-others). The module wraps Claude / Codex / Agy CLIs behind a
-uniform `call.sh` + `vendor-launch.sh` interface so callers do not
-have to know vendor-specific argument shapes.
+`shared/vendors` is the only canonical vendors module in this repository. It
+wraps the Codex, Claude, Agy, Cursor, and official Grok Build CLIs behind the
+uniform `scripts/call.sh` and `scripts/vendor-launch.sh` interface.
 
-## Where this code actually runs
+## Repository layout
 
-The live `autodev` CLI resolves `shared/vendors` via
-`SDK_ROOT / "shared" / "vendors"` in `autodev/vendors/shared_call.py`.
-In this repo, skill-local `shared` folders are symlinks to the repo-level
-`shared/` directory, so `shared/vendors` is the canonical source of truth
-for panel-review, feature-spec, and auto-dev-sdk.
+Five committed skill consumers use relative symlinks to the canonical module:
 
-## Known divergence (snapshot 2026-04-30)
-
-The two copies have drifted because fixes were applied in different
-repos and never fully cross-ported. Keep this list in sync with
-reality whenever a patch is applied.
-
-### Fixes in `Downloads/shared/vendors/` only (NOT in auto-dev-sdk)
-
-These are needed for **macOS compatibility** and **input
-robustness**. They should be ported into `auto-dev-sdk/shared/`.
-
-| Patch | Location | Symptom this fixes |
+| Consumer | Committed path | Required link target |
 |---|---|---|
-| `vendors_lower()` portable helper + replace `${var,,}` | `vendor-launch.sh`, `call.sh` | macOS ships bash 3.2; `${var,,}` is bash 4+ → unbound variable / syntax error on macOS |
-| `script -q /dev/null <file>` BSD form with Linux fallback | `vendor-launch.sh` | macOS `script` uses different argument syntax than util-linux `script`; running on Linux without fallback breaks |
-| Strip extra control chars (`\004` EOT, `\010` BS) | `vendor-launch.sh` | macOS `script` injects EOT/BS bytes into transcript; otherwise vendor JSON parsing chokes |
-| Line-by-line JSON extraction fallback | `vendor-launch.sh` | When vendor stdout is a mix of log lines + JSON (newer Claude / Codex versions print progress lines first), bare `json.loads(raw_out)` fails; Downloads scans lines in reverse for the last `{...}` line |
-| `set -eo pipefail` (drop `-u`) | `call.sh` | bash 3.2 + complex array indexing false-flags as unbound — relaxing nounset is a known macOS-compat workaround |
-| Manual array counting instead of `declare -A` | `call.sh` | Bash 3.2 has no associative arrays |
+| auto-dev-sdk | `skills/auto-dev-sdk/shared/vendors` | `../../../shared/vendors` |
+| feature-spec | `skills/feature-spec/shared/vendors` | `../../../shared/vendors` |
+| multi-lens-review | `skills/multi-lens-review/shared/vendors` | `../../../shared/vendors` |
+| panel-review | `skills/panel-review/shared/vendors` | `../../../shared/vendors` |
+| pr-review | `skills/pr-review/shared/vendors` | `../../../shared/vendors` |
 
-### Fixes in `auto-dev-sdk/shared/vendors/` only (NOT in Downloads)
+Do not replace these links with regular-file copies and do not hand-copy changes
+between skill directories. Editing `shared/vendors` updates every in-repository
+consumer through the same canonical files.
 
-These were applied as part of harness debugging and need to be
-back-ported to this canonical folder.
+## Validate links and packaging
 
-| Patch | Location | Symptom this fixes |
-|---|---|---|
-| `vendors.conf` model defaults, including an empty `agy.model` to use agy's configured default | `vendors.conf` | Avoids pinning a display-name model that may not exist on every Agy account |
+Run this audit after changing the module:
 
-### Recently ported to Downloads (now in both)
-
-| Patch | Ported on | Notes |
-|---|---|---|
-| `structured_output` envelope preservation when `--json-schema` is passed (`vendor-launch.sh`) | 2026-04-30 | Coexists with the line-by-line JSON extraction fallback already in Downloads — both run on the same `data` dict |
-| Unified `--schema-file` shared option in `call.sh` + codex envelope wrap in `vendor-launch.sh` | 2026-04-30 | Replaces vendor-specific `--json-schema`/`--output-schema` plumbing at call sites. Output is `{"structured_output": <obj>}` for both `claude` and `openai`; `agy` is rejected (no native schema enforcement). Auto-dev-sdk synth no longer pinned to claude. |
-
-### Other observed file diffs
-
-`README.md`, `TROUBLESHOOTING.md`, `doctor.sh`, `hello-test.sh`,
-`nested-test.sh`, `smoke-test.sh` also differ — those are mostly
-the `vendors_lower()` / bash-3.2 form propagated through helper
-scripts. Same root cause (macOS-compat).
-
-## Sync direction
-
-The right end-state is **full unification both ways** — every
-divergence above is a real fix that the other side should adopt.
-Quick recipe (run from `auto-dev-sdk/`):
-
-```sh
-# 1. Capture diffs as patches first (don't blind-overwrite).
-diff -ruN \
+```bash
+canonical=$(cd shared/vendors && pwd -P)
+for link in \
   skills/auto-dev-sdk/shared/vendors \
-  shared/vendors > /tmp/vendors-diff.patch
+  skills/feature-spec/shared/vendors \
+  skills/multi-lens-review/shared/vendors \
+  skills/panel-review/shared/vendors \
+  skills/pr-review/shared/vendors
+do
+  test -L "$link"
+  test "$(readlink "$link")" = "../../../shared/vendors"
+  test "$(cd "$link" && pwd -P)" = "$canonical"
+done
 
-# 2. Hand-apply each hunk, choosing the macOS-compat form for shell
-#    constructs and the structured_output / current-model form for
-#    behavior + config. Both sides must end up with both fixes.
-
-# 3. Run the test scripts to confirm:
-bash shared/vendors/scripts/doctor.sh
-bash shared/vendors/scripts/smoke-test.sh
-
-# 4. Copy unified result to the other location. NEVER blind-rsync —
-#    always confirm both sides have all known fixes first.
+# The repository should have one regular-file vendors tree: the canonical one.
+find . -type f -path '*/shared/vendors/*' -print | sort
 ```
 
-Do NOT cron a one-way `rsync` between these two folders. That has
-caused regressions before (whichever side gets overwritten loses
-its fixes).
+Installers, archives, caches, or deployed skill packages may dereference the
+symlink and contain regular files. Those are packaging artifacts outside the
+canonical repository layout. Regenerate them through their packaging workflow;
+never treat an installed copy, Downloads folder, cache, or generated archive as
+a source to sync back into this repository.
 
-## Verifying a patch is in place
+## Required validation
 
-Quick spot-checks for the most load-bearing fixes:
+The module is intentionally compatible with the macOS system Bash 3.2. Run:
 
-```sh
-# structured_output preservation present?
-grep -q 'structured_output' shared/vendors/scripts/vendor-launch.sh && echo OK
-
-# unified --schema-file option present?
-grep -q 'VENDORS_SCHEMA_FILE' shared/vendors/scripts/call.sh && echo OK
-
-# macOS bash-3.2 helper present?
-grep -q 'vendors_lower' shared/vendors/scripts/vendor-launch.sh && echo OK
-
-# vendors.conf models current?
-grep -E 'openai.model=gpt-5\.5|agy.model=' shared/vendors/vendors.conf
+```bash
+for script in shared/vendors/scripts/*.sh; do
+  /bin/bash -n "$script"
+done
+/bin/bash shared/vendors/scripts/smoke-test.sh
+git diff --check -- shared/vendors
 ```
 
-## Common bug signatures and the fix that covers each
+The smoke test uses fake CLIs and must not spend real model calls. Use
+`doctor.sh`, `hello-test.sh`, and guarded `nested-test.sh` only when the relevant
+real integration is intentionally being tested.
 
-When a vendor call misbehaves, match the symptom against this
-table before chasing it from scratch:
+## Load-bearing implementation details
 
-| Symptom | Likely missing fix |
+- Use `vendors_lower()` instead of Bash 4 `${var,,}` syntax.
+- Avoid associative arrays; macOS Bash 3.2 does not support them.
+- Keep `set -eo pipefail` in `call.sh`; nounset has caused false failures with
+  the module's Bash 3.2 array handling.
+- Preserve the BSD `script -q /dev/null <runner>` path and Linux fallback for
+  Claude PTY execution.
+- Strip PTY control bytes before parsing JSON.
+- Preserve line-by-line JSON extraction for CLIs that mix progress text with
+  JSON.
+- Keep `--schema-file` normalization and the common
+  `{"structured_output": <object>}` envelope.
+- Grok must have `python3` or `python` before native invocation because final
+  text, schema, protocol errors, and usage are derived from streaming JSON.
+  Missing Python must leave a valid unavailable `usage.json`.
+- Keep raw Grok NDJSON in `stream`; expose only normalized final text or the
+  structured-output envelope in `out`.
+
+## Common bug signatures
+
+| Symptom | Likely cause or required fix |
 |---|---|
-| Panel synthesizer reads 0-byte input → "synth failed: empty" | `structured_output` envelope preservation |
-| `unbound variable` / `${1,,}: bad substitution` in vendor-launch | `vendors_lower()` macOS-compat helpers |
-| Vendor call JSON parse error on log-noisy stdout | line-by-line JSON extraction fallback |
-| Stray binary chars (`^D`, `^H`) in vendor output | extra control-char strip in vendor-launch |
-| `script: invalid option` on macOS | BSD `script` argument form with Linux fallback |
-| Vendor returning gpt-5.4 deprecation warning | stale `vendors.conf` |
-| Agy rejects `--model` | configured value is not an exact display name from `agy models`; leave `agy.model=` empty to use its configured default |
-| Agy print mode pauses for permissions | use `--yolo` only for an explicitly approved workflow; it maps to `--dangerously-skip-permissions` |
+| `${1,,}: bad substitution` or an unbound array failure | Bash 4 syntax or nounset was introduced; restore the Bash 3.2-compatible form |
+| `script: invalid option` | The BSD/Linux PTY fallback was removed or reordered |
+| Stray `^D` or `^H` bytes | PTY control-character cleanup is missing |
+| JSON parsing fails after progress lines | The line-by-line JSON extraction fallback is missing |
+| Synthesizer reads empty schema output | The normalized `structured_output` envelope was lost |
+| Agy rejects `--model` | The configured value is not an exact available display name; leave `agy.model=` empty to use its configured default |
+| Cursor blocks on workspace trust | The headless `--trust` default is missing |
+| Grok `out` contains NDJSON control frames | The Grok transcript normalizer was bypassed |
+| Grok exits zero but produces no final text | Require a non-empty `text` event unless native structured output was requested |
+| Grok schema succeeds without an envelope | Treat `structuredOutputError` or missing `structuredOutput` as failure |
+| Grok has no Python interpreter | Fail before invoking `grok` and write unavailable Grok usage metadata |
 
-## Why this folder exists at all
+## Maintaining this file
 
-`shared/vendors` is reused across skills that should not depend on
-each other. Keeping a canonical copy outside any single skill
-repo makes the dependency graph explicit (each skill consumes
-`shared/vendors` rather than the skill-tree being a circular mesh).
-But once a skill (auto-dev-sdk) is installed and starts loading the
-module from inside its own tree, the canonical copy can drift if
-nobody bothers to back-port. This file exists so that drift is
-visible and fixable rather than rediscovered every six weeks.
-
-Update this file whenever a vendor patch is applied. Stale notes
-are worse than no notes — if you fix a bug, list it in the relevant
-"in X only" table above (or, after porting, remove from both).
+Update these notes when the canonical module layout, consumer symlink list, or a
+load-bearing compatibility rule changes. Historical external copies are useful
+only as debugging evidence; they are never canonical repository peers.

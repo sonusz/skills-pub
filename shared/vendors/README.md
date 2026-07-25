@@ -10,12 +10,12 @@ The stable module entrypoints are:
   vendors in parallel.
 - `scripts/doctor.sh` for readiness checks and retained diagnostics on failure.
 - `scripts/smoke-test.sh` for a fake-CLI regression test that makes one
-  four-vendor fan-out call per caller (fake `codex`, `claude`, `agy`, and
-  `cursor-agent` binaries are generated under a temp dir).
+  five-vendor fan-out call per caller (fake `codex`, `claude`, `agy`,
+  `cursor-agent`, and `grok` binaries are generated under a temp dir).
 - `scripts/hello-test.sh` for a real vendor call test that asks each selected
   LLM `Who are you?` and verifies non-error output.
-- `scripts/nested-test.sh` for a real nested integration test where each outer
-  vendor is asked to run a three-vendor inner `call.sh`.
+- `scripts/nested-test.sh` for a guarded real nested integration test where
+  each selected outer vendor is asked to run the selected inner `call.sh`.
 - `vendors.conf` for default model mapping.
 - `TROUBLESHOOTING.md` for reusable vendor and caller debugging notes.
 
@@ -39,10 +39,12 @@ Supported vendors:
 - `claude` maps to the local `claude` CLI.
 - `agy` maps to the local `agy` CLI.
 - `cursor` maps to the local `cursor-agent` CLI.
+- `grok` and `xai` map to the official local Grok Build `grok` CLI.
 
 Common arguments:
 
-- `--vendor openai|claude|agy|cursor` (required, repeatable)
+- `--vendor openai|claude|agy|cursor|grok` (required, repeatable; `xai` is a
+  Grok alias)
 - `--effort min|low|medium|high|xhigh|max` (optional, best effort)
 - `--prompt TEXT`, `--prompt-file FILE`, positional prompt text, or stdin
 - `--system TEXT` / `--system-file FILE`
@@ -62,9 +64,9 @@ Common arguments:
 - `--env NAME=VALUE` for per-call environment overrides
 - `--schema-file FILE` to constrain the response to a JSON Schema. Output lands
   at `<output-dir>/<id>/out` as `{"structured_output": <conforming-object>}`
-  for both supported vendors. Supported on `claude` and `openai` (codex);
-  `agy` and `cursor` are rejected because their CLIs have no native schema
-  enforcement.
+  for every supported schema vendor. Supported on `claude`, `openai` (codex),
+  and `grok`; `agy` and `cursor` are rejected because their CLIs have no native
+  schema enforcement.
 
 `model`, `effort`, and `yolo` are the only vendor behavior abstractions. Prompt
 transport, output files, timeouts, context inlining, cwd, and environment
@@ -81,6 +83,7 @@ vendor CLI behavior must be passed explicitly with `--native-arg`.
 | Claude | `--permission-mode bypassPermissions` |
 | Agy | `--dangerously-skip-permissions` |
 | Cursor | `--yolo` (alias of `--force`) |
+| Grok Build | `--yolo` (alias of `--always-approve`) |
 
 ## Effort Mapping
 
@@ -88,18 +91,20 @@ Effort is a shared ordered scale: `min < low < medium < high < xhigh < max`.
 Each vendor receives the exact value when it supports it. Otherwise the module
 selects the nearest stronger supported effort; if no stronger value exists, it
 selects the nearest weaker supported effort. Agy and Cursor currently have
-no native effort knob, so any effort hint maps to their default behavior; pick
+no native effort knob, so any effort hint maps to their default behavior. Grok
+supports `low`, `medium`, and `high` through `--reasoning-effort`; the generic
+nearest-effort mapping sends `min` to `low` and `xhigh`/`max` to `high`. Pick
 a model variant in `vendors.conf` (e.g. `cursor.model=...-thinking`) when you
 need stronger reasoning from those vendors.
 
-| Input | OpenAI/Codex | Claude | Agy | Cursor |
-|-------|--------------|--------|--------|--------|
-| `min` | `low` | `low` | default | default |
-| `low` | `low` | `low` | default | default |
-| `medium` | `medium` | `medium` | default | default |
-| `high` | `high` | `high` | default | default |
-| `xhigh` | `xhigh` | `xhigh` | default | default |
-| `max` | `xhigh` | `max` | default | default |
+| Input | OpenAI/Codex | Claude | Agy | Cursor | Grok |
+|-------|--------------|--------|-----|--------|------|
+| `min` | `low` | `low` | default | default | `low` |
+| `low` | `low` | `low` | default | default | `low` |
+| `medium` | `medium` | `medium` | default | default | `medium` |
+| `high` | `high` | `high` | default | default | `high` |
+| `xhigh` | `xhigh` | `xhigh` | default | default | `high` |
+| `max` | `xhigh` | `max` | default | default | `high` |
 
 ## Native Args
 
@@ -176,6 +181,23 @@ Agy examples:
   --output-dir "$RUN_DIR"
 ```
 
+Grok Build example:
+
+```bash
+"$VENDORS/scripts/call.sh" \
+  --vendor xai \
+  --model grok-4.5 \
+  --effort medium \
+  --schema-file "$schema_path" \
+  --prompt-file "$prompt_file" \
+  --output-dir "$RUN_DIR"
+```
+
+The launcher uses headless `--prompt-file` transport and
+`--output-format streaming-json` by default. It retains the NDJSON protocol as
+`stream`, concatenates only `text` events into `out`, and extracts the terminal
+`end.usage` object into `usage.json`.
+
 ## Schema-Constrained Output
 
 Pass `--schema-file <path>` to force the model's response to conform to a
@@ -187,12 +209,13 @@ branch on vendor:
 |--------|------------------|-------|
 | `claude` | `--json-schema "$(cat …)"` | Schema inlined as JSON |
 | `openai` (codex) | `--output-schema <path>` | File path passed through |
+| `grok` | `--json-schema "$(cat …)"` | Native Grok schema enforcement |
 | `agy` | (rejected) | CLI has no native schema enforcement |
 | `cursor` | (rejected) | CLI has no native schema enforcement |
 
 `<output-dir>/<id>/out` always contains `{"structured_output": <obj>}` —
 unwrap `.structured_output` to get the schema-conforming object. The
-envelope shape is the same for claude and codex.
+envelope shape is the same for Claude, Codex, and Grok.
 
 ```bash
 VENDORS=${VENDORS:-/tmp/skills/vendors}
@@ -211,8 +234,8 @@ JSON
 jq .structured_output "$RUN_DIR/openai/out"
 ```
 
-If a caller already passes `--json-schema` (claude) or `--output-schema`
-(codex) via `--native-arg`, the wrapper does not duplicate it; the explicit
+If a caller already passes `--json-schema` (Claude/Grok) or `--output-schema`
+(Codex) via `--native-arg`, the wrapper does not duplicate it; the explicit
 native arg wins.
 
 ## Calling From Another Skill
@@ -251,8 +274,9 @@ surprises.
 
 That temporary file is an internal transport detail. Each vendor launcher then
 uses the form the CLI actually tolerates: Codex reads from stdin, Claude runs in
-print mode and reads stdin, and Agy receives `--print <prompt>` while stdin is
-closed.
+print mode and reads stdin, Agy receives `--print <prompt>` while stdin is
+closed, Cursor receives a positional prompt, and Grok receives the temporary
+file through native `--prompt-file`.
 
 ## Parallel Calls
 
@@ -282,6 +306,7 @@ Outputs are always written as:
 - `<output-dir>/claude/out`
 - `<output-dir>/agy/out`
 - `<output-dir>/cursor/out`
+- `<output-dir>/grok/out`
 
 For a single vendor, the same contract applies. For example, `--vendor claude`
 writes `<output-dir>/claude/out`, `<output-dir>/claude/status`,
@@ -315,6 +340,25 @@ token totals, so its successful calls use that unavailable form.
 The module does not require every supported vendor to be healthy. A caller
 selects the vendors it needs for that workflow and sets `--min-success` for
 that selected set.
+
+## Grok Capability Matrix
+
+The wrapper/runtime guarantees below are separate from Grok model quality.
+`smoke-test.sh` proves the adapter deterministically; bounded real proofs use
+the named entrypoints and retain their output directory for diagnosis.
+
+| Capability | Wrapper/runtime contract | Grok-native mechanism | Evidence |
+|---|---|---|---|
+| Aliases and model | `grok`/`xai` normalize to id `grok`; config or `--model` selects model | `grok --model` | smoke aliases/default/override; real `call.sh` |
+| Prompt inputs | inline/file/stdin/system/instruction/context keep wrapper order | `--prompt-file` | smoke transport; real `hello-test.sh`/`call.sh` |
+| Runtime controls | cwd, per-call env, native argv, timeout | `--cwd`; process environment; raw argv | smoke runtime/timeout; bounded real `call.sh` |
+| Effort | nearest mapping over low/medium/high | `--reasoning-effort` | smoke all six inputs; real min/medium/max |
+| No approval | shared `--yolo` | Grok `--yolo` | smoke dry run; guarded real calls |
+| Output artifacts | isolated `out`, `status`, `log`, `stream`, `usage.json` | streaming NDJSON `text`/`end` | smoke success/failure/fan-out; real calls |
+| Usage | normalized token totals plus retained raw values | terminal `end.usage` | smoke controlled totals; real `usage.json` |
+| Structured output | shared `structured_output` envelope and failure status | native `--json-schema`; `end.structuredOutput` | smoke valid/invalid; bounded real schema |
+| Readiness/headless | bounded noninteractive call through production launcher | official installed/authenticated CLI | fake and real `doctor.sh`; `hello-test.sh` |
+| Nested execution | explicit guard and per-level timeouts | outer Grok `--yolo`; inner production launcher | bounded `nested-test.sh --run-real-nested` |
 
 Use repeated `--id` values when calls need call-specific names, such as running
 OpenAI once as `openai` and later as `synthesis` in the same directory:
@@ -353,7 +397,7 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/doctor.sh"
 ```
 
-By default it probes openai, claude, agy, and cursor through
+By default it probes openai, claude, agy, cursor, and grok through
 `scripts/call.sh` with a small `READY` prompt. Use `--vendor` to check a subset:
 
 ```bash
@@ -389,6 +433,14 @@ These details mirror the hard-won behavior captured in `panel-review`:
   CLI reuses that credential across every call, so this module does not require
   per-call env vars. List available model ids with `cursor-agent --list-models`
   and pin the chosen one in `vendors.conf` as `cursor.model=<id>`.
+- Grok runs the official `grok` executable headlessly with
+  `--output-format streaming-json`, `--prompt-file`, and the configured
+  `grok.model` (default `grok-4.5`). Its final `text` chunks, terminal usage,
+  and native `structuredOutput` are normalized without exposing protocol
+  control frames through `out`. Non-dry-run Grok calls require `python3` or
+  `python` for this normalization and fail before invoking Grok when neither is
+  available; `--dry-run` remains parser-free. Authenticate the official CLI
+  outside this module; the wrapper never reads or changes `~/.grok`.
 - Doctor probes make a tiny model call. Run them after setup, auth refreshes,
   model/config changes, or vendor failures; do not pay the probe cost before
   every routine call.
@@ -407,9 +459,11 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/smoke-test.sh"
 ```
 
-It uses fake `codex`, `claude`, `agy`, and `cursor-agent` binaries and
-performs one call per caller. Each call selects all four vendors and verifies
-the full output/status/log/usage.json contract across the run.
+It uses fake `codex`, `claude`, `agy`, `cursor-agent`, and `grok` binaries and
+performs one call per caller. Each call selects all five vendors and verifies
+the full output/status/log/stream/usage contract. Grok-specific checks cover
+aliases, models, effort, yolo, prompts, cwd/env/native args, schema, failures,
+timeouts, fan-out, and doctor.
 
 ## Real Response Test
 
@@ -420,7 +474,7 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/hello-test.sh"
 ```
 
-It defaults to openai, claude, agy, and cursor, asks each selected LLM
+It defaults to openai, claude, agy, cursor, and grok, asks each selected LLM
 `Who are you?`, and verifies `exit_code=0` plus non-empty output. It does not
 judge answer content. Use repeated `--vendor` flags to check a subset, or pass
 `--prompt` to ask a different short probe.
@@ -435,14 +489,14 @@ VENDORS=${VENDORS:-/tmp/skills/vendors}
 "$VENDORS/scripts/nested-test.sh" --run-real-nested
 ```
 
-By default it asks openai, claude, agy, and cursor as outer agents to each
-execute one inner `call.sh` that fans out to openai, claude, agy, and cursor.
-That is 4 outer model calls plus 16 inner model calls. It verifies each inner
-call has `exit_code=0` and non-empty output.
+By default it asks openai, claude, agy, cursor, and grok as outer agents to each
+execute one inner `call.sh` that fans out to all five vendors. That is expensive;
+prefer explicit `--outer-vendor` and `--inner-vendor` selections for bounded
+proofs. It verifies each inner call has `exit_code=0` and non-empty output.
 
 Nested calls do not pass model permissions from the outer LLM to the inner
 vendors. The outer LLM only needs enough tool/shell permission to execute
 `call.sh`. The inner calls then use the local machine's `codex`, `claude`,
-`agy`, and `cursor-agent` CLI auth, PATH, environment, and the inner
+`agy`, `cursor-agent`, and `grok` CLI auth, PATH, environment, and the inner
 `call.sh` arguments. Keep each nested layer on its own `--output-dir` subtree
 and set timeouts at every layer.

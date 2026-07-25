@@ -75,6 +75,10 @@ The per-vendor transport is deliberately different:
   otherwise blocks on a workspace-trust prompt with no headless answer. The
   launcher parses the terminal `result` event for the assistant text and the
   `usage` payload.
+- Grok receives the normalized temporary file through `--prompt-file` and runs
+  with `--output-format streaming-json`. The raw NDJSON remains in `stream`;
+  `out` contains only concatenated `text` events or the normalized
+  `structured_output` envelope.
 
 Do not pass prompts through raw native args unless you are intentionally
 debugging a vendor CLI. That bypasses the stable module contract.
@@ -143,6 +147,38 @@ exposes, update `cursor.model=` in `vendors.conf` to a current id, and re-run
 the doctor. `cursor.model=auto` lets the server pick if you would rather not
 pin; you trade a stable id in logs for resilience to renames.
 
+### Grok Is Missing, Not Authenticated, Or Rejects The Model
+
+Cause: the official Grok Build `grok` executable is not on `PATH`, its existing
+login is unavailable, or the configured `grok.model` is not available to the
+account.
+
+Fix: install and authenticate the official CLI using xAI's documented flow
+outside this module, then run a bounded retained probe:
+
+```bash
+scripts/doctor.sh --vendor grok --timeout 60 --output-dir /tmp/grok-doctor
+scripts/hello-test.sh --vendor xai --timeout 60 --output-dir /tmp/grok-hello
+```
+
+Inspect `status`, `log`, `stream`, and `usage.json` in those directories.
+Sanitize diagnostics before sharing them. Never copy, print, edit, or delete
+`~/.grok` authentication/configuration while debugging this wrapper.
+
+### Grok Stream Or Schema Normalization Fails
+
+Cause: `python3`/`python` is missing, the CLI did not finish with an `end`
+event, emitted a protocol `error`, or returned `structuredOutputError` for a
+native schema request. Grok production calls require Python for normalization
+and fail before invoking the native CLI when no interpreter is available;
+`--dry-run` does not require Python.
+
+Fix: retain the full call output directory. `stream` contains the native NDJSON,
+`status` records the normalized reason, and `out` is intentionally free of
+thought/control frames. Confirm the installed official CLI version and retry a
+minimal schema with a finite timeout; do not fall back to an unofficial CLI or
+direct xAI API call.
+
 ### Codex Succeeds But `out` Is Empty
 
 Cause: Codex may emit a transcript without writing the
@@ -159,8 +195,9 @@ execute the nested command in this environment.
 
 Fix: nested real tests pass `--yolo` to the outer call. The shared launcher maps
 that to Codex approval bypass, Claude `bypassPermissions`, Agy
-`--dangerously-skip-permissions`, or Cursor `--yolo`. This is only appropriate
-for explicit nested command-execution tests, not routine vendor calls.
+`--dangerously-skip-permissions`, Cursor `--yolo`, or Grok `--yolo`. This is
+only appropriate for explicit nested command-execution tests, not routine
+vendor calls.
 
 ### Smoke Passes But Doctor Fails
 

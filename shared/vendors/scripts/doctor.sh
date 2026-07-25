@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: doctor.sh [--vendor openai|claude|agy|cursor]...
+# Usage: doctor.sh [--vendor openai|claude|agy|cursor|grok]...
 #
 # Verifies that selected vendor CLIs are not only installed, but can complete a
 # trivial call through scripts/call.sh. This keeps readiness probing aligned
@@ -16,7 +16,8 @@ Usage:
   scripts/doctor.sh [options]
 
 Options:
-  --vendor NAME             openai, claude, agy, or cursor; repeatable. Default: all
+  --vendor NAME             openai, claude, agy, cursor, or grok/xai; repeatable.
+                            Default: all
   --config FILE             Model mapping config (default: ../vendors.conf)
   --effort min|low|medium|high|xhigh|max
                           Probe effort hint (default: min)
@@ -142,7 +143,7 @@ CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")
 vendors_read_models "$CONFIG_FILE"
 
 if [ "${#REQUESTED_VENDORS[@]}" -eq 0 ]; then
-  REQUESTED_VENDORS=(openai claude agy cursor)
+  REQUESTED_VENDORS=(openai claude agy cursor grok)
 fi
 
 if [ -n "$OUTPUT_DIR" ]; then

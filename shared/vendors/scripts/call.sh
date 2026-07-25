@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: call.sh --vendor openai|claude|agy|cursor [--vendor ...] [options] [prompt]
+# Usage: call.sh --vendor openai|claude|agy|cursor|grok [--vendor ...] [options] [prompt]
 #
 # Unified vendor interface. A single --vendor behaves like a normal CLI call;
 # repeated --vendor values fan the same prompt out in parallel.
@@ -12,10 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/call.sh --vendor openai|claude|agy|cursor [--vendor NAME...] [options] [prompt]
+  scripts/call.sh --vendor openai|claude|agy|cursor|grok [--vendor NAME...] [options] [prompt]
 
 Vendor selection:
-  --vendor NAME                  openai, claude, agy, or cursor; repeatable
+  --vendor NAME                  openai, claude, agy, cursor, or grok; repeatable
+                                 grok and xai select the official grok CLI
   --min-success N                Required successful calls. Default: all selected
 
 Output:
@@ -33,7 +34,7 @@ Selection hints:
   --schema-file FILE             JSON Schema constraining the response shape.
                                  Output lands at <output-dir>/<id>/out as
                                  {"structured_output": <conforming-object>}.
-                                 Supported on claude and openai (codex).
+                                 Supported on claude, openai (codex), and grok.
                                  agy and cursor do not enforce schemas natively.
 
 Prompt and instruction input:
@@ -580,6 +581,10 @@ run_one_vendor() {
     VENDORS_TRANSCRIPT_FILE="$call_dir/codex-transcript.txt"
     ln -s "$(basename "$VENDORS_TRANSCRIPT_FILE")" "$VENDORS_STREAM_FILE" 2>/dev/null \
       || VENDORS_STREAM_FILE="$VENDORS_TRANSCRIPT_FILE"
+  elif [ "$vendor_id" = "grok" ]; then
+    VENDORS_TRANSCRIPT_FILE="$call_dir/grok-transcript.jsonl"
+    ln -s "$(basename "$VENDORS_TRANSCRIPT_FILE")" "$VENDORS_STREAM_FILE" 2>/dev/null \
+      || VENDORS_STREAM_FILE="$VENDORS_TRANSCRIPT_FILE"
   else
     VENDORS_TRANSCRIPT_FILE="$output_file"
     ln -s "$(basename "$output_file")" "$VENDORS_STREAM_FILE" 2>/dev/null \
@@ -592,6 +597,7 @@ run_one_vendor() {
     if [ -n "$status_file" ]; then
       {
         printf "vendor=%s\n" "$vendor_id"
+        printf "cli=%s\n" "$cli"
         printf "id=%s\n" "$output_id"
         printf "label=%s\n" "$label"
         printf "exit_code=127\n"
@@ -649,6 +655,10 @@ run_one_vendor() {
   if [ -n "$status_file" ]; then
     {
       printf "vendor=%s\n" "$vendor_id"
+      printf "cli=%s\n" "$cli"
+      printf "model=%s\n" "${VENDORS_RESOLVED_MODEL:-}"
+      printf "effort=%s\n" "${VENDORS_RESOLVED_EFFORT:-}"
+      printf "yolo=%s\n" "$VENDORS_YOLO"
       printf "id=%s\n" "$output_id"
       printf "label=%s\n" "$label"
       printf "exit_code=%s\n" "$code"

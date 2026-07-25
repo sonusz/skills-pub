@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test for the shared vendors module without real model calls.
 #
-# Exercises the cross-vendor fan-out contract: four separate callers each make
-# one call to all four configured vendors, for four total calls and sixteen
-# vendor outputs.
+# Exercises the cross-vendor fan-out contract with fake CLIs, including the
+# official Grok Build command surface and normalized artifacts.
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -261,9 +260,129 @@ else
 fi
 FAKE_CURSOR
 
-chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/agy" "$BIN_DIR/cursor-agent"
+cat > "$BIN_DIR/grok" <<'FAKE_GROK'
+#!/usr/bin/env bash
+format=""
+schema=""
+prompt_file=""
+fail=0
+delay=0
+malformed_schema=0
+no_text=0
+original_args=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-format)
+      format="${2-}"
+      shift 2
+      ;;
+    --json-schema)
+      schema="${2-}"
+      shift 2
+      ;;
+    --prompt-file)
+      prompt_file="${2-}"
+      shift 2
+      ;;
+    --model|--reasoning-effort|--cwd|--fake-native)
+      shift 2
+      ;;
+    --fake-fail)
+      fail=1
+      shift
+      ;;
+    --fake-delay)
+      delay="${2-}"
+      shift 2
+      ;;
+    --fake-malformed-schema)
+      malformed_schema=1
+      shift
+      ;;
+    --fake-no-text)
+      no_text=1
+      shift
+      ;;
+    --yolo)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+prompt=""
+if [ -n "$prompt_file" ]; then
+  prompt=$(cat "$prompt_file")
+fi
+if [ -n "${FAKE_GROK_CAPTURE_DIR:-}" ]; then
+  mkdir -p "$FAKE_GROK_CAPTURE_DIR"
+  printf "%s\n" "${original_args[@]}" > "$FAKE_GROK_CAPTURE_DIR/argv"
+  pwd > "$FAKE_GROK_CAPTURE_DIR/cwd"
+  printf "%s\n" "${GROK_SMOKE_MARKER:-}" > "$FAKE_GROK_CAPTURE_DIR/env"
+  printf "%s" "$prompt" > "$FAKE_GROK_CAPTURE_DIR/prompt"
+fi
+if [ "$delay" -gt 0 ]; then
+  sleep "$delay"
+fi
+if [ "$fail" = "1" ]; then
+  printf '{"type":"error","message":"controlled fake Grok failure"}\n'
+  exit 17
+fi
+if [ "${FAKE_GROK_FORCE_FAIL:-0}" = "1" ]; then
+  printf '{"type":"error","message":"forced fake Grok doctor failure"}\n'
+  exit 18
+fi
+if printf "%s" "$prompt" | grep -qi 'single word READY'; then
+  response="READY"
+else
+  response="grok received: $prompt"
+fi
+if [ "$format" != "streaming-json" ]; then
+  printf "fake grok requires --output-format streaming-json\n" >&2
+  exit 2
+fi
+python3 - "$response" "$schema" "$malformed_schema" "$no_text" <<'PY'
+import json
+import sys
 
-for caller in openai claude agy cursor; do
+response, schema, malformed_schema, no_text = sys.argv[1:5]
+print(json.dumps({"type": "thought", "data": "fake-control-frame"}))
+if no_text != "1":
+    mid = max(1, len(response) // 2)
+    print(json.dumps({"type": "text", "data": response[:mid]}))
+    print(json.dumps({"type": "text", "data": response[mid:]}))
+end = {
+    "type": "end",
+    "stopReason": "EndTurn",
+    "sessionId": "fake-grok-session",
+    "requestId": "fake-grok-request",
+    "usage": {
+        "input_tokens": 127,
+        "cache_read_input_tokens": 17,
+        "output_tokens": 29,
+        "reasoning_tokens": 11,
+        "total_tokens": 173,
+    },
+}
+if schema:
+    if malformed_schema == "1":
+        end["structuredOutput"] = None
+        end["structuredOutputError"] = "controlled schema mismatch"
+    else:
+        end["structuredOutput"] = {"answer": "READY"}
+print(json.dumps(end))
+PY
+FAKE_GROK
+
+chmod +x \
+  "$BIN_DIR/codex" \
+  "$BIN_DIR/claude" \
+  "$BIN_DIR/agy" \
+  "$BIN_DIR/cursor-agent" \
+  "$BIN_DIR/grok"
+
+for caller in openai claude agy cursor grok; do
   call_dir="$RUN_ROOT/$caller"
   mkdir -p "$call_dir"
 
@@ -272,11 +391,12 @@ for caller in openai claude agy cursor; do
     --vendor Claude \
     --vendor Agy \
     --vendor Cursor \
-    --prompt "caller=$caller fan out to openai, claude, agy, cursor" \
+    --vendor Grok \
+    --prompt "caller=$caller fan out to openai, claude, agy, cursor, grok" \
     --output-dir "$call_dir" \
-    --min-success 4 >/dev/null
+    --min-success 5 >/dev/null
 
-  for vendor in openai claude agy cursor; do
+  for vendor in openai claude agy cursor grok; do
     for suffix in out status usage.json; do
       file="$call_dir/$vendor/$suffix"
       if [ ! -s "$file" ]; then
@@ -457,6 +577,57 @@ if ! grep -q -- '--output-format json' "$dry_dir/cursor-json-output/log" \
   exit 1
 fi
 
+for grok_label in Grok GROK xai XAI; do
+  grok_alias_id="grok-alias-$(printf "%s" "$grok_label" | tr '[:upper:]' '[:lower:]')"
+  PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor "$grok_label" \
+    --prompt "dry run Grok alias $grok_label" \
+    --output-dir "$dry_dir" \
+    --id "$grok_alias_id" \
+    --dry-run >/dev/null
+  if ! grep -q '^vendor=grok$' "$dry_dir/$grok_alias_id/log" \
+      || ! grep -q '^cli=grok$' "$dry_dir/$grok_alias_id/log"; then
+    printf "FAIL: expected %s to normalize to vendor/cli grok\n" "$grok_label" >&2
+    cat "$dry_dir/$grok_alias_id/log" >&2
+    exit 1
+  fi
+done
+
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor Grok \
+  --prompt "dry run grok defaults" \
+  --output-dir "$dry_dir" \
+  --id grok-defaults \
+  --yolo \
+  --native-arg --fake-native \
+  --native-arg "value with spaces" \
+  --dry-run >/dev/null
+
+if ! grep -q '^model=grok-4.5$' "$dry_dir/grok-defaults/log" \
+    || ! grep -q -- '--output-format streaming-json' "$dry_dir/grok-defaults/log" \
+    || ! grep -q -- '--yolo' "$dry_dir/grok-defaults/log" \
+    || ! grep -q -- '--fake-native value\\ with\\ spaces' "$dry_dir/grok-defaults/log" \
+    || ! grep -q -- '--prompt-file' "$dry_dir/grok-defaults/log"; then
+  printf "FAIL: expected Grok default model, streaming JSON, yolo, native args, and prompt-file transport\n" >&2
+  cat "$dry_dir/grok-defaults/log" >&2
+  exit 1
+fi
+
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+  --vendor xai \
+  --model grok-explicit-test \
+  --prompt "dry run explicit Grok model" \
+  --output-dir "$dry_dir" \
+  --id grok-explicit-model \
+  --dry-run >/dev/null
+
+if ! grep -q '^model=grok-explicit-test$' "$dry_dir/grok-explicit-model/log" \
+    || ! grep -q -- '--model grok-explicit-test' "$dry_dir/grok-explicit-model/log"; then
+  printf "FAIL: expected explicit Grok model to pass through\n" >&2
+  cat "$dry_dir/grok-explicit-model/log" >&2
+  exit 1
+fi
+
 expected_effort() {
   case "$1:$2" in
     OpenAI:min|OpenAI:low) printf "low\n" ;;
@@ -470,6 +641,9 @@ expected_effort() {
     Claude:max) printf "max\n" ;;
     Agy:*) printf "<default>\n" ;;
     Cursor:*) printf "<default>\n" ;;
+    Grok:min|Grok:low) printf "low\n" ;;
+    Grok:medium) printf "medium\n" ;;
+    Grok:high|Grok:xhigh|Grok:max) printf "high\n" ;;
     *) printf "unknown\n" ;;
   esac
 }
@@ -478,7 +652,7 @@ lower() {
   printf "%s" "$1" | tr '[:upper:]' '[:lower:]'
 }
 
-for effort_vendor in OpenAI Claude Agy Cursor; do
+for effort_vendor in OpenAI Claude Agy Cursor Grok; do
   for effort in min low medium high xhigh max; do
     effort_id="effort-$(lower "$effort_vendor")-$effort"
     PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
@@ -493,6 +667,13 @@ for effort_vendor in OpenAI Claude Agy Cursor; do
     if ! grep -q "^effort=$expected$" "$dry_dir/$effort_id/log"; then
       printf "FAIL: expected %s effort %s to resolve to %s\n" \
         "$effort_vendor" "$effort" "$expected" >&2
+      cat "$dry_dir/$effort_id/log" >&2
+      exit 1
+    fi
+    if [ "$effort_vendor" = "Grok" ] \
+        && ! grep -q -- "--reasoning-effort $expected" "$dry_dir/$effort_id/log"; then
+      printf "FAIL: expected Grok effort %s to use --reasoning-effort %s\n" \
+        "$effort" "$expected" >&2
       cat "$dry_dir/$effort_id/log" >&2
       exit 1
     fi
@@ -533,6 +714,135 @@ if ! grep -q 'BEGIN CONTEXT FILE:' "$context_dir/claude-context/out" \
   exit 1
 fi
 
+grok_prompt_file="$WORK/grok-prompt.txt"
+grok_system_file="$WORK/grok-system.txt"
+grok_instruction_file="$WORK/grok-instruction.txt"
+grok_context_file="$WORK/grok-context.txt"
+grok_cwd="$WORK/grok-cwd"
+grok_capture="$WORK/grok-capture"
+grok_transport_dir="$RUN_ROOT/grok-transport"
+mkdir -p "$grok_cwd" "$grok_transport_dir"
+printf "GROK_FILE_PROMPT αβ\\nwith whitespace  \\n" > "$grok_prompt_file"
+printf "GROK_SYSTEM_MARKER\\n" > "$grok_system_file"
+printf "GROK_INSTRUCTION_MARKER\\n" > "$grok_instruction_file"
+printf "GROK_CONTEXT_MARKER\\n" > "$grok_context_file"
+
+printf "GROK_STDIN_MARKER\\nsecond line\\n" | \
+  PATH="$BIN_DIR:$PATH" \
+  FAKE_GROK_CAPTURE_DIR="$grok_capture" \
+  "$SCRIPT_DIR/call.sh" \
+    --vendor xai \
+    --prompt-file "$grok_prompt_file" \
+    --system-file "$grok_system_file" \
+    --instruction-file "$grok_instruction_file" \
+    --context-file "$grok_context_file" \
+    --cwd "$grok_cwd" \
+    --env GROK_SMOKE_MARKER=GROK_ENV_VALUE \
+    --native-arg --fake-native \
+    --native-arg "native value with spaces" \
+    --output-dir "$grok_transport_dir" \
+    --id grok-transport \
+    --min-success 1 >/dev/null
+
+for marker in GROK_FILE_PROMPT GROK_SYSTEM_MARKER GROK_INSTRUCTION_MARKER GROK_CONTEXT_MARKER; do
+  if ! grep -q "$marker" "$grok_capture/prompt"; then
+    printf "FAIL: expected Grok prompt transport to include %s\n" "$marker" >&2
+    cat "$grok_capture/prompt" >&2
+    exit 1
+  fi
+done
+if [ "$(cat "$grok_capture/cwd")" != "$grok_cwd" ] \
+    || [ "$(cat "$grok_capture/env")" != "GROK_ENV_VALUE" ] \
+    || ! grep -Fxq -- '--fake-native' "$grok_capture/argv" \
+    || ! grep -Fxq -- 'native value with spaces' "$grok_capture/argv"; then
+  printf "FAIL: expected Grok cwd, env, and ordered native args to reach fake CLI\n" >&2
+  exit 1
+fi
+python3 - "$grok_capture/argv" <<'PY'
+import sys
+from pathlib import Path
+
+args = Path(sys.argv[1]).read_text().splitlines()
+assert args.index("--output-format") < args.index("--fake-native")
+assert args.index("--fake-native") < args.index("--prompt-file")
+assert args.count("--fake-native") == 1
+PY
+if ! grep -q 'grok received:' "$grok_transport_dir/grok-transport/out" \
+    || grep -q 'fake-control-frame' "$grok_transport_dir/grok-transport/out" \
+    || ! grep -q '"source": "grok_jsonl"' "$grok_transport_dir/grok-transport/usage.json" \
+    || ! grep -q '"total_tokens": 173' "$grok_transport_dir/grok-transport/usage.json" \
+    || ! grep -q '"type": "thought"' "$grok_transport_dir/grok-transport/stream"; then
+  printf "FAIL: expected normalized Grok final text, usage, and raw stream artifacts\n" >&2
+  exit 1
+fi
+if ! grep -q '^cli=grok$' "$grok_transport_dir/grok-transport/status" \
+    || ! grep -q '^model=grok-4.5$' "$grok_transport_dir/grok-transport/status"; then
+  printf "FAIL: expected Grok status to retain selected CLI and model\n" >&2
+  cat "$grok_transport_dir/grok-transport/status" >&2
+  exit 1
+fi
+
+grok_stdin_capture="$WORK/grok-stdin-capture"
+grok_stdin_dir="$RUN_ROOT/grok-stdin"
+printf "GROK_STDIN_MARKER\\nsecond line\\n" | \
+  PATH="$BIN_DIR:$PATH" \
+  FAKE_GROK_CAPTURE_DIR="$grok_stdin_capture" \
+  "$SCRIPT_DIR/call.sh" \
+    --vendor grok \
+    --output-dir "$grok_stdin_dir" \
+    --min-success 1 >/dev/null
+if ! grep -q 'GROK_STDIN_MARKER' "$grok_stdin_capture/prompt" \
+    || ! grep -q 'second line' "$grok_stdin_capture/prompt"; then
+  printf "FAIL: expected multiline stdin to reach fake Grok\n" >&2
+  exit 1
+fi
+
+for kind in system instruction context; do
+  kind_capture="$WORK/grok-$kind-capture"
+  kind_dir="$RUN_ROOT/grok-$kind"
+  case "$kind" in
+    system)
+      kind_args=(--system "GROK_SYSTEM_ONLY")
+      marker="GROK_SYSTEM_ONLY"
+      ;;
+    instruction)
+      kind_args=(--instruction "GROK_INSTRUCTION_ONLY")
+      marker="GROK_INSTRUCTION_ONLY"
+      ;;
+    context)
+      kind_args=(--context-file "$grok_context_file")
+      marker="GROK_CONTEXT_MARKER"
+      ;;
+  esac
+  PATH="$BIN_DIR:$PATH" \
+  FAKE_GROK_CAPTURE_DIR="$kind_capture" \
+  "$SCRIPT_DIR/call.sh" \
+    --vendor grok \
+    --prompt "GROK_USER_ONLY" \
+    "${kind_args[@]}" \
+    --output-dir "$kind_dir" \
+    --min-success 1 >/dev/null
+  if ! grep -q "$marker" "$kind_capture/prompt" \
+      || ! grep -q 'GROK_USER_ONLY' "$kind_capture/prompt"; then
+    printf "FAIL: expected standalone Grok %s transport\n" "$kind" >&2
+    exit 1
+  fi
+done
+
+grok_env_clean_capture="$WORK/grok-env-clean-capture"
+PATH="$BIN_DIR:$PATH" \
+FAKE_GROK_CAPTURE_DIR="$grok_env_clean_capture" \
+"$SCRIPT_DIR/call.sh" \
+  --vendor grok \
+  --prompt "GROK_ENV_CLEAN" \
+  --output-dir "$RUN_ROOT/grok-env-clean" \
+  --min-success 1 >/dev/null
+if [ -n "$(cat "$grok_env_clean_capture/env")" ] \
+    || [ -n "${GROK_SMOKE_MARKER:-}" ]; then
+  printf "FAIL: expected per-call Grok env not to leak to later call or parent\n" >&2
+  exit 1
+fi
+
 schema_file="$WORK/response-schema.json"
 cat > "$schema_file" <<'JSON'
 {
@@ -559,6 +869,46 @@ if ! grep -q '"structured_output"' "$schema_dir/claude-schema/out" \
     || ! grep -q '"answer": "READY"' "$schema_dir/claude-schema/out"; then
   printf "FAIL: expected Claude stream-json schema output to preserve structured_output envelope\n" >&2
   cat "$schema_dir/claude-schema/out" >&2
+  exit 1
+fi
+
+grok_schema_dir="$RUN_ROOT/grok-schema"
+mkdir -p "$grok_schema_dir"
+PATH="$BIN_DIR:$PATH" \
+FAKE_GROK_CAPTURE_DIR="$grok_capture" \
+"$SCRIPT_DIR/call.sh" \
+  --vendor Grok \
+  --prompt "return Grok schema output" \
+  --schema-file "$schema_file" \
+  --output-dir "$grok_schema_dir" \
+  --id grok-schema \
+  --min-success 1 >/dev/null
+
+if ! grep -q '"structured_output"' "$grok_schema_dir/grok-schema/out" \
+    || ! grep -q '"answer": "READY"' "$grok_schema_dir/grok-schema/out" \
+    || ! grep -Fxq -- '--json-schema' "$grok_capture/argv"; then
+  printf "FAIL: expected Grok native schema arg and output envelope\n" >&2
+  cat "$grok_schema_dir/grok-schema/out" >&2
+  exit 1
+fi
+
+grok_bad_schema_dir="$RUN_ROOT/grok-bad-schema"
+mkdir -p "$grok_bad_schema_dir"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "return malformed Grok schema output" \
+    --schema-file "$schema_file" \
+    --native-arg --fake-malformed-schema \
+    --output-dir "$grok_bad_schema_dir" \
+    --id grok-bad-schema \
+    --min-success 1 >/dev/null 2>&1; then
+  printf "FAIL: expected malformed Grok schema event to fail\n" >&2
+  exit 1
+fi
+if ! grep -q '^exit_code=1$' "$grok_bad_schema_dir/grok-bad-schema/status" \
+    || ! grep -q 'structured output failed' "$grok_bad_schema_dir/grok-bad-schema/status"; then
+  printf "FAIL: expected retained Grok schema failure status and reason\n" >&2
+  cat "$grok_bad_schema_dir/grok-bad-schema/status" >&2
   exit 1
 fi
 
@@ -622,4 +972,174 @@ for id in openai openai-2; do
   fi
 done
 
-printf "OK: vendors smoke test passed (4 calls x 4 vendors + duplicate vendor + schema rejects)\n"
+grok_failure_dir="$RUN_ROOT/grok-failure"
+mkdir -p "$grok_failure_dir"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "controlled Grok failure" \
+    --native-arg --fake-fail \
+    --output-dir "$grok_failure_dir" \
+    --id grok-failure \
+    --min-success 1 >/dev/null 2>&1; then
+  printf "FAIL: expected controlled fake Grok failure\n" >&2
+  exit 1
+fi
+if ! grep -q '^exit_code=17$' "$grok_failure_dir/grok-failure/status" \
+    || ! grep -q 'controlled fake Grok failure' "$grok_failure_dir/grok-failure/stream"; then
+  printf "FAIL: expected retained fake Grok failure status and stream\n" >&2
+  exit 1
+fi
+
+grok_empty_dir="$RUN_ROOT/grok-empty-response"
+mkdir -p "$grok_empty_dir"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "controlled empty Grok response" \
+    --native-arg --fake-no-text \
+    --output-dir "$grok_empty_dir" \
+    --id grok-empty \
+    --min-success 1 >/dev/null 2>&1; then
+  printf "FAIL: expected Grok end event without text to fail\n" >&2
+  exit 1
+fi
+if ! grep -q '^exit_code=1$' "$grok_empty_dir/grok-empty/status" \
+    || ! grep -q 'without response text' "$grok_empty_dir/grok-empty/status"; then
+  printf "FAIL: expected retained Grok empty-response failure reason\n" >&2
+  exit 1
+fi
+
+grok_timeout_dir="$RUN_ROOT/grok-timeout"
+mkdir -p "$grok_timeout_dir"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "controlled Grok timeout" \
+    --native-arg --fake-delay \
+    --native-arg 8 \
+    --timeout 1 \
+    --output-dir "$grok_timeout_dir" \
+    --id grok-timeout \
+    --min-success 1 >/dev/null 2>&1; then
+  printf "FAIL: expected controlled fake Grok timeout\n" >&2
+  exit 1
+fi
+if ! grep -q '^exit_code=124$' "$grok_timeout_dir/grok-timeout/status" \
+    || ! grep -q '^reason=timeout$' "$grok_timeout_dir/grok-timeout/status"; then
+  printf "FAIL: expected Grok timeout status and reason\n" >&2
+  cat "$grok_timeout_dir/grok-timeout/status" >&2
+  exit 1
+fi
+
+doctor_dir="$RUN_ROOT/grok-doctor"
+PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/doctor.sh" \
+  --vendor XAI \
+  --timeout 5 \
+  --output-dir "$doctor_dir" >/dev/null
+if [ "$(cat "$doctor_dir/grok.status")" != "ok" ] \
+    || [ ! -s "$doctor_dir/grok-call/grok/out" ]; then
+  printf "FAIL: expected fake Grok doctor path to report ready\n" >&2
+  exit 1
+fi
+
+doctor_failure_dir="$RUN_ROOT/grok-doctor-failure"
+if PATH="$BIN_DIR:$PATH" FAKE_GROK_FORCE_FAIL=1 "$SCRIPT_DIR/doctor.sh" \
+    --vendor grok \
+    --timeout 5 \
+    --output-dir "$doctor_failure_dir" >/dev/null 2>&1; then
+  printf "FAIL: expected fake Grok doctor failure path\n" >&2
+  exit 1
+fi
+if [ "$(cat "$doctor_failure_dir/grok.status")" = "ok" ]; then
+  printf "FAIL: expected failed fake Grok doctor status\n" >&2
+  exit 1
+fi
+
+doctor_missing_dir="$RUN_ROOT/grok-doctor-missing"
+if PATH="/usr/bin:/bin" /bin/bash "$SCRIPT_DIR/doctor.sh" \
+    --vendor grok \
+    --timeout 5 \
+    --output-dir "$doctor_missing_dir" >/dev/null 2>&1; then
+  printf "FAIL: expected missing Grok doctor path\n" >&2
+  exit 1
+fi
+if ! grep -q 'CLI not on PATH' "$doctor_missing_dir/grok.status"; then
+  printf "FAIL: expected missing Grok doctor diagnostic\n" >&2
+  exit 1
+fi
+
+no_python_dir="$RUN_ROOT/grok-no-python"
+no_python_capture="$WORK/grok-no-python-capture"
+mkdir -p "$no_python_dir"
+printf "GROK_NO_PYTHON_PROMPT\n" > "$no_python_dir/prompt.txt"
+(
+  # Exercise the real production functions while replacing only interpreter
+  # discovery. No production test knob is needed, and fake Grok must remain
+  # uninvoked because correctness depends on the normalizer.
+  # shellcheck source=vendor-launch.sh
+  . "$SCRIPT_DIR/vendor-launch.sh"
+  vendors_python() {
+    return 0
+  }
+  VENDORS_TRANSCRIPT_FILE="$no_python_dir/grok-transcript.jsonl"
+  VENDORS_VENDOR_ID="grok"
+  VENDORS_VENDOR_CLI="grok"
+  VENDORS_RESOLVED_MODEL="grok-4.5"
+  VENDORS_RESOLVED_EFFORT="low"
+  VENDORS_CWD=""
+  VENDORS_YOLO=0
+  VENDORS_DRY_RUN=0
+  VENDORS_SCHEMA_FILE=""
+  VENDORS_NATIVE_ARGS=()
+  VENDORS_ENV=()
+  export FAKE_GROK_CAPTURE_DIR="$no_python_capture"
+
+  no_python_status=0
+  vendors_run_grok \
+    "$no_python_dir/prompt.txt" \
+    "$no_python_dir/out" \
+    > "$no_python_dir/stdout" \
+    2> "$no_python_dir/diagnostic" \
+    || no_python_status=$?
+  if [ "$no_python_status" -ne 69 ]; then
+    printf "FAIL: expected Grok missing-Python guard exit 69, got %s\n" \
+      "$no_python_status" >&2
+    exit 1
+  fi
+  VENDORS_DRY_RUN=1
+  vendors_run_grok \
+    "$no_python_dir/prompt.txt" \
+    "$no_python_dir/dry-run-out" \
+    > "$no_python_dir/dry-run"
+  VENDORS_DRY_RUN=0
+  vendors_collect_usage \
+    grok \
+    "$no_python_dir/out" \
+    "$no_python_dir/grok-transcript.jsonl" \
+    "$no_python_dir/usage.json"
+  vendors_collect_usage \
+    agy \
+    "$no_python_dir/agy-out" \
+    "$no_python_dir/agy-transcript" \
+    "$no_python_dir/agy-usage.json"
+)
+
+if [ -e "$no_python_capture/argv" ] \
+    || ! grep -q 'requires python3 or python' "$no_python_dir/diagnostic" \
+    || ! grep -q '^vendor=grok$' "$no_python_dir/dry-run" \
+    || [ -e "$no_python_dir/agy-usage.json" ]; then
+  printf "FAIL: expected Grok Python guard before invocation without changing Agy behavior\n" >&2
+  exit 1
+fi
+python3 - "$no_python_dir/usage.json" <<'PY'
+import json
+import sys
+
+usage = json.load(open(sys.argv[1], encoding="utf-8"))
+assert usage == {
+    "available": False,
+    "provider": "grok",
+    "total_tokens": None,
+    "reason": "python3 or python is required for Grok streaming JSON normalization",
+}
+PY
+
+printf "OK: vendors smoke test passed (5 calls x 5 vendors + Grok aliases/runtime/schema/failure/timeout/doctor)\n"
