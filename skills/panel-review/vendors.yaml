@@ -1,6 +1,6 @@
-# Four vendor calls made by panel-review.
+# Five vendor calls made by panel-review.
 #
-# The three entries under `panel` receive the same review prompt in parallel.
+# The four entries under `panel` receive the same review prompt in parallel.
 # The `synthesis` entry receives the original prompt plus panel outputs and
 # produces the final comparative report.
 # Effort uses the shared vendor scale: min, low, medium, high, xhigh, max.
@@ -17,6 +17,10 @@ panel:
   - id: agy
     vendor: agy
     effort: medium
+  - id: grok
+    vendor: grok
+    effort: medium
+    model: grok-4.5
 
 synthesis:
   id: synthesis

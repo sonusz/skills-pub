@@ -99,7 +99,7 @@ need re-approval.
 
 ### 4. Launch panel calls in parallel
 
-The four configured calls live in [vendors.yaml](vendors.yaml): three `panel` calls and one `synthesis` call, each with vendor/model/effort settings. Vendor CLI differences are handled by the packaged module at `shared/vendors`; panel-review should not duplicate vendor-specific CLI flags or quirks.
+The five configured calls live in [vendors.yaml](vendors.yaml): four `panel` calls and one `synthesis` call, each with vendor/model/effort settings. Vendor CLI differences are handled by the packaged module at `shared/vendors`; panel-review should not duplicate vendor-specific CLI flags or quirks.
 
 A configured call that fails mid-run is marked failed and never substituted —
 substitution would silently weaken the divergence signal. `launch.sh` aborts
@@ -112,8 +112,9 @@ Default repo-discovery mode drives `shared/vendors/scripts/call.sh` with
 maps that access per vendor: Codex gets
 `--dangerously-bypass-approvals-and-sandbox`, Claude gets
 `--permission-mode bypassPermissions`, and Agy gets
-`--dangerously-skip-permissions`. `--cwd` is honored by Codex via `--cd` and by
-Claude/Agy through the wrapper's cwd execution.
+`--dangerously-skip-permissions`; Grok gets `--yolo`. `--cwd` is honored by
+Codex via `--cd`, by Grok via native `--cwd`, and by Claude/Agy through the
+wrapper's cwd execution.
 
 In repo mode, keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
 rejects in-worktree output dirs, then records git status/diff snapshots under
@@ -155,7 +156,7 @@ The synthesis prompt requires this format:
 ```
 ━━━ Panel Review ━━━
 Task: {description}
-Vendors: {vendor_a} ✅ | {vendor_b} ✅ | {vendor_c} ✅
+Vendors: {vendor_a} ✅ | {vendor_b} ✅ | {vendor_c} ✅ | {vendor_d} ✅
 
 ## Consensus
 {Shared findings, including shared concerns}

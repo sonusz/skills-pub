@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Smoke test for panel-review without real model calls.
 #
-# It puts fake codex/claude/agy binaries at the front of PATH, then exercises
-# doctor.sh, launch.sh, and synthesize.sh through the shared vendors module.
+# It puts fake codex/claude/agy/grok binaries at the front of PATH, then
+# exercises doctor.sh, launch.sh, and synthesize.sh through the shared vendors
+# module.
 set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,7 +56,7 @@ if printf "%s" "$prompt" | grep -qi 'single word READY'; then
 elif printf "%s" "$prompt" | grep -qi 'Panel outputs:'; then
   response="━━━ Panel Review ━━━
 Task: smoke test
-Vendors: openai ✅ | claude ✅ | agy ✅
+Vendors: openai ✅ | claude ✅ | agy ✅ | grok ✅
 
 ## Consensus
 Smoke consensus.
@@ -85,7 +86,7 @@ elif printf "%s" "$prompt" | grep -qi 'Panel outputs:'; then
   cat <<'OUT'
 ━━━ Panel Review ━━━
 Task: smoke test
-Vendors: openai ✅ | claude ✅ | agy ✅
+Vendors: openai ✅ | claude ✅ | agy ✅ | grok ✅
 
 ## Consensus
 Smoke consensus.
@@ -126,7 +127,62 @@ else
 fi
 FAKE_AGY
 
-chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/agy"
+cat > "$BIN_DIR/grok" <<'FAKE_GROK'
+#!/usr/bin/env bash
+format=""
+prompt_file=""
+if [ -n "${PANEL_SMOKE_MARKERS:-}" ]; then
+  printf "pwd=%s\nargs=%s\n" "$PWD" "$*" > "${PANEL_SMOKE_MARKERS}.grok"
+fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-format)
+      format="${2-}"
+      shift 2
+      ;;
+    --prompt-file)
+      prompt_file="${2-}"
+      shift 2
+      ;;
+    --model|--reasoning-effort|--cwd)
+      shift 2
+      ;;
+    --yolo)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ "$format" != "streaming-json" ] || [ -z "$prompt_file" ]; then
+  printf '{"type":"error","message":"invalid fake Grok invocation"}\n'
+  exit 2
+fi
+prompt=$(cat "$prompt_file")
+if printf "%s" "$prompt" | grep -qi 'single word READY'; then
+  response="READY"
+else
+  response="grok panel smoke output"
+fi
+python3 - "$response" <<'PY'
+import json
+import sys
+
+response = sys.argv[1]
+print(json.dumps({"type": "text", "data": response}))
+print(json.dumps({
+    "type": "end",
+    "usage": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+    },
+}))
+PY
+FAKE_GROK
+
+chmod +x "$BIN_DIR/codex" "$BIN_DIR/claude" "$BIN_DIR/agy" "$BIN_DIR/grok"
 
 OPENAI_ARGS=()
 while IFS= read -r -d '' arg; do
@@ -137,6 +193,21 @@ OPENAI_EXPECTED_EFFORT=$(panel_yaml_value "$ROOT_DIR/vendors.yaml" panel openai 
 if [ -n "$OPENAI_EXPECTED_EFFORT" ] && [[ "$OPENAI_ARG_TEXT" != *"<--effort><$OPENAI_EXPECTED_EFFORT>"* ]]; then
   printf "FAIL: expected panel openai call args to include configured effort=%s\n" "$OPENAI_EXPECTED_EFFORT" >&2
   printf "%s\n" "$OPENAI_ARG_TEXT" >&2
+  exit 1
+fi
+
+GROK_ARGS=()
+while IFS= read -r -d '' arg; do
+  GROK_ARGS+=("$arg")
+done < <(panel_call_args "$ROOT_DIR/vendors.yaml" panel grok)
+GROK_ARG_TEXT=$(printf '<%s>' "${GROK_ARGS[@]}")
+GROK_EXPECTED_EFFORT=$(panel_yaml_value "$ROOT_DIR/vendors.yaml" panel grok effort)
+GROK_EXPECTED_MODEL=$(panel_yaml_value "$ROOT_DIR/vendors.yaml" panel grok model)
+if [[ "$GROK_ARG_TEXT" != *"<--vendor><grok>"* ]] \
+    || [[ "$GROK_ARG_TEXT" != *"<--effort><$GROK_EXPECTED_EFFORT>"* ]] \
+    || [[ "$GROK_ARG_TEXT" != *"<--model><$GROK_EXPECTED_MODEL>"* ]]; then
+  printf "FAIL: expected Grok panel args to include vendor, effort, and model\n" >&2
+  printf "%s\n" "$GROK_ARG_TEXT" >&2
   exit 1
 fi
 
@@ -157,7 +228,7 @@ PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$MARKER_PREFIX" \
   "$SCRIPT_DIR/launch.sh" --cwd "$ROOT_DIR" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/synthesize.sh" "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$RUN_DIR" >/dev/null
 
-for vendor in codex claude agy; do
+for vendor in codex claude agy grok; do
   marker="$MARKER_PREFIX.$vendor"
   if [ ! -s "$marker" ]; then
     printf "FAIL: expected repo-mode marker for %s\n" "$vendor" >&2
@@ -189,25 +260,38 @@ if ! grep -q -- '--dangerously-skip-permissions' "$MARKER_PREFIX.agy"; then
   cat "$MARKER_PREFIX.agy" >&2
   exit 1
 fi
+if ! grep -q -- '--yolo' "$MARKER_PREFIX.grok" \
+    || ! grep -q -- "--cwd $ROOT_DIR" "$MARKER_PREFIX.grok"; then
+  printf "FAIL: expected repo-mode Grok call to use yolo and cwd\n" >&2
+  cat "$MARKER_PREFIX.grok" >&2
+  exit 1
+fi
 
 PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$INLINE_MARKER_PREFIX" \
   "$SCRIPT_DIR/launch.sh" --inline "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$INLINE_RUN_DIR" >/dev/null
 if grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$INLINE_MARKER_PREFIX.codex" \
     || grep -q -- '--permission-mode bypassPermissions' "$INLINE_MARKER_PREFIX.claude" \
-    || grep -q -- '--dangerously-skip-permissions' "$INLINE_MARKER_PREFIX.agy"; then
+    || grep -q -- '--dangerously-skip-permissions' "$INLINE_MARKER_PREFIX.agy" \
+    || grep -q -- '--yolo' "$INLINE_MARKER_PREFIX.grok"; then
   printf "FAIL: inline mode should not pass repo/yolo access flags\n" >&2
-  cat "$INLINE_MARKER_PREFIX.codex" "$INLINE_MARKER_PREFIX.claude" "$INLINE_MARKER_PREFIX.agy" >&2
+  cat \
+    "$INLINE_MARKER_PREFIX.codex" \
+    "$INLINE_MARKER_PREFIX.claude" \
+    "$INLINE_MARKER_PREFIX.agy" \
+    "$INLINE_MARKER_PREFIX.grok" >&2
   exit 1
 fi
 
-for file in openai/out claude/out agy/out synthesis/out openai/status claude/status agy/status synthesis/status; do
+for file in \
+  openai/out claude/out agy/out grok/out synthesis/out \
+  openai/status claude/status agy/status grok/status synthesis/status; do
   if [ ! -s "$RUN_DIR/$file" ]; then
     printf "FAIL: expected non-empty smoke output %s\n" "$RUN_DIR/$file" >&2
     exit 1
   fi
 done
 
-for id in openai claude agy synthesis; do
+for id in openai claude agy grok synthesis; do
   status_file="$RUN_DIR/$id/status"
   expected_kind="panel"
   [ "$id" = "synthesis" ] && expected_kind="synthesis"

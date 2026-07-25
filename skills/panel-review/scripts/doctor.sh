@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: doctor.sh [options] [vendors_yaml]
 #
-# Probes the configured three panel calls and synthesis call through the shared
+# Probes the configured panel calls and synthesis call through the shared
 # vendors module. Exits 0 when >=2 panel calls and the synthesis call are ready.
 set -euo pipefail
 
