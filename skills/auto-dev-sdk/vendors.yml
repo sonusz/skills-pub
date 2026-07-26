@@ -66,10 +66,6 @@ panel:
   # consulted docs, then returns findings; they should not generate new design.
   # Context: medium-large, bounded to attached context files. Effort: high.
   reviewers:
-    # Agy-Claude: strong natural-language critique under Agy's auth/quota.
-    - vendor: agy
-      model: claude-opus-4-6-thinking
-      effort: max
     # Grok: independent xAI-backed reviewer for divergence signal.
     - vendor: grok
       model: grok-4.5
