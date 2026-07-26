@@ -82,8 +82,8 @@ panel:
   # Context: medium; reviewer outputs plus schema. Effort: high enough for
   # faithful extraction, lower than design generation.
   synthesizer:
-    vendor: grok
-    model: grok-4.5
+    vendor: codex
+    model: gpt-5.6-sol
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
