@@ -41,16 +41,18 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
 
 ## Guardrails
 
-- Repo-discovery mode gives reviewers real repo/tool access through `--cwd` +
+- Path-based discovery gives reviewers real repo/tool access through `--cwd` +
   `--yolo`; use it only for read-only review. Do not ask panel vendors to edit
   files, commit, push, install dependencies, apply infrastructure, or run
   destructive commands.
-- Use `--inline` when reviewer tool access is not acceptable or the artifact
-  is not available from a local repo/source path.
+- Materialize every reviewed artifact under a local repo/source root before
+  launch. Never paste an artifact body, source excerpt, diff hunk, or config
+  fragment into the panel prompt. If the artifact cannot be made locally
+  readable, stop instead of falling back to inline review.
 - Never send credentials, tokens, `.env` contents, or production secrets to
-  panel vendors. Redact before launch, regardless of mode.
+  panel vendors. Redact or exclude them before launch.
 - In git worktrees, `launch.sh` snapshots status and diffs before and after
-  repo-mode panel calls. If the workspace changes, stop and report it. Do not
+  panel calls. If the workspace changes, stop and report it. Do not
   auto-revert or commit unless the user explicitly asks.
 - Keep local-machine setup such as SSL certificates, proxies, auth refreshes,
   and vendor sandbox workarounds outside this skill source and outside
@@ -67,16 +69,19 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
 
 ### 2. Build the prompt
 
-One prompt for all vendors. Default to **repo discovery**: provide the
-repo/source root, artifact paths, sizes, and hashes, then tell reviewers to
-inspect the files themselves with their available tools. Do not inline artifact
-bodies by default. If a required file cannot be read, the reviewer should
-report that as a failed or risky review, not infer from the manifest alone.
+One prompt for all vendors. Use **path-based discovery only**:
 
-Use the old inline style only as an explicit option. In inline mode, inline all
-referenced artifacts as text so every vendor receives identical bytes. ~50KB
-inlined is fine; larger → prefer repo discovery, or ask the user to narrow
-scope or split into focused rounds (no built-in multi-round protocol).
+1. Choose the narrowest local repo/source root that contains the review inputs.
+2. Materialize external, generated, deleted, or historical inputs under that
+   root (or a dedicated temporary audit root).
+3. Put only the review question, root/path manifest, sizes, and hashes in the
+   prompt.
+4. Tell reviewers to inspect the files themselves with their available tools.
+
+Do not paste reviewed content into the prompt, even when it is small. If a
+required file cannot be read, the reviewer must report a failed or risky review
+rather than infer from the manifest. Keep panel output directories outside the
+audit root.
 
 Strip credentials and tokens before sending. Panel members cannot prompt the user mid-run, so the orchestrator owns security up front.
 
@@ -86,16 +91,14 @@ Write the finalized prompt to a file (e.g., `/tmp/panel-prompt.XXXX.txt`) — `l
 
 ### 3. Approval checkpoint — explicit, before launch
 
-Repo-discovery prompts go to the configured panel calls, which then run with
-repo/tool access from the selected `--cwd`. Inline prompts send artifact
-contents directly. In both modes, panel outputs and the original prompt go to
-the configured synthesis call. Before launching, show the user: (1) review
-question, (2) mode (`repo` or `inline`), (3) repo/source cwd when in repo mode,
-(4) artifact list (paths + sizes, not full text), (5) redactions applied,
-(6) configured calls from `vendors.yaml` to be invoked. Wait for explicit
-approval. Re-ask when the prompt materially changes (different artifact,
-question, mode/cwd, redactions, or added vendor). Minor reformatting doesn't
-need re-approval.
+The configured panel calls run with repo/tool access from the selected
+`--cwd`. Panel outputs and the original manifest-only prompt go to the
+configured synthesis call. Before launching, show the user: (1) review
+question, (2) repo/source cwd, (3) artifact list (paths + sizes, not full
+text), (4) redactions/exclusions applied, and (5) configured calls from
+`vendors.yaml`. Wait for explicit approval. Re-ask when the prompt materially
+changes (different artifact, question, cwd, redactions, or added vendor).
+Minor reformatting does not need re-approval.
 
 ### 4. Launch panel calls in parallel
 
@@ -107,7 +110,7 @@ if fewer than 2 panel outputs succeed. Each vendor call has a **5 minute**
 timeout by default via `PANEL_CALL_TIMEOUT=300`; override with
 `PANEL_CALL_TIMEOUT=<seconds>` only for a focused prompt.
 
-Default repo-discovery mode drives `shared/vendors/scripts/call.sh` with
+Path-based discovery drives `shared/vendors/scripts/call.sh` with
 `--cwd <repo/source>` and `--yolo` for each panel vendor. The shared wrapper
 maps that access per vendor: Codex gets
 `--dangerously-bypass-approvals-and-sandbox`, Claude gets
@@ -116,7 +119,7 @@ maps that access per vendor: Codex gets
 Codex via `--cd`, by Grok via native `--cwd`, and by Claude/Agy through the
 wrapper's cwd execution.
 
-In repo mode, keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
+Keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
 rejects in-worktree output dirs, then records git status/diff snapshots under
 `$RUN_DIR/.repo-state` before and after panel calls. Any tracked, staged, or
 status-visible workspace change fails the launch and is not reverted
@@ -136,15 +139,12 @@ scripts/launch.sh --cwd "$REVIEW_CWD" <prompt_file> vendors.yaml "$RUN_DIR"
 # outputs before the synthesizer reads them.
 ```
 
-To preserve the original inline-only behavior:
-
-```bash
-scripts/launch.sh --inline <prompt_file> vendors.yaml "$RUN_DIR"
-```
+`--cwd` is mandatory. `launch.sh` has no inline mode.
 
 ### 5. Synthesize with the configured synthesis call
 
-The synthesis call receives the original prompt plus all panel outputs and writes `$RUN_DIR/synthesis/out` by default:
+The synthesis call receives the original manifest-only prompt plus all panel
+outputs and writes `$RUN_DIR/synthesis/out` by default:
 
 ```bash
 scripts/synthesize.sh <prompt_file> vendors.yaml "$RUN_DIR"

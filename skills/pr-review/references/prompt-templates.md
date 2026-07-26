@@ -12,16 +12,19 @@ to the specific diff. Don't copy verbatim; treat as a structural guide.
 new/modified doc(s)? For each requirement, classify yes / partial / no /
 unclear, with a code citation.
 
-**Inline:** the doc(s) verbatim, plus the implementation files the doc
-references (or, if the doc doesn't name files, the implementation files in
-the diff most likely to deliver the doc's content).
+**Path inputs:** the audit repo root, merge-base/head SHAs, `diff.patch`, the
+anchor-doc paths, and the implementation paths most likely to deliver the
+docs. Reviewers read the exact files themselves; the prompt never contains
+the reviewed bodies.
 
 **Skeleton:**
 
 ```
 You are reviewing whether a code change fulfills a short product/engineering
-plan. Read the plan and the implementation; for each requirement in the plan,
-state:
+plan. The reviewed content is available from the audit root and revision
+manifest below. Read the exact plan and implementation files yourself before
+judging; do not infer from the path list or diff stat. For each requirement in
+the plan, state:
 
 1. whether it is satisfied (yes / partial / no / unclear),
 2. the specific code location(s) that satisfy or contradict it,
@@ -31,25 +34,28 @@ End with a short "gaps" list: requirements that are NOT satisfied or are only
 partially satisfied. Be concrete. Quote line numbers / function names. Do not
 generalize.
 
-============================================================================
-ARTIFACT 1 — <doc path>
-============================================================================
+AUDIT_ROOT: <absolute repo root>
+MERGE_BASE_SHA: <merge-base SHA>
+TARGET_HEAD_SHA: <head SHA>
+CHANGE_DIFF: <absolute path to diff.patch>
+CHANGED_FILES: <absolute path to files.txt>
 
-<doc content verbatim>
+ANCHOR_DOC_PATHS:
+- <repo-relative doc path>
 
-============================================================================
-ARTIFACT 2 — <implementation file path>
-============================================================================
+IMPLEMENTATION_PATHS:
+- <repo-relative implementation path>
 
-```<lang>
-<file content>
-```
-
-============================================================================
-ARTIFACT 3 — <next implementation file path> (if multiple)
-============================================================================
-
-...
+Reading contract:
+- Run file and git reads from AUDIT_ROOT.
+- Read a target file exactly as reviewed with:
+  git show TARGET_HEAD_SHA:<repo-relative-path>
+- Use CHANGE_DIFF or:
+  git diff MERGE_BASE_SHA..TARGET_HEAD_SHA -- <path>
+- Read every listed anchor doc and selected implementation file before
+  answering.
+- If any required path or revision is unreadable, report the review as
+  incomplete. Do not guess.
 
 ============================================================================
 What you need to produce
@@ -68,12 +74,9 @@ merge.
 ```
 
 **Sizing**: keep total prompt ≤ 50 KB. If the implementation is larger,
-scope to the files the doc actually names + the entrypoint. Bug-hunt
-phase will cover anything missed.
-
-**Trim policy**: in this phase, it is OK to selectively inline the parts of
-implementation files most relevant to the doc's claims. The bug-hunt phase
-will inline full files separately, so coverage isn't lost.
+scope the manifest to the files the doc actually names plus the entrypoint.
+The prompt stays small because it contains paths, not file bodies. Bug-hunt
+phase covers the rest.
 
 ---
 
@@ -83,17 +86,19 @@ will inline full files separately, so coverage isn't lost.
 out of scope** — Phase 1 covers that. The two phases together produce
 non-overlapping output.
 
-**Inline:** every code file in the diff, **in full**. No trimming. Bugs hide
-in env-var parsing, error mapping, and other "boring" helpers. If the prompt
-exceeds 50 KB, split into focused rounds (one file per round) rather than
-truncating mid-file.
+**Path inputs:** every selected code file in the diff. Reviewers must read
+each selected file **in full** from the target revision. Bugs hide in env-var
+parsing, error mapping, and other "boring" helpers. If the set is too broad,
+split it into focused path-based rounds rather than truncating files or
+embedding their text.
 
 **Skeleton:**
 
 ```
 You are a senior <language> reviewer doing a focused bug hunt on <subsystem>.
-Read the complete source below and find ONLY bugs — not style nits, not
-"could be cleaner" suggestions, not future-proofing. Bugs.
+Read every selected source file from the audit root and target revision, then
+find ONLY bugs — not style nits, not "could be cleaner" suggestions, not
+future-proofing. Bugs.
 
 A bug is: code that produces wrong output, hangs, leaks resources, races,
 panics, drops data, mishandles errors in a way that causes operator-visible
@@ -151,19 +156,25 @@ Do not pad. If you only find 2 bugs, return 2. If you find none, say so
 explicitly. False positives waste reviewer time. Be specific and cite line
 numbers. Lead with the worst bug.
 
-============================================================================
-ARTIFACT 1 — <file path> (FULL)
-============================================================================
+AUDIT_ROOT: <absolute repo root>
+MERGE_BASE_SHA: <merge-base SHA>
+TARGET_HEAD_SHA: <head SHA>
+CHANGE_DIFF: <absolute path to diff.patch>
+CHANGED_FILES: <absolute path to files.txt>
 
-```<lang>
-<file content verbatim>
-```
+IMPLEMENTATION_PATHS:
+- <repo-relative implementation path>
+- <next repo-relative implementation path>
 
-============================================================================
-ARTIFACT 2 — <file path> (FULL)
-============================================================================
-
-...
+Reading contract:
+- Run file and git reads from AUDIT_ROOT.
+- Read each listed file in full at TARGET_HEAD_SHA with:
+  git show TARGET_HEAD_SHA:<repo-relative-path>
+- Inspect its change with CHANGE_DIFF or:
+  git diff MERGE_BASE_SHA..TARGET_HEAD_SHA -- <path>
+- Do not read a working-tree copy as the reviewed version.
+- If a listed file cannot be read, report the review as incomplete. Do not
+  silently skip it or guess.
 
 # Notes that may help (optional — include any subtle invariants the model
 # might miss without prompting)
@@ -188,9 +199,12 @@ it in the "Notes that may help" section. Models can miss subtle setups.
    cross-reference and harder to verify.
 3. **Strip credentials and tokens** before sending. Check env-loaded values,
    default-config strings, anything `*_KEY` or `*_TOKEN`.
-4. **Don't include the test files in the bug-hunt prompt** unless you
+4. **Never include reviewed bodies in the prompt.** No source, doc text,
+   excerpt, or diff hunk. Include only instructions and the path/revision
+   manifest.
+5. **Don't include the test files in the bug-hunt manifest** unless you
    suspect a test bug. Tests double the prompt size and rarely contain
    production bugs.
-5. **For both phases, write the finalized prompt to a file** (e.g.
+6. **For both phases, write the finalized prompt to a file** (e.g.
    `$RUN_DIR/phase1-prompt.txt`). The panel-review launcher reads from disk
    so identical bytes go to every vendor.
