@@ -21,6 +21,8 @@
 #   mode             "branches" or "pr"
 #   pr_number        PR number (pr mode only)
 #   head_sha         SHA of head commit
+#   merge_base_sha   merge-base used for the review diff
+#   repo_root        absolute audit root reviewers use as --cwd
 #   base_ref         base branch name (origin/ prefix stripped)
 #   head_ref         head branch name (origin/ prefix stripped)
 #   diff.patch       full unified diff
@@ -88,6 +90,11 @@ done
 [[ -z "$MODE" || -z "$OUT" ]] && usage
 
 mkdir -p "$OUT"
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "Error: current directory is not inside a git repository." >&2
+  exit 2
+}
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 
 # ---------------------------------------------------------------------------
 # Resolve base / head SHAs
@@ -164,6 +171,8 @@ git diff --name-only --diff-filter=AM "$MERGE_BASE..$HEAD_SHA" | sort -u > "$OUT
 echo "$MODE" > "$OUT/mode"
 [[ "$MODE" == "pr" ]] && echo "$PR_NUMBER" > "$OUT/pr_number"
 echo "$HEAD_SHA" > "$OUT/head_sha"
+echo "$MERGE_BASE" > "$OUT/merge_base_sha"
+echo "$REPO_ROOT" > "$OUT/repo_root"
 echo "$BASE_REF" > "$OUT/base_ref"
 echo "$HEAD_REF" > "$OUT/head_ref"
 
@@ -174,6 +183,8 @@ jq -n \
   --arg mode "$MODE" \
   --arg pr_number "${PR_NUMBER:-}" \
   --arg head_sha "$HEAD_SHA" \
+  --arg merge_base_sha "$MERGE_BASE" \
+  --arg repo_root "$REPO_ROOT" \
   --arg base_ref "$BASE_REF" \
   --arg head_ref "$HEAD_REF" \
   --argjson file_count "$FILE_COUNT" \
@@ -183,6 +194,8 @@ jq -n \
     mode: $mode,
     pr_number: (if $pr_number == "" then null else ($pr_number | tonumber) end),
     head_sha: $head_sha,
+    merge_base_sha: $merge_base_sha,
+    repo_root: $repo_root,
     base_ref: $base_ref,
     head_ref: $head_ref,
     file_count: $file_count,
@@ -192,4 +205,4 @@ jq -n \
 
 echo "Context bundle written to: $OUT"
 echo ""
-jq '{mode, pr_number, head_sha, base_ref, head_ref, file_count, diff_bytes}' "$OUT/summary.json"
+jq '{mode, pr_number, head_sha, merge_base_sha, repo_root, base_ref, head_ref, file_count, diff_bytes}' "$OUT/summary.json"

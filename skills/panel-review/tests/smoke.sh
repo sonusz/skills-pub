@@ -20,17 +20,13 @@ trap cleanup EXIT
 
 BIN_DIR="$WORK/bin"
 RUN_DIR="$WORK/run"
-INLINE_RUN_DIR="$WORK/run-inline"
 PROMPT_FILE="$WORK/prompt.txt"
 MARKER_PREFIX="$WORK/marker"
-INLINE_MARKER_PREFIX="$WORK/inline-marker"
-mkdir -p "$BIN_DIR" "$RUN_DIR" "$INLINE_RUN_DIR"
+mkdir -p "$BIN_DIR" "$RUN_DIR"
 
 cat > "$PROMPT_FILE" <<'PROMPT'
-Review this tiny config for ambiguity:
-
-timeout = 30
-retry = true
+Review the local file at `SKILL.md` for ambiguity. Read it from the current
+working directory with your file tools. Do not modify it.
 PROMPT
 
 cat > "$BIN_DIR/codex" <<'FAKE_CODEX'
@@ -267,18 +263,27 @@ if ! grep -q -- '--yolo' "$MARKER_PREFIX.grok" \
   exit 1
 fi
 
-PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$INLINE_MARKER_PREFIX" \
-  "$SCRIPT_DIR/launch.sh" --inline "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$INLINE_RUN_DIR" >/dev/null
-if grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$INLINE_MARKER_PREFIX.codex" \
-    || grep -q -- '--permission-mode bypassPermissions' "$INLINE_MARKER_PREFIX.claude" \
-    || grep -q -- '--dangerously-skip-permissions' "$INLINE_MARKER_PREFIX.agy" \
-    || grep -q -- '--yolo' "$INLINE_MARKER_PREFIX.grok"; then
-  printf "FAIL: inline mode should not pass repo/yolo access flags\n" >&2
-  cat \
-    "$INLINE_MARKER_PREFIX.codex" \
-    "$INLINE_MARKER_PREFIX.claude" \
-    "$INLINE_MARKER_PREFIX.agy" \
-    "$INLINE_MARKER_PREFIX.grok" >&2
+if "$SCRIPT_DIR/launch.sh" --inline \
+    "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$WORK/rejected-inline" \
+    >"$WORK/rejected-inline.log" 2>&1; then
+  printf "FAIL: launch.sh must reject the removed --inline mode\n" >&2
+  exit 1
+fi
+if ! grep -q -- 'unknown option: --inline' "$WORK/rejected-inline.log"; then
+  printf "FAIL: --inline rejection did not explain the unsupported option\n" >&2
+  cat "$WORK/rejected-inline.log" >&2
+  exit 1
+fi
+
+if "$SCRIPT_DIR/launch.sh" \
+    "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$WORK/rejected-no-cwd" \
+    >"$WORK/rejected-no-cwd.log" 2>&1; then
+  printf "FAIL: launch.sh must require an explicit audit cwd\n" >&2
+  exit 1
+fi
+if ! grep -q -- '--cwd is required' "$WORK/rejected-no-cwd.log"; then
+  printf "FAIL: missing-cwd rejection did not explain the path-based contract\n" >&2
+  cat "$WORK/rejected-no-cwd.log" >&2
   exit 1
 fi
 

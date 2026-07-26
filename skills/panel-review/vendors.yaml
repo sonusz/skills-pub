@@ -1,8 +1,9 @@
 # Five vendor calls made by panel-review.
 #
-# The four entries under `panel` receive the same review prompt in parallel.
-# The `synthesis` entry receives the original prompt plus panel outputs and
-# produces the final comparative report.
+# The four entries under `panel` receive the same manifest-only review prompt
+# in parallel and read reviewed files from the configured audit root.
+# The `synthesis` entry receives that prompt plus panel outputs and produces
+# the final comparative report.
 # Effort uses the shared vendor scale: min, low, medium, high, xhigh, max.
 
 panel:

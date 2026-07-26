@@ -24,7 +24,8 @@ inline-thread posting third. Mirrors the workflow used to review the
 `maestro-rate-limit` PR end-to-end.
 
 The agent owns orchestration. Scripts are thin, non-classifying primitives
-— they fetch state, talk to the GitHub API, and produce verbatim lists.
+— they fetch state, talk to the GitHub API, and produce path-based review
+bundles.
 **Any classification (which files are anchor docs, which are implementation,
 which are noise, which are binary, which are tests) is the agent's job.**
 Hardcoded scripts always have corner cases — a vendored directory might
@@ -121,6 +122,8 @@ Output (under `$RUN_DIR`):
 | `mode` | `branches` or `pr` |
 | `pr_number` | PR # (gh mode only) |
 | `head_sha` | head SHA |
+| `merge_base_sha` | merge-base used for `diff.patch` |
+| `repo_root` | absolute audit root passed to panel-review as `--cwd` |
 | `base_ref`, `head_ref` | branch names (origin/ prefix stripped) |
 | `diff.patch` | unified diff |
 | `diff-stat.txt` | `git diff --stat` |
@@ -141,7 +144,8 @@ further approval needed — the user already opted in at Step 0):
 - **Meta doc** (README, CHANGELOG, CONTRIBUTING — describes state, not
   future delivery) → skip.
 - **Binary / fixture / generated artifact** (PNG, model weights, lockfile,
-  `go.sum`, vendored deps, minified JS) → skip; not reviewable inline.
+  `go.sum`, vendored deps, minified JS) → skip; not suitable for this text
+  review.
   Generated artifacts especially are noise — the source they come from
   is what matters.
 - **CI / config / build** (`.github/workflows/*`, Makefile, Dockerfile)
@@ -170,13 +174,18 @@ deliverables to check.
 
 Otherwise:
 
-1. Read each anchor doc and the implementation files most likely to
-   deliver it. Use `Read` for full content. The doc may name specific
+1. Read enough locally to classify each anchor doc and select the
+   implementation paths most likely to deliver it. The doc may name specific
    files; if not, scope to the obvious entrypoints in the diff.
-2. Build a prompt at `$RUN_DIR/phase1-prompt.txt` using the docs-compliance
-   skeleton in `references/prompt-templates.md`.
+2. Build `$RUN_DIR/phase1-prompt.txt` from the docs-compliance skeleton in
+   `references/prompt-templates.md`. Put only the review question, commit
+   identifiers, and path manifest in the prompt. Never paste doc text, source
+   text, excerpts, or diff hunks into it.
 3. Invoke `panel-review` via the `Skill` tool: `skill="panel-review"`,
-   `args` describing the prompt file path. Capture the synthesis output.
+   with `args` naming the prompt file and the audit root from
+   `$RUN_DIR/repo_root` as `--cwd`. Reviewers read the exact target version
+   with `git show <head_sha>:<path>` and inspect `$RUN_DIR/diff.patch`
+   themselves. Capture the synthesis output.
    No mid-flow approval gate — the user's Step 0 confirmation covered
    this launch.
 4. Surface results: quote the synthesis report's `## Consensus` and
@@ -191,25 +200,28 @@ Otherwise:
 
 Always runs.
 
-1. Read each implementation file from `files.txt` **in full**. Bugs hide
-   in env-var parsers, error mappers, and other "boring" helpers. Do not
-   trim. Skip files that are obviously not implementation (anchor docs
-   reviewed in Phase 1, vendored fixtures, README-style docs).
-2. If the total inline budget exceeds ~50 KB, sort files by lines-changed
-   (from `diff-stat.txt`) and inline the top files until the budget is
-   spent. List the remaining files by path in the prompt, and offer the
-   user a second pass after the first round completes.
+1. Curate the implementation paths from `files.txt`. Skip files that are
+   obviously not implementation (anchor docs reviewed in Phase 1, vendored
+   fixtures, README-style docs). Bugs hide in env-var parsers, error mappers,
+   and other "boring" helpers, so do not silently omit such paths.
+2. If the changed implementation surface is too broad for one focused review,
+   partition the path list by subsystem and run multiple path-based rounds.
+   Never truncate a file and never move its body into the prompt.
 3. Build `$RUN_DIR/phase2-prompt.txt` from the bug-hunt skeleton in
-   `references/prompt-templates.md`. Spec-compliance is **explicitly
-   out of scope** — Phase 1 covered that.
-4. Invoke `panel-review`. Capture synthesis. No mid-flow approval gate —
-   the user's Step 0 confirmation covered this launch.
+   `references/prompt-templates.md`. The prompt contains paths and revision
+   metadata only. Spec-compliance is **explicitly out of scope** — Phase 1
+   covered that.
+4. Invoke `panel-review` with `--cwd "$(cat "$RUN_DIR/repo_root")"`.
+   Reviewers read every selected file at `$RUN_DIR/head_sha` themselves.
+   Capture synthesis. No mid-flow approval gate — the user's Step 0
+   confirmation covered this launch.
 5. **Verify findings before presenting.** Models hallucinate line
    numbers and occasionally invent bugs that don't exist. Spot-check the
-   top 2–3 by severity: read the cited lines via `Read` and confirm the
-   bug is real. Adjust the severity downward (or label "could not
-   verify") if the panel misunderstood the code. False findings waste
-   reviewer time and erode trust faster than missed findings.
+   top 2–3 by severity against `git show <head_sha>:<path>` and confirm the
+   bug is real. Do not verify against a potentially dirty working-tree copy.
+   Adjust the severity downward (or label "could not verify") if the panel
+   misunderstood the code. False findings waste reviewer time and erode trust
+   faster than missed findings.
 6. Surface results: by severity, with verification status. Two-vendor
    agreement is suggestive; agreement-on-the-same-mistake is also a
    thing (vendors share training data) — verification overrides.
@@ -387,7 +399,7 @@ Any failure → STOP and ask the user to fix.
 | Diagnose environment | `scripts/doctor.sh` |
 | Gather diff + file list | `scripts/gather-context.sh --branches <base> <head> --out <dir>` OR `scripts/gather-context.sh --pr <n> --out <dir>` |
 | List all PR threads (resolved + unresolved) | `shared/github-ops/comment-check.sh <pr> --include-resolved` |
-| Run Phase 1 / Phase 2 panels | `Skill` tool with `skill="panel-review"` |
+| Run Phase 1 / Phase 2 panels | `panel-review` with the phase prompt and `--cwd "$(cat "$RUN_DIR/repo_root")"` |
 | Post one inline review thread | `scripts/post-review-thread.sh --pr N --path PATH --body-file FILE [--line N \| --start-line N --end-line M]` |
 
 Scripts auto-detect owner/repo from the git remote in gh mode. Local mode
@@ -417,6 +429,9 @@ The skill should not:
   other non-bugs.** The bug-hunt prompt template explicitly excludes
   those; don't forward them up to the user. Style belongs to lint,
   not to a review thread.
+- **Inline reviewed content into a panel prompt.** Both phases are path-based:
+  pass the repo root, revision IDs, diff path, and selected file paths; let
+  each reviewer read the exact files itself.
 - **Edit code in this skill.** Review-only is the contract. Fixes belong
   to `auto-fix` or to the human author.
 - **Use `gh` CLI.** Its auth scope is independent of this session's git

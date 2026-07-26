@@ -35,10 +35,10 @@ One of:
 
 - **Vendor CLI not installed / not on PATH.** Run
   `shared/vendors/scripts/doctor.sh`.
-- **Vendor took longer than the call timeout** (default 5 min). Larger
-  prompts → longer responses. Either trim the prompt (Phase 1: scope to
-  files the doc names; Phase 2: split into one-file-per-round) or raise
-  `PANEL_CALL_TIMEOUT` via env.
+- **Vendor took longer than the call timeout** (default 5 min). Broader file
+  manifests take longer to inspect. Narrow Phase 1 to files the doc names, or
+  split Phase 2 into subsystem/path-based rounds; do not paste or trim file
+  bodies. Raise `PANEL_CALL_TIMEOUT` only for an already-focused round.
 - **Auth drifted mid-session.** For Agy, run `agy` once interactively to refresh
   sign-in, then confirm the configured/default model with `agy models`.
 
@@ -114,10 +114,10 @@ bugs the panel flagged), do this:
    branch range.
 4. Re-verify the flagged bugs against the clean source.
 
-In gh mode the input is a remote PR, so local dirty state can't contaminate
-the diff itself — but it can contaminate "Read"-tool reads if the agent
-falls back to reading the working tree instead of the PR head. Verify
-critical findings against `git show <pr-head>:<path>` if in doubt.
+In gh mode the input is a remote PR, so local dirty state cannot contaminate
+the diff itself. The path-based prompt requires reviewers and the verifying
+agent to read `git show <pr-head>:<path>`, never the working-tree copy. Treat a
+finding based only on the working tree as unverified.
 
 ---
 

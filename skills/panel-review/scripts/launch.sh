@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: launch.sh [--inline] [--cwd DIR] <prompt_file> <vendors_yaml> <output_dir>
+# Usage: launch.sh --cwd DIR <prompt_file> <vendors_yaml> <output_dir>
 #
 # Launches the configured panel calls in parallel through the shared vendors
 # module. Outputs: <output_dir>/<panel-id>/out plus log/status/call.log files.
@@ -12,16 +12,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/launch.sh [--inline] [--cwd DIR] <prompt_file> <vendors_yaml> <output_dir>
+  scripts/launch.sh --cwd DIR <prompt_file> <vendors_yaml> <output_dir>
 
-Default mode is repo discovery: panel calls run with --yolo and --cwd so each
-vendor can inspect the requested repo/source itself. Use --cwd to point at the
-repo/source root; when omitted, PANEL_REVIEW_CWD or the current directory is
-used.
+Panel calls always run in path-based discovery mode with --yolo and --cwd so
+each vendor reads the requested repo/source itself. Reviewed artifact bodies
+must not be embedded in the prompt.
 
 Options:
-  --cwd DIR   Repo/source root for reviewer tool access in repo mode
-  --inline    Preserve the old inline-only behavior; do not pass --cwd/--yolo
+  --cwd DIR   Required repo/source root for reviewer tool access
   -h, --help  Show this help
 USAGE
 }
@@ -40,8 +38,7 @@ require_value() {
   fi
 }
 
-PANEL_MODE="repo"
-PANEL_REVIEW_CWD_VALUE="${PANEL_REVIEW_CWD:-}"
+PANEL_REVIEW_CWD_VALUE=""
 PANEL_REVIEW_GIT_GUARD=0
 PANEL_REVIEW_GIT_ROOT=""
 
@@ -58,14 +55,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --cwd=*)
       PANEL_REVIEW_CWD_VALUE="${1#*=}"
-      shift
-      ;;
-    --inline)
-      PANEL_MODE="inline"
-      shift
-      ;;
-    --repo)
-      PANEL_MODE="repo"
       shift
       ;;
     --)
@@ -98,27 +87,25 @@ panel_require_config "$VENDORS_YAML"
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(cd "$RUN_DIR" && pwd -P)"
 
-if [ "$PANEL_MODE" = "repo" ]; then
-  if [ -z "$PANEL_REVIEW_CWD_VALUE" ]; then
-    PANEL_REVIEW_CWD_VALUE="$(pwd)"
-  fi
-  if [ ! -d "$PANEL_REVIEW_CWD_VALUE" ]; then
-    printf "FAIL: --cwd is not a directory: %s\n" "$PANEL_REVIEW_CWD_VALUE" >&2
-    exit 2
-  fi
-  PANEL_REVIEW_CWD_VALUE="$(cd "$PANEL_REVIEW_CWD_VALUE" && pwd -P)"
-  if command -v git >/dev/null 2>&1 \
-      && git -C "$PANEL_REVIEW_CWD_VALUE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    PANEL_REVIEW_GIT_ROOT=$(git -C "$PANEL_REVIEW_CWD_VALUE" rev-parse --show-toplevel)
-    PANEL_REVIEW_GIT_ROOT="$(cd "$PANEL_REVIEW_GIT_ROOT" && pwd -P)"
-    case "$RUN_DIR/" in
-      "$PANEL_REVIEW_GIT_ROOT"/*)
-        printf "FAIL: output_dir must be outside reviewed git worktree in repo mode: %s\n" "$RUN_DIR" >&2
-        printf "Use a temp dir such as /tmp/panel-review.XXXXXX.\n" >&2
-        exit 2
-        ;;
-    esac
-  fi
+if [ -z "$PANEL_REVIEW_CWD_VALUE" ]; then
+  die "--cwd is required; panel reviews are path-based"
+fi
+if [ ! -d "$PANEL_REVIEW_CWD_VALUE" ]; then
+  printf "FAIL: --cwd is not a directory: %s\n" "$PANEL_REVIEW_CWD_VALUE" >&2
+  exit 2
+fi
+PANEL_REVIEW_CWD_VALUE="$(cd "$PANEL_REVIEW_CWD_VALUE" && pwd -P)"
+if command -v git >/dev/null 2>&1 \
+    && git -C "$PANEL_REVIEW_CWD_VALUE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  PANEL_REVIEW_GIT_ROOT=$(git -C "$PANEL_REVIEW_CWD_VALUE" rev-parse --show-toplevel)
+  PANEL_REVIEW_GIT_ROOT="$(cd "$PANEL_REVIEW_GIT_ROOT" && pwd -P)"
+  case "$RUN_DIR/" in
+    "$PANEL_REVIEW_GIT_ROOT"/*)
+      printf "FAIL: output_dir must be outside reviewed git worktree: %s\n" "$RUN_DIR" >&2
+      printf "Use a temp dir such as /tmp/panel-review.XXXXXX.\n" >&2
+      exit 2
+      ;;
+  esac
 fi
 
 repo_state_path() {
@@ -132,9 +119,6 @@ snapshot_repo_state() {
   local label="$1"
   local state_dir="$RUN_DIR/.repo-state"
 
-  if [ "$PANEL_MODE" != "repo" ]; then
-    return
-  fi
   if [ -z "$PANEL_REVIEW_GIT_ROOT" ]; then
     return
   fi
@@ -190,32 +174,18 @@ launch_one() {
     call_args+=("$arg")
   done < <(panel_call_args "$VENDORS_YAML" panel "$id")
 
-  if [ "$PANEL_MODE" = "repo" ]; then
-    if "$PANEL_VENDOR_CALL" \
-      "${call_args[@]}" \
-      --cwd "$PANEL_REVIEW_CWD_VALUE" \
-      --yolo \
-      --id "$id" \
-      --timeout "$PANEL_CALL_TIMEOUT" \
-      --prompt-file "$PROMPT_FILE" \
-      --output-dir "$RUN_DIR" \
-      --min-success 1 > "$wrapper_log" 2>&1; then
-      code=0
-    else
-      code=$?
-    fi
+  if "$PANEL_VENDOR_CALL" \
+    "${call_args[@]}" \
+    --cwd "$PANEL_REVIEW_CWD_VALUE" \
+    --yolo \
+    --id "$id" \
+    --timeout "$PANEL_CALL_TIMEOUT" \
+    --prompt-file "$PROMPT_FILE" \
+    --output-dir "$RUN_DIR" \
+    --min-success 1 > "$wrapper_log" 2>&1; then
+    code=0
   else
-    if "$PANEL_VENDOR_CALL" \
-      "${call_args[@]}" \
-      --id "$id" \
-      --timeout "$PANEL_CALL_TIMEOUT" \
-      --prompt-file "$PROMPT_FILE" \
-      --output-dir "$RUN_DIR" \
-      --min-success 1 > "$wrapper_log" 2>&1; then
-      code=0
-    else
-      code=$?
-    fi
+    code=$?
   fi
   if [ -r "$status_file" ]; then
     vendor_code=$(awk -F= '$1 == "exit_code" { print $2; exit }' "$status_file")
@@ -228,13 +198,9 @@ launch_one() {
     printf "id=%s\n" "$id"
     printf "kind=panel\n"
     printf "vendor=%s\n" "$vendor"
-    printf "mode=%s\n" "$PANEL_MODE"
-    if [ "$PANEL_MODE" = "repo" ]; then
-      printf "cwd=%s\n" "$PANEL_REVIEW_CWD_VALUE"
-      printf "yolo=1\n"
-    else
-      printf "yolo=0\n"
-    fi
+    printf "mode=repo\n"
+    printf "cwd=%s\n" "$PANEL_REVIEW_CWD_VALUE"
+    printf "yolo=1\n"
     [ -z "$label" ] || printf "label=%s\n" "$label"
     printf "exit_code=%s\n" "$code"
     printf "output=%s\n" "$out_file"
@@ -260,7 +226,7 @@ done
 
 snapshot_repo_state after
 if repo_state_changed; then
-  printf "FAIL: repo state changed during panel review in repo mode.\n" >&2
+  printf "FAIL: repo state changed during path-based panel review.\n" >&2
   printf "Reviewers run with --yolo for read-only inspection only; no changes were reverted.\n" >&2
   printf "Inspect current status and snapshots under %s/.repo-state.\n" "$RUN_DIR" >&2
   git -C "$PANEL_REVIEW_CWD_VALUE" status --short >&2 || true

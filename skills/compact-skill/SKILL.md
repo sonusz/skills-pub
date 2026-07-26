@@ -155,7 +155,11 @@ Apply Methods §4: extract repeated rules into authoritative sections, replace o
 
 ### 6. Verify
 
-Run panel-review with both versions (original backup + compressed). Each model answers:
+Keep the original backup and compressed skill as separate files under the same
+local audit root. Run panel-review with that directory as `--cwd`; put only
+both file paths, sizes/hashes, and the question below in the prompt. Never paste
+either SKILL.md body into the prompt. Each model reads both files itself and
+answers:
 
 > Does the compressed version allow you to reconstruct all operational
 > steps from the original without guessing?
