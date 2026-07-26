@@ -24,12 +24,12 @@ def _deprecation_warn(path: Path, old: str, new: str) -> None:
 # Coding stages — vendors.yml must cover all.
 STAGES = ("design", "build", "spec", "review")
 
-# Vendors allowed for coding (R3: agy/grok excluded; panel-review handles them separately).
+# Vendors allowed for coding (R3: agy excluded; panel-review handles it separately).
 # `openai` and `codex` both route through the Codex CLI in shared/vendors.
 # `cursor` (cursor-agent) is allowed for stages too — it pins a model SKU with
 # effort encoded in the model id (e.g. `gpt-5.5-high`); the `--effort` flag has
 # no cursor analog (see shared/vendors/vendors.conf).
-ALLOWED_VENDORS = {"claude", "codex", "openai", "cursor"}
+ALLOWED_VENDORS = {"claude", "codex", "openai", "cursor", "grok"}
 
 # Panel review vendors. `cursor` is allowed as a reviewer (it proxies a
 # backing provider — e.g. a Gemini or Claude model — under cursor's own auth);
@@ -38,12 +38,12 @@ ALLOWED_VENDORS = {"claude", "codex", "openai", "cursor"}
 PANEL_REVIEWER_VENDORS = {
     "claude", "codex", "openai", "agy", "cursor", "grok",
 }
-# Synthesizer requires native JSON-schema output (claude via --json-schema,
+# Synthesizer requires native JSON-schema output (claude/grok via --json-schema,
 # codex/openai via --output-schema; agy and cursor lack native enforcement).
-PANEL_SYNTHESIZER_VENDORS = {"claude", "codex", "openai"}
+PANEL_SYNTHESIZER_VENDORS = {"claude", "codex", "openai", "grok"}
 # The idle probe is a short, read-only LLM call. Keep it on coding-capable
 # CLIs that accept prompt-on-stdin in headless mode.
-PROBE_VENDORS = {"claude", "codex", "openai"}
+PROBE_VENDORS = {"claude", "codex", "openai", "grok"}
 
 # Cursor proxies many backends. For panel diversity we care about the underlying
 # LLM provider, not the `cursor` proxy. These substrings are matched against the
@@ -322,7 +322,7 @@ def _validate_raw(raw: Any, path: Path) -> dict[str, dict[str, Any]]:
         if entry["vendor"] not in ALLOWED_VENDORS:
             raise ConfigError(
                 f"{path}: stages.{s}.vendor = {entry['vendor']!r} not in {ALLOWED_VENDORS} "
-                f"(agy and grok are panel-review-only in v2)"
+                f"(agy is panel-review-only in v2)"
             )
         if not isinstance(entry["model"], str) or not entry["model"].strip():
             raise ConfigError(f"{path}: stages.{s}.model must be non-empty string")

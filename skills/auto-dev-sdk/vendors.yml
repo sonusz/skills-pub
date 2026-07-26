@@ -7,7 +7,8 @@
 # `--vendors-yml`, `AUTODEV_VENDORS_YML`, or a legacy repo-root vendors.yml.
 #
 # Required: `stages` mapping with every coding stage below.
-# Allowed coding vendors: claude, codex, openai. Agy and Grok are panel-review-only.
+# Allowed coding vendors: claude, codex, openai, cursor, and grok.
+# Agy is panel-review-only.
 # Vendor labels are case-insensitive and normalized to lowercase.
 # `codex` and `openai` both route through the Codex CLI.
 # `probe_interval_sec` (per stage) is the idle threshold for the
@@ -46,8 +47,8 @@ stages:
   # Context: medium; checks consistency and release readiness, not broad design
   # exploration. Effort: medium-high.
   review:
-    vendor: claude
-    model: opus
+    vendor: grok
+    model: grok-4.5
     probe_interval_sec: 900
     effort: high
 
@@ -65,9 +66,9 @@ panel:
   # consulted docs, then returns findings; they should not generate new design.
   # Context: medium-large, bounded to attached context files. Effort: high.
   reviewers:
-    # Claude: strong natural-language critique and ambiguity detection.
-    - vendor: claude
-      model: opus
+    # Agy-Claude: strong natural-language critique under Agy's auth/quota.
+    - vendor: agy
+      model: claude-opus-4-6-thinking
       effort: max
     # Grok: independent xAI-backed reviewer for divergence signal.
     - vendor: grok
@@ -81,8 +82,8 @@ panel:
   # Context: medium; reviewer outputs plus schema. Effort: high enough for
   # faithful extraction, lower than design generation.
   synthesizer:
-    vendor: claude
-    model: claude-sonnet-5
+    vendor: grok
+    model: grok-4.5
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
@@ -90,7 +91,7 @@ panel:
   # Short idle-timeout arbiter. It reads process tree and log tails, then says
   # extend or kill; it never develops artifacts. Context: small. Effort: low.
 probe:
-  vendor: claude
-  model: claude-haiku-4-5
+  vendor: grok
+  model: grok-4.5
   timeout_sec: 60
   effort: low

@@ -233,6 +233,25 @@ def test_probe_config_loaded_from_top_level(tmp_path):
     assert cfg.probe.flags == ("-c", "reasoning_effort=\"low\"")
 
 
+def test_grok_supported_for_stage_synthesizer_and_probe(tmp_path):
+    stages = _happy_stages()
+    stages["review"] = {"vendor": "grok", "model": "grok-4.5"}
+    panel = _happy_panel()
+    panel["synthesizer"] = {"vendor": "grok", "model": "grok-4.5"}
+    probe = {"vendor": "grok", "model": "grok-4.5"}
+
+    cfg = load_vendors_config(
+        _write(
+            tmp_path,
+            _yaml_dump(_happy_doc(stages=stages, panel=panel, probe=probe)),
+        )
+    )
+
+    assert cfg.resolve("review").vendor == "grok"
+    assert cfg.panel.synthesizer.vendor == "grok"
+    assert cfg.probe.vendor == "grok"
+
+
 def test_probe_unknown_vendor_rejected(tmp_path):
     body = _yaml_dump(_happy_doc(
         probe={"vendor": "agy", "model": "fake-probe-agy"},

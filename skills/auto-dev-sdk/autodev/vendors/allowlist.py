@@ -35,6 +35,10 @@ VENDOR_ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
         "--effort",                # accepted for uniformity (no cursor analog; ignored)
         "--max-budget-usd",        # cost cap
     ),
+    "grok": (
+        "--model",                 # explicit model override
+        "--effort",                # shared effort scale maps to Grok reasoning effort
+    ),
 }
 VENDOR_ALLOWED_FLAGS["openai"] = VENDOR_ALLOWED_FLAGS["codex"]
 
