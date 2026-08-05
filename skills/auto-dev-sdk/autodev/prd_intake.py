@@ -132,6 +132,13 @@ def validate_prd_text(text: str) -> PrdIntakeResult:
                 "Requirements section contains no `### R<N>:` markers"
             )
 
+    # Optional `## Assurance` section (per-requirement rigor levels).
+    # Absent section is valid (all-strict default); present-but-
+    # malformed is a lint error.
+    from autodev.assurance import parse_assurance
+    _, assurance_errors = parse_assurance(text, known_rs=set(markers_found))
+    errors.extend(assurance_errors)
+
     return PrdIntakeResult(
         ok=not errors,
         errors=errors,

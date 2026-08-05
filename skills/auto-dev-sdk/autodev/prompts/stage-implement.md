@@ -201,3 +201,13 @@ orchestrator doesn't loop for you.
 - Production code + tests at paths listed in `files_changed`.
 - Exit 0 on green; non-zero on abort.
 - Stdout: free-form TDD narrative. Not parsed.
+
+## Contract items (design altitude)
+
+Scope items with `design_depth: contract` hand YOU the interior
+design: the design packet pins only their boundary contract
+(`### Contract: <scope-id>` in design.md) plus a rough sketch. Design
+the interior as you build, author its unit tests yourself, and keep
+the contract satisfied. If the interior cannot satisfy the contract,
+report it as a blocking deviation naming the design layer — do not
+silently renegotiate the boundary.

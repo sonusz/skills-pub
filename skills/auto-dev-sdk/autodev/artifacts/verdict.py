@@ -93,6 +93,21 @@ class ReviewDecision:
         return data
 
 
+FindingCategory = Literal[
+    "missing", "invented", "ambiguous", "undelivered", "missized",
+    "untestable", "underspecified-contract", "other",
+]
+FailureClass = Literal["mainline", "edge"]
+MissizedDirection = Literal["coarse", "fine"]
+
+_VALID_CATEGORY = {
+    "missing", "invented", "ambiguous", "undelivered", "missized",
+    "untestable", "underspecified-contract", "other",
+}
+_VALID_FAILURE_CLASS = {"mainline", "edge"}
+_VALID_MISSIZED_DIRECTION = {"coarse", "fine"}
+
+
 @dataclass
 class PanelFinding:
     severity: Severity
@@ -103,9 +118,18 @@ class PanelFinding:
     # or "anchor.<filename>". Bare "primary_pair"/"anchor" supported read-only
     # for pre-extension files; v3 reviewers always emit filename-qualified.
     targets: list[str] = field(default_factory=list)
+    # Rigor-tier structured fields (docs/proposals/rigor-tier.md).
+    # `severity` holds the EFFECTIVE severity after the rigor filter;
+    # `severity_reported` preserves the reviewer's original when the
+    # filter changed it (absent ⇒ effective == reported).
+    category: str | None = None                 # FindingCategory
+    evidence_refs: list[str] = field(default_factory=list)
+    failure_class: str | None = None            # FailureClass
+    missized_direction: str | None = None       # MissizedDirection
+    severity_reported: Severity | None = None
 
     def to_dict(self) -> dict:
-        d = {
+        d: dict[str, Any] = {
             "severity": self.severity,
             "vendor": self.vendor,
             "summary": self.summary,
@@ -113,6 +137,18 @@ class PanelFinding:
         }
         if self.targets:
             d["targets"] = list(self.targets)
+        if self.category is not None:
+            d["category"] = self.category
+        if self.evidence_refs:
+            d["evidence_refs"] = list(self.evidence_refs)
+        if self.failure_class is not None:
+            d["failure_class"] = self.failure_class
+        if self.missized_direction is not None:
+            d["missized_direction"] = self.missized_direction
+        if self.severity_reported is not None and (
+            self.severity_reported != self.severity
+        ):
+            d["severity_reported"] = self.severity_reported
         return d
 
 
@@ -169,6 +205,11 @@ class PanelVerdict:
     # This is review output, not an input to the gate.
     coverage_map: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     decision: ReviewDecision | None = None
+    # Rigor filter audit: when the filter downgraded every blocking
+    # finding and the harness therefore overrode a canonical
+    # `retry_design` decision to `pass`, the original decision dict is
+    # preserved here. `halt_for_human` is never overridden.
+    decision_overridden_by_rigor: dict[str, Any] | None = None
 
     def has_invariant_violation(self) -> bool:
         return any(f.severity == "invariant_violation" for f in self.findings)
@@ -207,6 +248,10 @@ class PanelVerdict:
             d["coverage_map"] = self.coverage_map
         if self.decision is not None:
             d["decision"] = self.decision.to_dict()
+        if self.decision_overridden_by_rigor is not None:
+            d["decision_overridden_by_rigor"] = dict(
+                self.decision_overridden_by_rigor
+            )
         return d
 
 
@@ -272,6 +317,25 @@ def _validate(obj: dict) -> None:
                 raise SchemaError(f"findings[{i}] missing {k}")
         if f["severity"] not in _VALID_SEVERITY:
             raise SchemaError(f"findings[{i}].severity must be one of {_VALID_SEVERITY}")
+        if "category" in f and f["category"] not in _VALID_CATEGORY:
+            raise SchemaError(
+                f"findings[{i}].category must be one of {sorted(_VALID_CATEGORY)}"
+            )
+        if "failure_class" in f and f["failure_class"] not in _VALID_FAILURE_CLASS:
+            raise SchemaError(
+                f"findings[{i}].failure_class must be one of "
+                f"{sorted(_VALID_FAILURE_CLASS)}"
+            )
+        if ("missized_direction" in f
+                and f["missized_direction"] not in _VALID_MISSIZED_DIRECTION):
+            raise SchemaError(
+                f"findings[{i}].missized_direction must be one of "
+                f"{sorted(_VALID_MISSIZED_DIRECTION)}"
+            )
+        if "severity_reported" in f and f["severity_reported"] not in _VALID_SEVERITY:
+            raise SchemaError(
+                f"findings[{i}].severity_reported must be one of {_VALID_SEVERITY}"
+            )
     if "decision" in obj:
         if not isinstance(obj["decision"], dict):
             raise SchemaError("decision must be an object")
@@ -298,6 +362,11 @@ def load_verdict(path: Path) -> PanelVerdict:
                 severity=f["severity"], vendor=f["vendor"],
                 summary=f["summary"], cited_artifact_span=f.get("cited_artifact_span", {}),
                 targets=_load_targets(f),
+                category=f.get("category"),
+                evidence_refs=[str(x) for x in f.get("evidence_refs", [])],
+                failure_class=f.get("failure_class"),
+                missized_direction=f.get("missized_direction"),
+                severity_reported=f.get("severity_reported"),
             )
             for f in raw["findings"]
         ],
@@ -319,6 +388,7 @@ def load_verdict(path: Path) -> PanelVerdict:
             for df in raw.get("dropped_findings", [])
         ],
         coverage_map=raw.get("coverage_map", {}),
+        decision_overridden_by_rigor=raw.get("decision_overridden_by_rigor"),
         decision=(
             ReviewDecision(
                 node=raw["decision"]["node"],

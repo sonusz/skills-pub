@@ -27,45 +27,45 @@ intentionally override the harness defaults.
 stages:
   design:
     vendor: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     probe_interval_sec: 1200
     effort: max
   build:
     vendor: codex
-    model: gpt-5.4
+    model: gpt-5.6-terra
     probe_interval_sec: 3600
     effort: high
   spec:
     vendor: codex
-    model: gpt-5.4
+    model: gpt-5.6-terra
     probe_interval_sec: 900
     effort: high
   review:
     vendor: codex
-    model: gpt-5.4
+    model: gpt-5.6-terra
     probe_interval_sec: 900
     effort: high
 
 panel:
   reviewers:
     - vendor: claude
-      model: claude-sonnet-4-6
+      model: claude-sonnet-5
       effort: high
     - vendor: agy
       effort: high
     - vendor: codex
-      model: gpt-5.4
+      model: gpt-5.6-terra
       effort: high
   synthesizer:
     vendor: claude
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
 
 probe:
   vendor: claude
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   timeout_sec: 60
   effort: low
 ```
@@ -108,7 +108,7 @@ Notes:
 autodev --help
 autodev status <any-feature-name>    # "not found" if feature absent
 scripts/llm-test.sh --vendor claude  # real shared-vendors adapter smoke
-PYTHONPATH=. python3 -m pytest -q    # source checkout verification
+python3 -m pytest -q                 # source checkout verification
 ```
 
 ## First feature

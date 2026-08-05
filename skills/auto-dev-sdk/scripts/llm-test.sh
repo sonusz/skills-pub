@@ -10,7 +10,7 @@ TIMEOUT="120"
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/llm-test.sh [--vendor claude|openai|codex|agy] [--model MODEL] [--timeout SECONDS]
+  scripts/llm-test.sh [--vendor claude|openai|codex|agy|cursor|grok] [--model MODEL] [--timeout SECONDS]
 
 Runs one real model call through auto-dev-sdk's Python adapter and the packaged
 shared/vendors module. Success means the call returned any non-empty output.

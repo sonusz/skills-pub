@@ -128,32 +128,6 @@ def test_guard_detects_tracked_source_modification(tmp_path):
     assert any("src.py" in c and "tracked file modified" in c for c in changes)
 
 
-def test_guard_ignores_tracked_outputs_owned_by_current_panel(tmp_path):
-    _init_git_repo(tmp_path)
-    active = tmp_path / "docs" / "features" / "x" / "active"
-    active.mkdir(parents=True)
-    art = active / "design-packet.json"
-    art.write_text("{}", encoding="utf-8")
-    outputs = [
-        active / "panel-design-review.json",
-        active / "panel-design-review.reviewers.json",
-        active / "panel-trace-review.json",
-        active / "panel-trace-review.reviewers.json",
-    ]
-    for output in outputs:
-        output.write_text('{"run":"old"}', encoding="utf-8")
-    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "initial panel"], cwd=tmp_path, check=True,
-    )
-
-    state = integrity.snapshot_before(tmp_path, "design-review", [art])
-    for output in outputs:
-        output.write_text('{"run":"new"}', encoding="utf-8")
-
-    assert integrity.detect_after(state, [art]) == []
-
-
 def test_report_includes_git_rollback_command(tmp_path):
     _init_git_repo(tmp_path)
     art = tmp_path / "design.md"

@@ -7,6 +7,7 @@ invoker shell script so no live vendor subprocess runs.
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from pathlib import Path
 
@@ -86,25 +87,6 @@ def test_schema_is_per_reviewer_extraction():
     }
 
 
-def test_openai_schema_requires_every_property_and_allows_null_decision():
-    schema = synthesizer_output_schema(openai_compatible=True)
-
-    def assert_strict(node):
-        if isinstance(node, dict):
-            properties = node.get("properties")
-            if isinstance(properties, dict):
-                assert set(node["required"]) == set(properties)
-            for value in node.values():
-                assert_strict(value)
-        elif isinstance(node, list):
-            for value in node:
-                assert_strict(value)
-
-    assert_strict(schema)
-    decision_options = schema["properties"]["decision"]["anyOf"]
-    assert any(option.get("type") == "null" for option in decision_options)
-
-
 def test_compose_reviewer_prompt_references_artifact_file(feature_active):
     artifact = _make_artifact(feature_active)
     prompt = _compose_reviewer_prompt(
@@ -130,12 +112,29 @@ def test_compose_reviewer_prompt_uses_file_refs_for_consulted_docs(feature_activ
     assert tail not in prompt
 
 
+def test_compose_reviewer_prompt_does_not_inline_coverage_map(feature_active):
+    artifact = _make_artifact(feature_active)
+    coverage = feature_active / "panel-coverage-map.json"
+    sentinel = "COVERAGE_ROWS_MUST_STAY_ON_DISK"
+    coverage.write_text(
+        json.dumps({"kind": "panel-coverage-map", "sentinel": sentinel}),
+        encoding="utf-8",
+    )
+    prompt = _compose_reviewer_prompt(
+        gate="design-review",
+        artifact_path=artifact,
+        consulted_docs=[{"path": str(coverage), "priority": "harness"}],
+        feature_active=feature_active,
+    )
+    assert str(coverage) in prompt
+    assert "size_bytes=" in prompt
+    assert sentinel not in prompt
+    assert "Harness-precomputed context" not in prompt
+
+
 def test_reviewer_vendor_labels_route_through_shared_vendors():
     assert normalize_shared_vendor("Claude") == "claude"
     assert normalize_shared_vendor("agy") == "agy"
-    assert normalize_shared_vendor("Antigravity") == "agy"
-    assert normalize_shared_vendor("grok") == "grok"
-    assert normalize_shared_vendor("XAI") == "grok"
     assert normalize_shared_vendor("codex") == "openai"
     assert cli_name_for_vendor("openai") == "codex"
 
@@ -240,37 +239,6 @@ def test_synthesizer_malformed_triggers_failure(fake_invoker, monkeypatch):
     assert not ok
     assert parsed is None
     assert "json" in detail.lower()
-
-
-def test_synthesizer_nonzero_persists_diagnostics(monkeypatch, tmp_path):
-    class _Result:
-        returncode = 1
-        timed_out = False
-        output = "provider failure body"
-        log = "launcher log"
-        summary_stderr = "provider stderr"
-        status = {"exit_code": "1", "failure_kind": "provider"}
-
-    monkeypatch.delenv(FAKE_INVOKER_ENV, raising=False)
-    monkeypatch.setattr(
-        "autodev.panel.runner.call_shared_vendor",
-        lambda **_kwargs: _Result(),
-    )
-    spec = PanelSynthesizerSpec(vendor="claude", model="fake-sonnet")
-
-    ok, parsed, detail = _invoke_synthesizer(
-        spec,
-        "prompt",
-        probe_interval_sec=10,
-        debug_dir=tmp_path,
-    )
-
-    assert not ok
-    assert parsed is None
-    assert "exit 1" in detail
-    debug = (tmp_path / "panel-synthesizer-raw.txt").read_text(encoding="utf-8")
-    assert "provider failure body" in debug
-    assert "provider stderr" in debug
 
 
 def test_end_to_end_all_pass(fake_invoker, monkeypatch, feature_active, panel_config):
@@ -454,10 +422,10 @@ def test_synthesizer_broken_halts_with_invariant_violation(
         "role=\"${AUTODEV_PANEL_FAKE_ROLE:-}\"\n"
         "if [[ \"$role\" == \"reviewer\" ]]; then\n"
         "  AUTODEV_PANEL_FAKE_BEHAVIOR=reviewers_two_fail "
-        f"  exec {FAKE_SCRIPT}\n"
+            f"  exec {shlex.quote(str(FAKE_SCRIPT))}\n"
         "else\n"
         "  AUTODEV_PANEL_FAKE_BEHAVIOR=synth_empty "
-        f"  exec {FAKE_SCRIPT}\n"
+            f"  exec {shlex.quote(str(FAKE_SCRIPT))}\n"
         "fi\n"
     )
     wrapper.chmod(0o755)

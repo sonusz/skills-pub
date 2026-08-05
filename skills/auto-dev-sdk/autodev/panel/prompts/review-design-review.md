@@ -151,6 +151,67 @@ trace-review panel's job; do not audit them here.
 - `opinion` — style, phrasing, or preference; informational,
   never blocks.
 
+## Rigor calibration (PRD `## Assurance` map)
+
+The PRD may carry an `## Assurance` section assigning each `R<n>` a
+rigor level: `strict` / `core` / `loose` (plus a `Default:`). Read it
+before reviewing. Whether a blocking-severity finding actually blocks
+is decided mechanically by the harness from these levels — you do not
+change your severity vocabulary, but calibrate where you spend
+effort:
+
+- `strict` Rs: full scrutiny, corner cases included.
+- `core` Rs: main-path correctness is what blocks; edge/corner
+  findings are recorded but will not block.
+- `loose` Rs: failures are cheap to discover and fix; exhaustive
+  corner-case hunting here is wasted effort. Over-design findings
+  (INVENTED) on loose Rs still block — flagging invented obligations
+  is MORE valuable there, not less.
+
+Cross-R blast radius: if a failure inside a loose R's scope would
+endanger another R's guarantee (e.g. an auxiliary component's crash
+kills the main path), cite that endangered R explicitly with a
+`prd:R<n>` token in the finding's `evidence_refs` — the harness
+escalates the finding to the strictest cited R's level.
+
+Scope→R mapping fidelity: while judging scope items, audit each
+active item's `prd_ref` set for completeness against the work its
+description commits to. A scope item doing work that implicates an R
+it does not cite is an INVENTED-category finding (cite the missing R
+via `prd:R<n>`). This audit explicitly covers Depth: work implicating
+an `upfront`-depth R must cite that R — omitting it launders the item
+past the upfront→full precheck.
+
+## Design altitude (deferral soundness)
+
+Scope items may carry `design_depth: contract` — interior design
+deferred to build time; design.md pins only a `### Contract:
+<scope-id>` section plus an interior `Sketch`. A harness-injected
+depth list appears in your context when contract items exist. For
+every contract item, answer a fourth gate question: **is the deferral
+safe?**
+
+- Boundary crisp and contract complete (interface, invariants, error
+  semantics, dependencies, concurrency)? If not → blocking finding,
+  category `underspecified-contract` (fix the contract or fall back
+  to full design). This blocks at EVERY rigor level — `defer` waives
+  the interior, never the boundary.
+- Interior fits one build invocation? Judge MISSIZED for contract
+  items from the Sketch, not from enumerated internals.
+- Interior thinness on contract items is NOT a finding. Interior
+  *detail* present on an item whose cited Rs **resolve to `defer`**
+  IS an over-design finding (INVENTED category). Resolution is
+  most-conservative across ALL the item's cited Rs — `upfront >
+  auto > defer` — so an item citing both a `defer` R and an
+  `upfront` R resolves to `upfront`: its full interior design is
+  precheck-mandated, never an over-design finding.
+
+If the PRD has no Assurance section, every R is `strict` for rigor
+purposes and every Depth directive resolves to `auto` — rigor
+calibration then changes nothing, but the deferral-soundness gate
+question above still applies to every `contract` item, and interior
+thinness on contract items remains a non-finding.
+
 ## Targets (routing)
 
 Every finding includes a `targets` list: the filename-qualified
@@ -184,6 +245,11 @@ skip any. The synthesizer checks this table for completeness.
 Structural gaps (R<N> not referenced in scope at all) are already
 caught by precheck; your table judges whether the design content
 *adequately addresses* each requirement.
+
+When `panel-coverage-map.json` is listed in the required file inputs,
+read its harness-derived `coverage` and `design_depths` first. Use the
+coverage rows as the mechanical R-to-scope extraction rather than
+re-deriving that mapping; your job remains judging adequacy.
 
 Columns:
 
@@ -219,10 +285,22 @@ Per finding state:
 
 - `severity`: `invariant_violation` / `risk` / `opinion`
 - `summary`: one sentence naming the category (MISSING /
-  INVENTED / AMBIGUOUS / UNDELIVERED / MISSIZED / UNTESTABLE)
-  and the specific defect
+  INVENTED / AMBIGUOUS / UNDELIVERED / MISSIZED / UNTESTABLE /
+  UNDERSPECIFIED-CONTRACT) and the specific defect
+- `category`: the same category as a lowercase machine token —
+  one of `missing` / `invented` / `ambiguous` / `undelivered` /
+  `missized` / `untestable` / `underspecified-contract`
+- `failure_class`: `mainline` | `edge` — REQUIRED on every `risk`
+  finding. `mainline` = the failure hits the requirement's primary
+  path; `edge` = it needs a rare situation (unusual input,
+  concurrency window, interrupted restart). Absent → the harness
+  treats it as `mainline` (fail closed).
+- `missized_direction`: `coarse` | `fine` — REQUIRED when category
+  is `missized`. Absent → treated as `coarse` (fail closed).
 - `targets`: filename-qualified list
 - `Evidence`: one of:
+  - `Evidence: prd:R<n>` — a specific requirement (use this whenever
+    the finding traces to an R, and always for cross-R escalation)
   - `Evidence: prd:<section> "exact quoted text"`
   - `Evidence: design:<section> "exact quoted text"`
   - `Evidence: scope:<id> "exact quoted text"`
@@ -230,6 +308,10 @@ Per finding state:
   - `Evidence: test-plan:<test-case-id> "exact quoted text"`
   - `Evidence: <arch-doc-basename> "exact quoted text"`
   - `Evidence: code:<path>:<lineno>` for code-level citations
+- `evidence_refs`: the same references as a machine-readable list of
+  bare tokens, e.g. `evidence_refs: [prd:R3, scope:s-2]` — the
+  harness resolves rigor levels from these tokens; a blocking
+  finding without resolvable refs is treated as `strict`
 
 State your verdict: `pass` / `needs_revision` / `fail`. A
 synthesizer will extract your verdict, coverage table, and

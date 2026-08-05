@@ -84,6 +84,24 @@ and fails the panel.
 
 ## Rework protocol on reruns
 
+The orchestrator context may carry a harness-computed `REWORK_MODE`
+for this rerun — the trust-region step size, derived from the last
+verdict's shape (finding count, anchor specificity, fingerprint
+freshness). It is not advisory; follow it:
+
+- **`REWORK_MODE: patch`** — the remaining findings are few, fresh,
+  and narrowly anchored. Fix EXACTLY the cited findings with minimal
+  edits; preserve everything else byte-identical; do NOT restructure
+  or launch a coherent redesign — late-stage redesign perturbs an
+  almost-converged packet and creates fresh finding surface. If a
+  cited finding truly cannot be fixed without structural change, make
+  the minimal structural change and record a `patch-mode deviation`
+  in this round's `design-changelog.json` entry `reason` — never
+  silently redesign. Skip protocol steps 1–2 below; steps 5–7 still
+  apply.
+- **`REWORK_MODE: root-cause`** (or absent) — the full protocol
+  below.
+
 If `CONTEXT_ARTIFACTS` includes prior design artifacts, a panel verdict,
 or `build.json`, do **not** treat rework as "patch each finding in
 place." Use this protocol instead:
@@ -168,6 +186,38 @@ feature-spec stage later crystallizes code facts into `implemented-spec.md`'s
 architecture section, which the next feature will read as an
 arch-doc anchor.
 
+### Design altitude (mechanism 4 — contract-first)
+
+Each scope item carries `design_depth: "contract" | "full"` (default
+`full`). The PRD's `## Assurance` table may carry a `Depth` column
+per R — `upfront | auto | defer`:
+
+- `upfront` R: every item citing it MUST be `full` (precheck-enforced;
+  most-conservative wins across an item's cited Rs).
+- `defer` R: items whose cited Rs **resolve to `defer`**
+  (most-conservative across all the item's cited Rs: `upfront >
+  auto > defer`) MUST be `contract` — spending design context on
+  their interiors is itself an over-design finding. An item citing
+  both a `defer` R and an `upfront` R resolves to `upfront` and
+  needs full design.
+- `auto` (default): YOU propose the depth per item; the design-review
+  panel adjudicates deferral soundness.
+
+A `contract` item defers interior design to build time. For each one:
+
+- design.md gets a `### Contract: <scope-id>` section: interface
+  signatures / CLI / file formats, boundary invariants,
+  `Error semantics` (literal marker required), resource ownership,
+  permitted dependencies, concurrency semantics at the boundary, and
+  a one-paragraph `Sketch` of the interior approach (non-empty;
+  judged only for feasibility and build-invocation sizing, never for
+  completeness).
+- trace.md / test-plan.md cover **boundary behaviors only** — the
+  test-plan needs ≥1 row for the item whose Tier matches
+  contract/integration/e2e/boundary (precheck-enforced). Interior
+  unit tests are the build agent's job. Deliberately thin interior
+  coverage on contract items is correct, not a gap.
+
 ### Job (b) — work decomposition (→ scope.json)
 
 Chunk the design into implementable work units. Each scope item
@@ -192,6 +242,23 @@ committed to.
 Undercounting behaviors here is the #1 source of downstream
 failures: build ships code that passes thin tests but violates
 design-implied invariants.
+
+**Enumeration depth follows the PRD's `## Assurance` map.** When the
+PRD assigns per-R rigor levels (`strict` / `core` / `loose`),
+allocate depth accordingly:
+
+- `strict` Rs: exhaustive — every invariant, SLA, constraint, and
+  failure mode, corner cases included. This is the default when no
+  Assurance section exists.
+- `core` Rs: enumerate the main path completely and the failure
+  modes that would corrupt it; do not manufacture rare-situation
+  rows (concurrency windows, interrupted restarts) unless design.md
+  names them.
+- `loose` Rs: main-path behavior rows plus at most the failure
+  modes whose escape would be hard to notice; deliberately thin
+  test coverage is correct here, not a gap. Over-enumerating loose
+  Rs bloats the packet and invites reviewer findings on rows that
+  should not exist.
 
 ## Goals (what the design-review panel grades on)
 

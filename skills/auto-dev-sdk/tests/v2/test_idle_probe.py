@@ -251,12 +251,12 @@ def test_probe_can_use_codex_config(monkeypatch, tmp_path):
         stage="build", pid=99999, idle_sec=500, idle_cap_sec=300,
         stdout_path=stdout_log, stderr_path=tmp_path / "e.log",
         vendor_binary=str(script),
-        probe_config=ProbeConfig(vendor="codex", model="gpt-5.4"),
+        probe_config=ProbeConfig(vendor="codex", model="gpt-5.6-luna"),
     )
     assert v.action == "kill"
     args = args_file.read_text()
     assert "exec" in args
-    assert "gpt-5.4" in args
+    assert "gpt-5.6-luna" in args
     assert "Probe inputs" in received.read_text()
 
 

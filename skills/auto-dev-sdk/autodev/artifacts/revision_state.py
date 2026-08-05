@@ -17,7 +17,7 @@ Shape::
     }
 
 Invariants:
-  - 0 ≤ L[gate] ≤ L_MAX (==3) for each gate
+  - 0 ≤ L[gate] ≤ L_MAX (==10) for each gate
   - File absent ≡ all zeros + empty feedback
   - Atomic writes only
 
@@ -26,7 +26,8 @@ Budget semantics:
     bumps L[gate] by 1 and reruns the panel afterwards.
   - When L[gate] == L_MAX and the next panel run returns a blocking
     verdict, the orchestrator halts for human decision.
-  - Total panel runs per gate per cycle: 1 initial + up to 3 reruns = 4.
+  - Total panel runs per gate per cycle: 1 initial + up to L_MAX
+    reruns = L_MAX + 1.
   - Upstream diagnostic routing (route_to_layer) consumes the same
     L[gate] budget as a panel verdict rerun.
   - Design-review PRD targets get one automatic design rerun first; the

@@ -760,6 +760,12 @@ def cmd_update(args) -> int:
     ov.advance_cycle(active)
     from autodev.artifacts.revision_state import reset_on_amendment
     reset_on_amendment(active)
+    # Mechanism 2 (rigor-tier): a new PRD cycle starts fingerprint-clean;
+    # stale diagnosis / rework-mode artifacts must not leak across cycles.
+    from autodev.artifacts.fingerprint_history import clear_history
+    clear_history(active)
+    (active / "diagnosis.json").unlink(missing_ok=True)
+    (active / "rework-mode.json").unlink(missing_ok=True)
     # Emit a structured log event so the iteration-history manifest in
     # downstream stage prompts shows the amendment as a clear cycle
     # boundary. Anything in the manifest before this row was produced
@@ -860,6 +866,18 @@ def cmd_skip_gate(args) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return exit_codes.ERROR
+    # Mechanism 2 (rigor-tier): skipping a gate while a rigor-pivotal
+    # diagnosis is pending IS the "keep the tolerance" answer — record
+    # the declined (fingerprint, R) pairs so the same re-audit question
+    # is never asked again for this stall.
+    from autodev.diagnosis import record_skip_as_declined
+    declined = record_skip_as_declined(active, args.gate)
+    if declined:
+        print(
+            f"recorded {declined} declined re-audit pair(s) — the pending "
+            f"rigor re-audit for {args.gate} is answered as 'keep the "
+            f"tolerance' and will not be re-asked"
+        )
     # G16: warn if ceiling is approaching.
     from autodev.artifacts.overrides import (
         CEILING_REFUSE_AT, CEILING_WARNING_AT,
