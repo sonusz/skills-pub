@@ -48,6 +48,7 @@ from autodev.panel.schemas import synthesizer_output_schema_json
 from autodev.state.hashing import hash_file
 from autodev.state.atomic import atomic_write_json
 from autodev.state.log import JsonlLog
+from autodev.state.process_registry import registry_path
 
 from autodev.vendors.config import (
     ProbeConfig,
@@ -435,6 +436,7 @@ def _compose_reviewer_prompt(
 def _invoke_reviewer(
     spec: PanelReviewerSpec, prompt: str, probe_interval_sec: int,
     *, cwd: Path | None = None,
+    feature_active: Path | None = None,
     probe_config: ProbeConfig | None = None,
     log_emit: Callable[[dict], None] | None = None,
 ) -> ReviewerResult:
@@ -486,6 +488,10 @@ def _invoke_reviewer(
                     stderr_path=Path("/dev/null"),
                     probe_config=probe_config,
                     log_emit=log_emit,
+                    process_registry=(
+                        registry_path(feature_active)
+                        if feature_active is not None else None
+                    ),
                 )
                 if probe_config is not None
                 else None
@@ -509,6 +515,11 @@ def _invoke_reviewer(
                 # guard in panel/__init__.py backstops any stray mutation.
                 yolo=True,
                 idle_callback=idle_callback,
+                process_registry=(
+                    registry_path(feature_active)
+                    if feature_active is not None else None
+                ),
+                process_label=f"panel-reviewer:{spec.vendor}",
             )
             elapsed = time.monotonic() - t0
             if result.returncode != 0:
@@ -618,6 +629,7 @@ def _invoke_synthesizer(
     spec: PanelSynthesizerSpec, prompt: str, probe_interval_sec: int,
     *, cwd: Path | None = None,
     debug_dir: Path | None = None,
+    feature_active: Path | None = None,
     probe_config: ProbeConfig | None = None,
     log_emit: Callable[[dict], None] | None = None,
 ) -> tuple[bool, dict | None, str]:
@@ -697,6 +709,10 @@ def _invoke_synthesizer(
                 stderr_path=Path("/dev/null"),
                 probe_config=probe_config,
                 log_emit=log_emit,
+                process_registry=(
+                    registry_path(feature_active)
+                    if feature_active is not None else None
+                ),
             )
             if probe_config is not None
             else None
@@ -717,6 +733,11 @@ def _invoke_synthesizer(
             schema_json=schema_json,
             native_args=_read_only_native_args(spec.vendor),
             idle_callback=idle_callback,
+            process_registry=(
+                registry_path(feature_active)
+                if feature_active is not None else None
+            ),
+            process_label=f"panel-synthesizer:{spec.vendor}",
         )
         if result.returncode != 0:
             if debug_dir is not None:
@@ -982,6 +1003,7 @@ def _synthesize_and_build_verdict(
         cfg.synthesizer, synth_prompt, cfg.synthesizer_probe_interval_sec,
         cwd=vendor_cwd,
         debug_dir=feature_active,
+        feature_active=feature_active,
         probe_config=probe_config,
         log_emit=log_emit,
     )
@@ -1129,6 +1151,7 @@ def _run_one_group_pipeline(
                     group_spec["reviewer_prompt"],
                     cfg.reviewer_probe_interval_sec,
                     cwd=vendor_cwd,
+                    feature_active=feature_active,
                     probe_config=probe_config,
                     log_emit=log_emit,
                 )
@@ -1366,6 +1389,7 @@ def run_panel_gate_internal(
                     reviewer_prompt,
                     cfg.reviewer_probe_interval_sec,
                     cwd=vendor_cwd,
+                    feature_active=feature_active,
                     probe_config=probe_config,
                     log_emit=log_emit,
                 ): r

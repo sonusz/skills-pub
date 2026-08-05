@@ -198,6 +198,7 @@ def run_idle_probe(
     probe_config: ProbeConfig,
     vendor_binary: str | None = None,
     stream_output_file: Path | None = None,
+    process_registry: Path | None = None,
 ) -> ProbeVerdict:
     """Ask a short-lived LLM probe whether to extend or kill.
 
@@ -273,6 +274,8 @@ def run_idle_probe(
                 effort=effort,
                 native_args=native_args,
                 binary_override=vendor_binary if same_vendor else None,
+                process_registry=process_registry,
+                process_label=f"probe:{stage}",
             )
             if result.returncode != 0:
                 if result.timed_out:

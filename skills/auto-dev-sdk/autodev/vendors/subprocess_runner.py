@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from autodev.artifacts.failure import FailureReport, write_failure
+from autodev.state.process_registry import registry_path
 from autodev.vendors.config import ProbeConfig, StageSpec
 from autodev.vendors.fallback import build_candidates, resolve_candidate
 from autodev.vendors.probe_agent import ProbeVerdict, run_idle_probe
@@ -163,6 +164,7 @@ def run_stage_subprocess(
             stderr_path=stderr_path,
             probe_config=probe_config,
             log_emit=log_emit,
+            process_registry=registry_path(feature_active),
         )
         if probe_enabled
         else None
@@ -181,6 +183,8 @@ def run_stage_subprocess(
             env_overrides=env_overrides,
             idle_callback=idle_callback,
             idle_check_interval_sec=IDLE_POLL_INTERVAL_SEC,
+            process_registry=registry_path(feature_active),
+            process_label=stage,
         )
         exit_code = _exit_code_from_status(result.status, result.returncode)
         stdout_path.write_text(
@@ -280,6 +284,7 @@ def _build_idle_callback(
     stderr_path: Path,
     probe_config: ProbeConfig,
     log_emit: Callable[[dict], None] | None,
+    process_registry: Path | None = None,
 ) -> Callable[..., IdleAction]:
     """Construct the idle-watch callback `call_shared_vendor` will poll.
 
@@ -317,6 +322,7 @@ def _build_idle_callback(
                 stderr_path=stderr_path,
                 probe_config=probe_config,
                 stream_output_file=stream_file,
+                process_registry=process_registry,
             )
         except Exception:
             # Defensive: if the probe itself errors (transient OS

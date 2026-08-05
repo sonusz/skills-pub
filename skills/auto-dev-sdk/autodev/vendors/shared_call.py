@@ -13,9 +13,16 @@ import signal
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
+
+from autodev.state.process_registry import (
+    register_process,
+    terminate_process_group,
+    unregister_process,
+)
 
 
 # Action returned by an idle_callback to call_shared_vendor.
@@ -42,6 +49,28 @@ class SharedVendorResult:
     elapsed_sec: float
     output_dir: Path
     timed_out: bool = False
+
+
+@contextmanager
+def _tracked_process(
+    proc: subprocess.Popen,
+    *,
+    process_registry: Path | None,
+    label: str,
+) -> Iterator[None]:
+    """Register a new-session process for the duration of its vendor call."""
+    if process_registry is not None:
+        register_process(process_registry, pid=proc.pid, label=label)
+    try:
+        yield
+    finally:
+        # The shared shell runner historically killed its timer subshell but
+        # left the timer's long-lived `sleep` reparented to PID 1. A vendor
+        # call owns its entire new session, so no process in that group should
+        # survive once the group leader returns.
+        terminate_process_group(proc.pid)
+        if process_registry is not None:
+            unregister_process(process_registry, pid=proc.pid)
 
 
 def normalize_shared_vendor(vendor: str) -> str:
@@ -207,6 +236,8 @@ def call_shared_vendor(
     schema_json: str | None = None,
     idle_callback: Callable[..., IdleAction] | None = None,
     idle_check_interval_sec: int = 10,
+    process_registry: Path | None = None,
+    process_label: str | None = None,
 ) -> SharedVendorResult:
     if not SHARED_CALL_SCRIPT.exists():
         raise FileNotFoundError(
@@ -274,31 +305,36 @@ def call_shared_vendor(
                 env=env,
                 start_new_session=True,
             )
-            try:
-                summary_stdout, summary_stderr = proc.communicate(
-                    timeout=max(timeout_sec, 0) + 30 if timeout_sec else None,
-                )
-                elapsed = time.monotonic() - start
-                returncode = proc.returncode
-                outer_timed_out = False
-            except subprocess.TimeoutExpired as e:
+            with _tracked_process(
+                proc,
+                process_registry=process_registry,
+                label=process_label or output_id,
+            ):
                 try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    summary_stdout, summary_stderr = proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
+                    summary_stdout, summary_stderr = proc.communicate(
+                        timeout=max(timeout_sec, 0) + 30 if timeout_sec else None,
+                    )
+                    elapsed = time.monotonic() - start
+                    returncode = proc.returncode
+                    outer_timed_out = False
+                except subprocess.TimeoutExpired as e:
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        os.killpg(proc.pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
-                    summary_stdout, summary_stderr = proc.communicate()
-                elapsed = time.monotonic() - start
-                returncode = -1
-                summary_stdout = summary_stdout or e.stdout or ""
-                summary_stderr = summary_stderr or e.stderr or ""
-                outer_timed_out = True
+                    try:
+                        summary_stdout, summary_stderr = proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        summary_stdout, summary_stderr = proc.communicate()
+                    elapsed = time.monotonic() - start
+                    returncode = -1
+                    summary_stdout = summary_stdout or e.stdout or ""
+                    summary_stderr = summary_stderr or e.stderr or ""
+                    outer_timed_out = True
         else:
             # Idle-callback path. Redirect summary stdout/stderr to
             # files (so we can call proc.wait() repeatedly without
@@ -316,72 +352,77 @@ def call_shared_vendor(
                     env=env,
                     start_new_session=True,
                 )
-                hard_deadline = (
-                    start + (timeout_sec + 30)
-                    if timeout_sec and timeout_sec > 0
-                    else None
-                )
-                while True:
-                    try:
-                        proc.wait(timeout=max(idle_check_interval_sec, 1))
-                        break  # natural exit
-                    except subprocess.TimeoutExpired:
-                        # Still running: gather stream-file state and ask callback.
-                        stream_file = _live_stream_file(call_dir, normalized)
-                        if stream_file.exists():
-                            try:
-                                last_mtime = stream_file.stat().st_mtime
-                            except OSError:
-                                last_mtime = wallclock_start
-                        else:
-                            last_mtime = wallclock_start
-                        idle_sec = max(0.0, time.time() - last_mtime)
-                        elapsed_now = time.monotonic() - start
+                with _tracked_process(
+                    proc,
+                    process_registry=process_registry,
+                    label=process_label or output_id,
+                ):
+                    hard_deadline = (
+                        start + (timeout_sec + 30)
+                        if timeout_sec and timeout_sec > 0
+                        else None
+                    )
+                    while True:
                         try:
-                            action: IdleAction = idle_callback(
-                                stream_file=stream_file,
-                                idle_sec=idle_sec,
-                                elapsed_sec=elapsed_now,
-                                pid=proc.pid,
-                            )
-                        except Exception:
-                            # Defensive: if the callback explodes, treat
-                            # as "continue" so we don't lose the run for
-                            # an observability bug; the hard deadline
-                            # still backstops us.
-                            action = "continue"
-                        if action == "kill":
-                            try:
-                                os.killpg(proc.pid, signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
-                            try:
-                                proc.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
+                            proc.wait(timeout=max(idle_check_interval_sec, 1))
+                            break  # natural exit
+                        except subprocess.TimeoutExpired:
+                            # Still running: gather stream-file state and ask callback.
+                            stream_file = _live_stream_file(call_dir, normalized)
+                            if stream_file.exists():
                                 try:
-                                    os.killpg(proc.pid, signal.SIGKILL)
+                                    last_mtime = stream_file.stat().st_mtime
+                                except OSError:
+                                    last_mtime = wallclock_start
+                            else:
+                                last_mtime = wallclock_start
+                            idle_sec = max(0.0, time.time() - last_mtime)
+                            elapsed_now = time.monotonic() - start
+                            try:
+                                action: IdleAction = idle_callback(
+                                    stream_file=stream_file,
+                                    idle_sec=idle_sec,
+                                    elapsed_sec=elapsed_now,
+                                    pid=proc.pid,
+                                )
+                            except Exception:
+                                # Defensive: if the callback explodes, treat
+                                # as "continue" so we don't lose the run for
+                                # an observability bug; the hard deadline
+                                # still backstops us.
+                                action = "continue"
+                            if action == "kill":
+                                try:
+                                    os.killpg(proc.pid, signal.SIGTERM)
                                 except ProcessLookupError:
                                     pass
-                                proc.wait()
-                            outer_timed_out = True
-                            break
-                        if hard_deadline is not None and time.monotonic() >= hard_deadline:
-                            try:
-                                os.killpg(proc.pid, signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
-                            try:
-                                proc.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
                                 try:
-                                    os.killpg(proc.pid, signal.SIGKILL)
+                                    proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    try:
+                                        os.killpg(proc.pid, signal.SIGKILL)
+                                    except ProcessLookupError:
+                                        pass
+                                    proc.wait()
+                                outer_timed_out = True
+                                break
+                            if hard_deadline is not None and time.monotonic() >= hard_deadline:
+                                try:
+                                    os.killpg(proc.pid, signal.SIGTERM)
                                 except ProcessLookupError:
                                     pass
-                                proc.wait()
-                            outer_timed_out = True
-                            break
-                elapsed = time.monotonic() - start
-                returncode = proc.returncode if proc.returncode is not None else -1
+                                try:
+                                    proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    try:
+                                        os.killpg(proc.pid, signal.SIGKILL)
+                                    except ProcessLookupError:
+                                        pass
+                                    proc.wait()
+                                outer_timed_out = True
+                                break
+                    elapsed = time.monotonic() - start
+                    returncode = proc.returncode if proc.returncode is not None else -1
             summary_stdout = (
                 summary_out_path.read_text(encoding="utf-8")
                 if summary_out_path.exists()

@@ -227,9 +227,10 @@ def cmd_status(args) -> int:
     repo_root = _repo_root(args)
     fp = FeaturePaths(repo_root=repo_root, feature=args.feature)
     current = fp.current_status()
+    json_mode = bool(getattr(args, "json", False))
     report: dict = {"feature": args.feature, "exists": current is not None}
     if current is None:
-        if args.json:
+        if json_mode:
             print(json.dumps(report))
         else:
             print(f"{args.feature}: not found")
@@ -280,7 +281,7 @@ def cmd_status(args) -> int:
             },
             "pending_feedback": dict(s.pending_feedback),
         }
-    if args.json:
+    if json_mode:
         print(json.dumps(report, indent=2, default=str))
     else:
         print(f"feature: {report['feature']}")
@@ -552,8 +553,9 @@ def cmd_abort(args) -> int:
        cannot dispatch another stage after the current vendor dies
        (without this, the orchestrator treats the kill as a stage
        failure and revision-loop-dispatches the next producer).
-    2. SIGTERM the running vendor subprocess (5s grace, then SIGKILL).
-    3. Write `<stage>-failure.json` with kind=interrupted.
+    2. SIGTERM every registered vendor/reviewer process group (5s grace,
+       then SIGKILL), with legacy `.running.pid` support.
+    3. Stop the orchestrator and write an interrupted failure report.
 
     `autodev resume` clears the sentinel before the next `run`.
     """
@@ -574,11 +576,52 @@ def cmd_abort(args) -> int:
     # resume`. This is what makes abort actually stop the run.
     (active / ".pause").write_text("paused-by-abort\n", encoding="utf-8")
 
-    # Step 2: try to kill the running subprocess by its recorded PID.
+    from autodev.state.lock import Lock, read_owner
+    from autodev.state.process_registry import (
+        registry_path,
+        terminate_registered_processes,
+    )
+
+    # Capture the lock owner before terminating vendor groups. The
+    # orchestrator may observe their exit + .pause and release its lock while
+    # abort is still running.
+    owner = read_owner(active) or {}
+    orch_pid = owner.get("pid")
+    orch_host = owner.get("host")
+    local_owner = (
+        isinstance(orch_pid, int)
+        and orch_pid != os.getpid()
+        and (not orch_host or orch_host == socket.gethostname())
+    )
+
+    # Step 2: terminate every live process group registered by this exact
+    # orchestrator. Panel gates can have several reviewers and synthesizers
+    # running concurrently, so a single PID file is insufficient.
     pid_file = active / ".running.pid"
     killed_pid = None
     killed_stage = "unknown"
     reaped = False
+    registered_pids: set[int] = set()
+    registered_pgids: set[int] = set()
+    remaining_pgids: set[int] = set()
+
+    def record_registered(summary) -> None:
+        registered_pids.update(summary.pids)
+        registered_pgids.update(summary.pgids)
+        for pgid in summary.pgids:
+            if pgid in summary.remaining_pgids:
+                remaining_pgids.add(pgid)
+            else:
+                remaining_pgids.discard(pgid)
+
+    if local_owner:
+        record_registered(terminate_registered_processes(
+            registry_path(active),
+            owner_pid=orch_pid,
+            remove_stopped=False,
+        ))
+
+    # Backward compatibility for older runners that wrote one PID.
     if pid_file.exists():
         try:
             content = pid_file.read_text().strip().splitlines()
@@ -608,30 +651,12 @@ def cmd_abort(args) -> int:
         except (OSError, ValueError) as e:
             print(f"warning: couldn't parse {pid_file}: {e}", file=sys.stderr)
 
-    # Unified interrupted failure artifact (named by stage if known)
-    failure_name = f"{killed_stage}-failure.json" if killed_stage != "unknown" else "abort-failure.json"
-    fr = FailureReport(
-        stage=killed_stage, kind="interrupted",
-        detail=f"abort via autodev abort (pid={killed_pid})",
-        subprocess_exit=None, stderr_tail="",
-        ts="", subprocess_reaped=reaped,
-    )
-    write_failure(active / failure_name, fr)
-
     # Step 3: stop the ORCHESTRATOR itself (the `autodev run` process holding
     # the feature lock) — not just its vendor child. An orchestrator that has
     # not yet seen `.pause` would otherwise keep advancing the pipeline after
     # we free its lock, concurrent with the next run. (Defense in depth: the
     # orchestrator also self-terminates on its next lock heartbeat.)
-    from autodev.state.lock import Lock, read_owner
-    owner = read_owner(active) or {}
-    orch_pid = owner.get("pid")
-    orch_host = owner.get("host")
-    if (
-        isinstance(orch_pid, int)
-        and orch_pid != os.getpid()
-        and (not orch_host or orch_host == socket.gethostname())
-    ):
+    if local_owner:
         try:
             os.kill(orch_pid, signal.SIGTERM)
             for _ in range(50):
@@ -649,12 +674,44 @@ def cmd_abort(args) -> int:
         except (ProcessLookupError, PermissionError):
             pass
 
+        # A panel worker can register another reviewer between the first
+        # registry snapshot and delivery of SIGTERM to the orchestrator.
+        # With the owner now stopped, drain the registry once more so that
+        # race cannot leave a newly-created session orphaned.
+        record_registered(terminate_registered_processes(
+            registry_path(active),
+            owner_pid=orch_pid,
+            grace_sec=1.0,
+        ))
+
+    if registered_pgids:
+        reaped = not remaining_pgids
+
+    # Unified interrupted failure artifact (named by stage if known).
+    failure_name = f"{killed_stage}-failure.json" if killed_stage != "unknown" else "abort-failure.json"
+    fr = FailureReport(
+        stage=killed_stage, kind="interrupted",
+        detail=(
+            f"abort via autodev abort (legacy_pid={killed_pid}, "
+            f"registered_pids={sorted(registered_pids)}, "
+            f"registered_pgids={sorted(registered_pgids)}, "
+            f"remaining_pgids={sorted(remaining_pgids)})"
+        ),
+        subprocess_exit=None, stderr_tail="",
+        ts="", subprocess_reaped=reaped,
+    )
+    write_failure(active / failure_name, fr)
+
     # Release the lock (force: we just stopped the holder, so reclaim it even
     # though abort's own token doesn't match the orchestrator's).
     Lock(active, session_id="abort", verb="abort").release(force=True)
     print(
         f"aborted {args.feature}"
         + (f" (killed pid {killed_pid})" if killed_pid else "")
+        + (
+            f" (stopped {len(registered_pgids)} registered process group(s))"
+            if registered_pgids else ""
+        )
         + "; .pause sentinel written. Run `autodev resume` before next `autodev run`."
     )
     return exit_codes.OK

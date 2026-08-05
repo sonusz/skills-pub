@@ -2,7 +2,8 @@
 
 Best-effort: wraps `git status --porcelain`. Not a security boundary.
 
-Harness-internal paths (`.lock/`, `.pause`, `.running.pid`, `*.stdout.log`,
+Harness-internal paths (`.lock/`, `.pause`, `.running.pid`,
+`.running-pids.json`, `.route-feedback.json`, `*.stdout.log`,
 `*.stderr.log`, `*.tmp` mid-rename, `*-failure.json`, `log.jsonl`,
 `overrides.json`, `panel-*.json`) are excluded from the dirty check —
 they're orchestration state, not user code. `is_dirty` reflects only
@@ -24,6 +25,8 @@ _HARNESS_IGNORE_PATTERNS = (
     "docs/features/*/active/.lock/*",
     "docs/features/*/active/.pause",
     "docs/features/*/active/.running.pid",
+    "docs/features/*/active/.running-pids.json",
+    "docs/features/*/active/.route-feedback.json",
     "docs/features/*/active/.*.stdout.log",
     "docs/features/*/active/.*.stderr.log",
     "docs/features/*/active/*.tmp",

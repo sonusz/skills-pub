@@ -633,7 +633,12 @@ run_one_vendor() {
     ) &
     TIMER_PID=$!
     wait "$RUN_PID" || run_status=$?
-    kill "$TIMER_PID" 2>/dev/null || true
+    # TIMER_PID is a subshell whose child is the long-lived sleep. Killing
+    # only the subshell reparents that sleep to PID 1, leaving one watchdog
+    # behind after every successful vendor call. Terminate the whole timer
+    # tree and reap the subshell before returning.
+    kill_tree "$TIMER_PID" TERM
+    wait "$TIMER_PID" 2>/dev/null || true
     if [ -e "$timeout_marker" ]; then
       run_status=124
     fi

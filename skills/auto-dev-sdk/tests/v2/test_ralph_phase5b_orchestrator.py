@@ -14,10 +14,15 @@ from autodev import ralph
 from autodev import __version__ as HARNESS_VERSION
 from autodev.artifacts.common import write_markdown_with_hash
 from autodev.artifacts.design_packet import write_accepted_design, write_design_packet
+from autodev.artifacts.revision_state import RevisionState, load_state, write_state
 from autodev.artifacts.scope import Scope, ScopeItem, write_scope
 from autodev.artifacts.verdict import PanelVerdict, write_verdict
-from autodev.errors import GatePending, SchemaError
-from autodev.orchestrator import Orchestrator, OrchestratorConfig
+from autodev.errors import GatePending, PreflightError, SchemaError
+from autodev.orchestrator import (
+    ROUTE_FEEDBACK_FILENAME,
+    Orchestrator,
+    OrchestratorConfig,
+)
 from autodev.state.hashing import hash_file
 from autodev.vendors.config import (
     PanelConfig,
@@ -500,6 +505,83 @@ def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
     assert not (feature_active / "test-plan.md").exists()
     assert not (feature_active / "ralph-state.json").exists()
     assert not (feature_active / "ralph-review.json").exists()
+    assert not (feature_active / "build.json").exists()
+
+    # The selected build diagnosis survives downstream invalidation and is
+    # wired into the next design prompt through pending_feedback.
+    route_feedback = feature_active / ROUTE_FEEDBACK_FILENAME
+    assert route_feedback.exists()
+    payload = json.loads(route_feedback.read_text(encoding="utf-8"))
+    assert payload["trigger_ref"] == "build.json#/deviations/0"
+    assert payload["scope_id"] == "t-1"
+    assert payload["deviation"]["diagnosis"]["defective_layer"] == "design"
+    assert load_state(feature_active).pending_feedback["design"] == [
+        ROUTE_FEEDBACK_FILENAME
+    ]
+    context = orch._context_artifacts_for_stage(
+        feature_active,
+        "design",
+        feature_active / "design.md",
+        [
+            feature_active / "scope.json",
+            feature_active / "trace.md",
+            feature_active / "test-plan.md",
+            feature_active / "design-changelog.json",
+        ],
+    )
+    assert str(route_feedback) in context
+
+    # Feedback is retained until success, then consumed and its private
+    # snapshot is removed.
+    orch._consume_stage_feedback(feature_active, "design")
+    assert load_state(feature_active).pending_feedback == {}
+    assert not route_feedback.exists()
+
+
+def test_legacy_deleted_build_feedback_uses_challenge_record(
+    git_repo, feature_active,
+):
+    """Recover a run routed by the buggy build.json-before-delete ordering."""
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    missing_build = feature_active / "build.json"
+    state = RevisionState()
+    state.pending_feedback = {"design": [str(missing_build)]}
+    write_state(feature_active, state)
+    challenge = feature_active / "build-challenges.md"
+    challenge.write_text("qualify repository absence as runtime-only\n")
+
+    context = orch._context_artifacts_for_stage(
+        feature_active,
+        "design",
+        feature_active / "design.md",
+        [
+            feature_active / "scope.json",
+            feature_active / "trace.md",
+            feature_active / "test-plan.md",
+            feature_active / "design-changelog.json",
+        ],
+    )
+    assert str(challenge) in context
+
+
+def test_missing_pending_feedback_fails_closed(git_repo, feature_active):
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    state = RevisionState()
+    state.pending_feedback = {"design": ["missing-feedback.json"]}
+    write_state(feature_active, state)
+
+    with pytest.raises(PreflightError, match="pending feedback.*missing"):
+        orch._context_artifacts_for_stage(
+            feature_active,
+            "design",
+            feature_active / "design.md",
+            [
+                feature_active / "scope.json",
+                feature_active / "trace.md",
+                feature_active / "test-plan.md",
+                feature_active / "design-changelog.json",
+            ],
+        )
 
 
 def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature_active):

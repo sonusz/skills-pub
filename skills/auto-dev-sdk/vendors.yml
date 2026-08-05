@@ -28,8 +28,8 @@ stages:
   # Context: largest stage; reads PRD, repo structure, prior completed specs,
   # and panel feedback during rework. Effort: highest.
   design:
-    vendor: openai
-    model: gpt-5.6-sol
+    vendor: claude
+    model: fable
     probe_interval_sec: 2400
     effort: max
 
@@ -37,8 +37,8 @@ stages:
   # Context: large and repo-heavy; needs enough room for design packet,
   # current source, failures, and test output. Effort: high.
   build:
-    vendor: codex
-    model: gpt-5.6-sol
+    vendor: claude
+    model: opus
     probe_interval_sec: 3600
     effort: max
 
@@ -46,8 +46,8 @@ stages:
   # Context: medium; checks consistency and release readiness, not broad design
   # exploration. Effort: medium-high.
   review:
-    vendor: claude
-    model: opus
+    vendor: codex
+    model: gpt-5.6-luna
     probe_interval_sec: 900
     effort: high
 
@@ -56,7 +56,7 @@ stages:
   # files. Effort: medium-high.
   spec:
     vendor: codex
-    model: gpt-5.6-sol
+    model: gpt-5.6-luna
     probe_interval_sec: 900
     effort: medium
 
@@ -69,20 +69,22 @@ panel:
     - vendor: claude
       model: opus
       effort: max
-    # Grok: independent xAI-backed reviewer for divergence signal.
-    - vendor: grok
-      model: grok-4.5
-      effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
       model: gpt-5.6-sol
       effort: max
+    # Agy/Gemini seat REMOVED 2026-07-29 20:14 UTC — agy CLI reported
+    # "Individual quota reached ... Resets in 153h39m" (≈ 2026-08-05 06:00 UTC).
+    # Re-add verbatim once `agy -p 'ok'` succeeds again:
+    #   - vendor: agy
+    #     model: gemini-3.1-pro-high
+    #     effort: max
   # Synthesizes reviewer outputs only; does not re-review the artifact.
   # Context: medium; reviewer outputs plus schema. Effort: high enough for
   # faithful extraction, lower than design generation.
   synthesizer:
-    vendor: claude
-    model: claude-sonnet-5
+    vendor: codex
+    model: gpt-5.6-luna
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300

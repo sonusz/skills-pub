@@ -1,7 +1,12 @@
 """v2-14/15/16: CLI verb smoke + pause sentinel + git prerequisite."""
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +21,14 @@ def test_cli_status_nonexistent_returns_ok(git_repo, capsys, monkeypatch):
     assert code == exit_codes.OK
     out = capsys.readouterr().out
     assert "not found" in out
+
+
+def test_cli_explain_uses_human_status_mode(git_repo, feature_active, capsys):
+    code = main(["explain", "demo", "--repo-root", str(git_repo)])
+    assert code == exit_codes.OK
+    out = capsys.readouterr().out
+    assert "feature: demo" in out
+    assert "status:  active" in out
 
 
 def test_cli_prd_from_file(git_repo, capsys, tmp_path):
@@ -67,6 +80,85 @@ def test_cli_abort_writes_pause_sentinel(git_repo, feature_active, capsys):
         "abort must write .pause so orchestrator stops at next stage boundary"
     out = capsys.readouterr().out
     assert "resume" in out  # operator instruction present
+
+
+def test_cli_abort_reaps_registered_new_session_child(
+    git_repo, feature_active, capsys,
+):
+    """Regression: panel children must not survive after their owner is killed."""
+    marker = feature_active / ".abort-test-child-pid"
+    helper_code = textwrap.dedent(
+        """\
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        from autodev.state.lock import Lock
+        from autodev.state.process_registry import register_process, registry_path
+
+        active = Path(sys.argv[1])
+        marker = Path(sys.argv[2])
+        lock = Lock(active, session_id="abort-test", verb="run")
+        lock.acquire()
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        register_process(
+            registry_path(active),
+            pid=child.pid,
+            label="panel-reviewer:test",
+        )
+        marker.write_text(str(child.pid), encoding="utf-8")
+        time.sleep(60)
+        """
+    )
+    helper = subprocess.Popen(
+        [sys.executable, "-c", helper_code, str(feature_active), str(marker)],
+        cwd=Path(__file__).resolve().parents[2],
+    )
+    child_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.exists()
+        child_pid = int(marker.read_text(encoding="utf-8"))
+
+        code = main(["abort", "demo", "--repo-root", str(git_repo)])
+        assert code == exit_codes.OK
+        helper.wait(timeout=7)
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"registered child pid {child_pid} survived abort")
+
+        assert not (feature_active / ".running-pids.json").exists()
+        failure = json.loads(
+            (feature_active / "abort-failure.json").read_text(encoding="utf-8")
+        )
+        assert child_pid in json.loads(
+            failure["detail"].split("registered_pids=", 1)[1].split(
+                ", registered_pgids=", 1
+            )[0]
+        )
+        assert "stopped 1 registered process group" in capsys.readouterr().out
+    finally:
+        if child_pid is not None:
+            try:
+                os.killpg(child_pid, 9)
+            except ProcessLookupError:
+                pass
+        if helper.poll() is None:
+            helper.kill()
+        helper.wait(timeout=2)
 
 
 def test_cli_skip_gate_requires_reason(git_repo, feature_active, capsys):

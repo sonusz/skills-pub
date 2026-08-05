@@ -18,7 +18,11 @@ from autodev.artifacts.design_packet import (
 from autodev.artifacts.design_package_history import archive_design_package
 from autodev.artifacts.implementation_index import write_implementation_index
 from autodev.artifacts.prd_checklist import write_prd_checklist
-from autodev.artifacts.revision_state import reset_prd_target_streak
+from autodev.artifacts.revision_state import (
+    load_state,
+    reset_prd_target_streak,
+    write_state,
+)
 from autodev.artifacts.verdict import (
     PanelVerdict,
     panel_verdict_transport_incomplete,
@@ -32,7 +36,7 @@ from autodev.panel import run_panel_gate, verdict_exists_and_valid
 from autodev.preflight import preflight_feature, preflight_repo_root
 from autodev.revision_loop import (
     Decision, DecisionKind, RouteDecision,
-    handle_panel_verdict, route_to_layer,
+    consume_pending_feedback, handle_panel_verdict, route_to_layer,
 )
 from autodev.state.cascade import StalenessCascade
 from autodev.state.hashing import hash_file
@@ -54,6 +58,13 @@ ARTIFACT_TO_GATE = {
 # its prior artifact handed back for in-place amendment, NOT a semantic
 # design revision. After this many attempts the failure propagates.
 STAGE_OUTPUT_RETRY_MAX = 3
+
+# A build diagnostic may route back to design, but route invalidation must
+# delete build.json so the later build cannot be mistaken for fresh output.
+# Preserve the selected diagnostic in this harness-internal snapshot before
+# deleting downstream artifacts.
+ROUTE_FEEDBACK_FILENAME = ".route-feedback.json"
+BUILD_CHALLENGES_FILENAME = "build-challenges.md"
 
 # Position of each cascade artifact, used to express "stop the `run`
 # loop before the pipeline crosses into a later phase" (the --until
@@ -791,6 +802,7 @@ class Orchestrator:
             archive_path = None
             if stage == "design":
                 archive_path = archive_design_package(active)
+            self._consume_stage_feedback(active, stage)
             detail = {
                 "artifact": str(primary_target),
                 "elapsed_sec": result.elapsed_sec,
@@ -824,6 +836,32 @@ class Orchestrator:
             rendered = str(path)
             if rendered not in context_artifacts:
                 context_artifacts.append(rendered)
+
+        # Route feedback is persisted separately from the artifacts that route
+        # invalidation deletes. Keep it pending across output retries and only
+        # consume it after the producer stage completes successfully.
+        pending = load_state(active).pending_feedback.get(stage, [])
+        for raw_path in pending:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = active / path
+            if path.exists():
+                append_once(path)
+                continue
+
+            # Backward compatibility for runs routed by harness versions that
+            # stored build.json itself as feedback and then deleted it. The
+            # build stage's durable challenge record contains the same concrete
+            # routing diagnosis and lets an in-flight run recover once.
+            if stage == "design" and path.name == "build.json":
+                legacy_fallback = active / BUILD_CHALLENGES_FILENAME
+                if legacy_fallback.exists():
+                    append_once(legacy_fallback)
+                    continue
+            raise PreflightError(
+                f"pending feedback for stage {stage!r} is missing: {path}. "
+                "Refusing to rerun without the diagnostic that triggered it."
+            )
 
         # v3-core: no explicit pending_feedback queue for panel reruns.
         # Instead, pass stage-relevant panel verdicts as context to
@@ -884,6 +922,19 @@ class Orchestrator:
         if stage != "spec" and build_json.exists():
             append_once(build_json)
         return context_artifacts
+
+    def _consume_stage_feedback(self, active: Path, stage: str) -> None:
+        """Clear feedback only after a producer stage succeeds.
+
+        Failed subprocesses and output-validation retries retain the pending
+        paths, so a diagnostic cannot be lost between attempts.
+        """
+        consumed = consume_pending_feedback(active, stage)
+        if stage != "design":
+            return
+        route_feedback = (active / ROUTE_FEEDBACK_FILENAME).resolve()
+        if any(Path(path).resolve() == route_feedback for path in consumed):
+            route_feedback.unlink(missing_ok=True)
 
     def _run_stage_subprocess_checked(
         self,
@@ -1522,11 +1573,20 @@ class Orchestrator:
                 )
                 raise GatePending("build_blocking", decision.reason)
 
-            # Successful route: invalidate target layer's artifacts
-            # and rewrite pending_feedback to the absolute build.json
-            # path (so the rerun agent can read it).
+            # Successful route: freeze the selected build diagnostic before
+            # invalidation deletes build.json, then point pending_feedback at
+            # the durable snapshot (and the richer build challenge log when
+            # present).
+            feedback_paths = self._snapshot_route_feedback(
+                active=active,
+                layer=layer,
+                trigger_ref=trigger_ref,
+                deviation_index=i,
+                deviation=dev,
+                build_report=report.to_dict(),
+            )
             self._apply_route_invalidation(active, layer)
-            self._reanchor_route_feedback(active, decision, build_path)
+            self._reanchor_route_feedback(active, decision, feedback_paths)
 
             logger.emit(
                 stage="build", event="route-triggered",
@@ -1588,16 +1648,53 @@ class Orchestrator:
         # Also drop ralph-state since upstream changed.
         (active / "ralph-state.json").unlink(missing_ok=True)
 
+    def _snapshot_route_feedback(
+        self,
+        *,
+        active: Path,
+        layer: str,
+        trigger_ref: str,
+        deviation_index: int,
+        deviation: dict,
+        build_report: dict,
+    ) -> list[Path]:
+        """Persist a route diagnostic outside the invalidation cascade."""
+        from autodev.state.atomic import atomic_write_json
+
+        feedback_path = active / ROUTE_FEEDBACK_FILENAME
+        atomic_write_json(feedback_path, {
+            "kind": "build-route-feedback",
+            "target_layer": layer,
+            "target_stage": "design" if layer == "design" else layer,
+            "trigger_ref": trigger_ref,
+            "deviation_index": deviation_index,
+            "scope_id": deviation.get("scope_id"),
+            "deviation": deviation,
+            "build_report": build_report,
+            "instruction": (
+                "Revise the routed layer to resolve this blocking build "
+                "diagnostic. Preserve requirements and artifacts that are "
+                "unrelated to the selected deviation."
+            ),
+        })
+        paths = [feedback_path]
+        challenges = active / BUILD_CHALLENGES_FILENAME
+        if challenges.exists():
+            paths.append(challenges)
+        return paths
+
     def _reanchor_route_feedback(
-        self, active: Path, decision: RouteDecision, build_path: Path,
+        self, active: Path, decision: RouteDecision, feedback_paths: list[Path],
     ) -> None:
-        """g-24: route_to_layer records the trigger_ref (symbolic) as
-        the feedback anchor; the rerun agent needs an actual path it
-        can read. Rewrite pending_feedback[<producer>] to the
-        absolute build.json path."""
-        from autodev.artifacts.revision_state import load_state, write_state
+        """Replace the symbolic trigger with durable, readable feedback."""
         s = load_state(active)
         if decision.stage_to_rerun is None:
             return
-        s.pending_feedback[decision.stage_to_rerun] = [str(build_path)]
+        rendered: list[str] = []
+        for path in feedback_paths:
+            try:
+                rendered.append(str(path.resolve().relative_to(active.resolve())))
+            except ValueError:
+                rendered.append(str(path))
+        s.pending_feedback[decision.stage_to_rerun] = rendered
         write_state(active, s)
