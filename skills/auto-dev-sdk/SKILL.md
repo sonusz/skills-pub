@@ -98,6 +98,10 @@ call the harness checks the vendor's remaining quota and uses the primary, else 
 first fallback with enough quota. The harness owns all of this — I do **not** edit
 `vendors.yml` or pick vendors.
 
+Quota lookup is implemented for Claude, Codex/OpenAI, Cursor, Agy, and Grok.
+Agy uses its prompt-free loopback quota server and Grok uses ACP billing; neither
+lookup spends model quota. Unreadable quota fails closed.
+
 When **every** candidate for a role is below its minimum, `autodev run`/`next`:
 - exits **2 (GATE_PENDING)**,
 - prints a machine line `QUOTA_PAUSE feature=<f> role=<r> resume_at=<ISO8601>`,

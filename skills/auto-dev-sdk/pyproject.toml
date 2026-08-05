@@ -33,6 +33,6 @@ shared = ["vendors/*", "vendors/scripts/*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
-  "live: opt-in tests that invoke live vendor CLIs (claude/agy/codex); skipped by default. Run with `pytest -m live`.",
+  "live: opt-in tests that invoke live vendor CLIs (claude/agy/codex/grok); skipped by default. Run with `pytest -m live`.",
 ]
 addopts = "-m 'not live'"

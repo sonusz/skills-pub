@@ -81,6 +81,9 @@ Notes:
 - Vendor labels are case-insensitive and normalized to lowercase. `codex`
   and `openai` both route through the Codex CLI. An Agy panel reviewer may
   omit `model` to use the model selected in agy's own configuration.
+- Quota gates support Claude, Codex/OpenAI, Cursor, Agy, and Grok. Agy reads
+  `RetrieveUserQuotaSummary` from its prompt-free local server; Grok reads ACP
+  billing. Both probes avoid issuing a model request.
 - All harness-owned LLM calls go through the packaged
   `shared/vendors/scripts/call.sh` interface and use its unified
   `<id>/out`, `<id>/status`, `<id>/log`, `<id>/stream` output contract.

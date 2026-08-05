@@ -15,12 +15,14 @@ from autodev.vendors.quota import claude as _claude
 from autodev.vendors.quota import codex as _codex
 from autodev.vendors.quota import cursor as _cursor
 from autodev.vendors.quota import agy as _agy
+from autodev.vendors.quota import grok as _grok
 from autodev.vendors.quota.base import QuotaResult
 
 _FETCHERS = {
     "claude": _claude.fetch,
     "cursor": _cursor.fetch,
     "agy": _agy.fetch,
+    "grok": _grok.fetch,
     "codex": _codex.fetch,
 }
 
@@ -35,6 +37,8 @@ def normalize_quota_vendor(vendor: str) -> str:
         return "cursor"
     if raw in {"agy", "antigravity"}:
         return "agy"
+    if raw in {"grok", "xai"}:
+        return "grok"
     if raw in {"codex", "openai", "gpt"}:
         return "codex"
     return raw

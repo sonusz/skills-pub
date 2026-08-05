@@ -40,6 +40,19 @@ def test_first_adequate_fallback(monkeypatch):
     assert c.vendor == "cursor"
 
 
+def test_agy_to_grok_quota_fallback(monkeypatch):
+    table = {"agy": _qr("agy", 4), "grok": _qr("grok", 55)}
+    monkeypatch.setattr(fallback, "get_remaining", lambda v, m=None, force=False: table[v])
+    c = fallback.resolve_candidate(
+        [
+            fallback.Candidate("agy", "gemini-3.1-pro-high", min_quota_pct=20),
+            fallback.Candidate("grok", "grok-4.5", min_quota_pct=10),
+        ],
+        role="reviewer",
+    )
+    assert c.vendor == "grok"
+
+
 def test_halt_uses_earliest_reset(monkeypatch):
     r_late = now_utc() + timedelta(hours=2)
     r_early = now_utc() + timedelta(hours=1)
