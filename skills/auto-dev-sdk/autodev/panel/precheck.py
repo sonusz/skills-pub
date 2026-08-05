@@ -71,6 +71,59 @@ def _extract_section_headers(md: str) -> set[str]:
 
 # ------------------------- G1: design-review ---------------------------
 
+def _contract_section(design_text: str, scope_id: str) -> str | None:
+    """Body of ``### Contract: <scope_id>`` up to the next ###/## header,
+    or None if absent."""
+    lines = design_text.splitlines()
+    start = None
+    header_re = re.compile(
+        rf"^\s*###\s+Contract:\s*{re.escape(scope_id)}\s*$")
+    for i, line in enumerate(lines):
+        if start is None and header_re.match(line):
+            start = i
+            continue
+        if start is not None and re.match(r"^\s*#{2,3}\s+", line):
+            return "\n".join(lines[start + 1:i])
+    if start is not None:
+        return "\n".join(lines[start + 1:])
+    return None
+
+
+def _sketch_nonempty(section: str) -> bool:
+    """True when a `Sketch` marker is followed by ≥1 non-heading content
+    line (or carries content on its own line)."""
+    lines = section.splitlines()
+    for i, line in enumerate(lines):
+        if "Sketch" not in line:
+            continue
+        after = line.split("Sketch", 1)[1].strip(" :*-")
+        if after:
+            return True
+        for nxt in lines[i + 1:]:
+            if not nxt.strip():
+                continue
+            return not re.match(r"^\s*#", nxt)
+    return False
+
+
+_BOUNDARY_TIER_RE = re.compile(
+    r"contract|integration|e2e|boundary", re.IGNORECASE)
+
+
+def _has_boundary_test(tp_text: str, scope_id: str) -> bool:
+    """≥1 test-plan table row for ``scope_id`` whose Tier cell matches
+    the boundary vocabulary. Column positions follow the canonical
+    layout (Test ID | Scope ID | Description | Tier | ...)."""
+    for line in tp_text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 4 and cells[1] == scope_id \
+                and _BOUNDARY_TIER_RE.search(cells[3]):
+            return True
+    return False
+
+
 def precheck_design_review(feature_active: Path) -> PrecheckResult:
     prd_path = feature_active / "prd.md"
     design_path = feature_active / "design.md"
@@ -167,6 +220,63 @@ def precheck_design_review(feature_active: Path) -> PrecheckResult:
                     False,
                     f"precheck_design_review: scope item {item.get('id')!r} "
                     f"design_ref token {tok!r} not found in design.md"
+                )
+
+    # Mechanism 4 — design-altitude rules (docs/proposals/rigor-tier.md):
+    # enum validity, upfront→full enforcement (most-conservative across
+    # cited Rs), and contract-section requirements for contract items.
+    from autodev.assurance import max_depth, parse_assurance
+    assurance, _assur_errs = parse_assurance(prd_text)
+    for item in in_scope:
+        if item.get("status") != "active":
+            continue
+        depth = item.get("design_depth", "full")
+        if depth not in ("contract", "full"):
+            return PrecheckResult(
+                False,
+                f"precheck_design_review: scope item {item.get('id')!r} "
+                f"design_depth {depth!r} invalid (contract|full)"
+            )
+        cited_rs = [t for t in item.get("prd_ref", [])
+                    if re.fullmatch(r"R\d+", str(t))]
+        directive = max_depth([assurance.depth_for(r) for r in cited_rs])
+        if directive == "upfront" and depth != "full":
+            return PrecheckResult(
+                False,
+                f"precheck_design_review: scope item {item.get('id')!r} "
+                f"cites an upfront-depth requirement but has "
+                f"design_depth: contract — upfront forces full design"
+            )
+        if depth == "contract":
+            section = _contract_section(design_text, str(item.get("id")))
+            if section is None:
+                return PrecheckResult(
+                    False,
+                    f"precheck_design_review: contract item "
+                    f"{item.get('id')!r} has no '### Contract: "
+                    f"{item.get('id')}' section in design.md"
+                )
+            if "Error semantics" not in section:
+                return PrecheckResult(
+                    False,
+                    f"precheck_design_review: contract section for "
+                    f"{item.get('id')!r} missing 'Error semantics' entry"
+                )
+            if not _sketch_nonempty(section):
+                return PrecheckResult(
+                    False,
+                    f"precheck_design_review: contract section for "
+                    f"{item.get('id')!r} missing a non-empty 'Sketch'"
+                )
+            if not _has_boundary_test(
+                tp_path.read_text(encoding="utf-8"), str(item.get("id")),
+            ):
+                return PrecheckResult(
+                    False,
+                    f"precheck_design_review: contract item "
+                    f"{item.get('id')!r} has no boundary test in "
+                    f"test-plan.md (Tier must match "
+                    f"contract|integration|e2e|boundary)"
                 )
 
     # source_hash provenance: scope.source_hash == hash_file(prd)

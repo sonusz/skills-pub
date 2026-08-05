@@ -41,6 +41,7 @@ PRD MUST have:
 ## Users              ← primary + future users; non-users explicit
 ## Architectural principles (binding)   ← optional but recommended; A1..An
 ## Requirements       ← R1, R2, ... (### R<n>: Title blocks)
+## Assurance          ← optional; per-R rigor levels (strict/core/loose)
 ## Constraints        ← runtime, libraries, language, platform
 ## Success Criteria   ← observable verifications, not vibes
 ## Out of Scope       ← what this feature explicitly does NOT do
@@ -100,11 +101,69 @@ thinking before scope is clear. Order:
 6. Constraints (runtime, libs, platform)
 7. Success Criteria (observable verifications)
 
-### 3. Interrogation checklist
+### 3. Assign per-requirement rigor (`## Assurance`)
+
+Each `R<n>` carries a rigor level that mechanically decides which
+panel findings block during the pipeline (see
+`docs/proposals/rigor-tier.md`):
+
+- `strict` — everything blocks, corner cases included (24×7 path).
+- `core` — main-path correctness blocks; edge findings don't.
+- `loose` — failures are cheap to discover and fix; only
+  contradictions, over-design, and too-coarse sizing block.
+
+Section shape (absent section ⇒ every R is `strict`):
+
+```markdown
+## Assurance
+
+Default: loose
+
+| Req | Rigor | Rationale |
+|---|---|---|
+| R1 | strict | Core algorithm under test — the reason this PoC exists |
+| R5 | loose  | Log formatting; failures visible immediately, trivially fixed |
+```
+
+Rows are needed only for Rs deviating from the default. Rationale is
+required — it calibrates reviewers and is re-asked verbatim at
+graduation or stall re-audits. Amendments override levels with
+`Assurance: R3 core -> strict` lines (latest wins).
+
+**Elicitation protocol — never ask for a level by name.** Users have
+no stable intuition for the labels but do for "can you accept this
+failure?". Every question is consequence-acceptance:
+
+1. Global default first, in consequence form: "if this breaks
+   overnight with nobody watching and gets fixed next morning, is
+   that fine?" → sets `Default:`.
+2. Propose a level for every R with a one-line consequence sentence;
+   show the full table for at-a-glance confirmation. No silent
+   assignment.
+3. For uncertain rows, pick the question form by your prior:
+   - narrowed to two adjacent levels → ONE binary boundary question
+     ("R5's cache corrupts under a rare concurrent write and may go
+     unnoticed for days — acceptable?" yes → core, no → strict);
+   - no prior → a 3-option tolerance card ordered loose → strict so
+     the user stops at the first acceptable rung.
+   Batch independent questions into one AskUserQuestion call. Do NOT
+   run full sequential ladders (doubles round trips, injects
+   acquiescence bias, discards your prior).
+4. Scenario cards are mandatory three-field: failure example
+   specific to the R, discovery latency, fix cost — understating
+   blast radius elicits wrong levels.
+5. The chosen tolerance statement becomes the `Rationale`
+   near-verbatim.
+
+### 4. Interrogation checklist
 
 Before declaring the draft ready, walk this checklist. Every "no"
 is a gap to either fill or explicitly close as Out of Scope. The
 checklist generalizes the questions a careful reviewer asks.
+**Trim by rigor**: run the heavyweight batteries (concurrency
+floor/ceiling, recovery, operator surface) only for `strict` and
+`core` Rs; for `loose` Rs a "no" is acceptable by construction and
+should not generate PRD text.
 
 **Capability boundary**
 
@@ -179,7 +238,7 @@ checklist generalizes the questions a careful reviewer asks.
 - [ ] No implementation choice unless cross-cutting. PRD
       mandates "use existing broker SDK"; spec picks `ib_insync`.
 
-### 4. Filter rubric
+### 5. Filter rubric
 
 For each bullet a draft introduces, classify:
 
@@ -194,7 +253,7 @@ For each bullet a draft introduces, classify:
 
 If a bullet doesn't fit any of these, it's noise. Cut it.
 
-### 5. Lessons carryover
+### 6. Lessons carryover
 
 Keep an Implementation Discipline subsection at the end of
 `## Constraints` capturing patterns that prior auto-dev-sdk runs
@@ -213,7 +272,7 @@ When this list grows, lift the canonical wording into a shared
 `auto-dev-sdk/references/implementation-discipline.md` and
 reference it from each PRD's Constraints section.
 
-### 6. Validate format
+### 7. Validate format
 
 Before invoking `autodev prd <feature> --from-file <path>`:
 
@@ -221,7 +280,7 @@ Before invoking `autodev prd <feature> --from-file <path>`:
 - Confirm 0 errors. The lint catches missing sections, malformed
   R blocks, duplicate IDs.
 
-### 7. Promote
+### 8. Promote
 
 After import:
 

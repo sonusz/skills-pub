@@ -20,21 +20,21 @@ def _load(yml: str):
 
 _GOOD = """
 stages:
-  design: {vendor: claude, model: claude-opus-4-8, effort: max, min_quota_pct: 20,
-           fallbacks: [{vendor: cursor, model: gpt-5.5-extra-high, effort: max, min_quota_pct: 15},
-                       {vendor: codex, model: gpt-5.5, min_quota_pct: 10}]}
-  build: {vendor: cursor, model: gpt-5.5-extra-high, effort: max}
-  review: {vendor: claude, model: claude-opus-4-8, effort: high}
-  spec: {vendor: cursor, model: gpt-5.5-extra-high, effort: medium}
+  design: {vendor: claude, model: claude-fable-5, effort: max, min_quota_pct: 20,
+           fallbacks: [{vendor: cursor, model: gpt-5.6-sol-xhigh, effort: max, min_quota_pct: 15},
+                       {vendor: codex, model: gpt-5.6-sol, min_quota_pct: 10}]}
+  build: {vendor: cursor, model: gpt-5.6-sol-xhigh, effort: max}
+  review: {vendor: claude, model: claude-fable-5, effort: high}
+  spec: {vendor: cursor, model: gpt-5.6-sol-xhigh, effort: medium}
 panel:
   reviewers:
-    - {vendor: claude, model: claude-opus-4-8, effort: max, min_quota_pct: 25,
-       fallbacks: [{vendor: agy, model: agy-3.1-pro, min_quota_pct: 10}]}
-    - {vendor: agy, model: agy-3.1-pro, effort: max}
-  synthesizer: {vendor: claude, model: claude-sonnet-4-6, effort: high, min_quota_pct: 30,
-                fallbacks: [{vendor: codex, model: gpt-5.5, min_quota_pct: 10}]}
+    - {vendor: claude, model: claude-fable-5, effort: max, min_quota_pct: 25,
+       fallbacks: [{vendor: cursor, model: gemini-3.1-pro, min_quota_pct: 10}]}
+    - {vendor: cursor, model: gemini-3.1-pro, effort: max}
+  synthesizer: {vendor: claude, model: claude-sonnet-5, effort: high, min_quota_pct: 30,
+                fallbacks: [{vendor: codex, model: gpt-5.6-sol, min_quota_pct: 10}]}
 probe: {vendor: claude, model: claude-haiku-4-5, effort: low, min_quota_pct: 5,
-        fallbacks: [{vendor: codex, model: gpt-5.5, min_quota_pct: 5}]}
+        fallbacks: [{vendor: codex, model: gpt-5.6-luna, min_quota_pct: 5}]}
 """
 
 
@@ -44,7 +44,7 @@ def test_parses_all_roles():
     assert d.min_quota_pct == 20.0
     assert [(f.vendor, f.min_quota_pct) for f in d.fallbacks] == [("cursor", 15.0), ("codex", 10.0)]
     assert c.panel.reviewers[0].min_quota_pct == 25.0
-    assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["agy"]
+    assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["cursor"]
     assert c.panel.synthesizer.min_quota_pct == 30.0
     assert [f.vendor for f in c.panel.synthesizer.fallbacks] == ["codex"]
     assert c.probe.min_quota_pct == 5.0

@@ -103,6 +103,15 @@ def render_stage_prompt(
         base_ref = discover_base_ref(feature_active)
         if base_ref:
             ctx_lines.append(f"- DIFF_BASE: `{base_ref}`")
+        # Mechanism 2 (rigor-tier): harness-computed rework trust region
+        # for this rerun. Injected only on reruns (a rerun always carries
+        # context artifacts); an initial authoring run must not see a
+        # stale mode from a prior cycle.
+        if context_artifacts:
+            from autodev.diagnosis import read_rework_mode
+            rework_mode = read_rework_mode(feature_active)
+            if rework_mode:
+                ctx_lines.append(f"- REWORK_MODE: `{rework_mode}`")
 
     # Target artifacts
     target_map = {

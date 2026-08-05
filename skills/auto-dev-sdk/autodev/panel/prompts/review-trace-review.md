@@ -182,11 +182,41 @@ Per finding state:
 - `summary`: one sentence naming the category (MISSING /
   INCOMPLETE / WEAKENED / UNTESTED / UNTESTABLE) and the
   specific defect
+- `category`: the machine token for the category — map
+  MISSING / INCOMPLETE / WEAKENED / UNTESTED → `missing`;
+  UNTESTABLE → `untestable`
+- `failure_class`: `mainline` | `edge` — REQUIRED on every `risk`
+  finding. `mainline` = the gap is on the requirement's primary
+  path; `edge` = it needs a rare situation (unusual input,
+  concurrency window, interrupted restart). Absent → the harness
+  treats it as `mainline` (fail closed).
 - `targets`: filename-qualified list
 - `Evidence`: one of:
+  - `Evidence: prd:R<n>` — a specific requirement (use this whenever
+    the finding traces to an R)
   - `Evidence: prd:<section> "exact quoted text"`
   - `Evidence: trace:<row-id> "exact quoted text"`
   - `Evidence: test-plan:<test-case-id> "exact quoted text"`
+- `evidence_refs`: the same references as a machine-readable list of
+  bare tokens, e.g. `evidence_refs: [prd:R3, trace:s-1.r2]` — the
+  harness resolves per-requirement rigor levels from these tokens
+
+Design altitude: when `panel-coverage-map.json` is listed in the
+required file inputs, its `design_depths` marks `contract` scope
+items (interior design deferred to build time). Judge those items on
+**boundary-behavior rows only** — interior enumeration absence on a
+contract item is NOT a finding; their interior unit tests are authored
+at build time. Its `coverage` rows are the harness's mechanical
+extraction for your coverage table — read the file, do not re-derive
+the mapping, and judge adequacy per row.
+
+If the PRD carries an `## Assurance` section (per-R rigor levels
+`strict` / `core` / `loose`), read it and calibrate effort: on
+`loose` Rs, exhaustive edge-case enumeration will not block and is
+wasted depth — main-path coverage is what matters there. If a gap
+inside a loose R's scope endangers another R's guarantee, cite that
+R with a `prd:R<n>` token; the harness escalates to the strictest
+cited R.
 
 State your verdict: `pass` / `needs_revision` / `fail`. A
 synthesizer will extract your verdict, coverage table, and

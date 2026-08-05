@@ -67,19 +67,19 @@ def test_live_scope_stage_completes_fast(live_git_repo):
         stages={
             s: StageSpec(
                 stage=s,
-                vendor="claude", model="claude-sonnet-4-6",
+                vendor="claude", model="claude-sonnet-5",
                 probe_interval_sec=60,
             ) for s in STAGES
         },
         panel=PanelConfig(
             reviewers=(
-                PanelReviewerSpec(vendor="claude", model="claude-sonnet-4-6"),
-                PanelReviewerSpec(vendor="agy", model=""),
-                PanelReviewerSpec(vendor="codex", model="gpt-5.4"),
+                PanelReviewerSpec(vendor="claude", model="claude-sonnet-5"),
+                PanelReviewerSpec(vendor="cursor", model="gemini-3.1-pro"),
+                PanelReviewerSpec(vendor="codex", model="gpt-5.6-terra"),
             ),
-            synthesizer=PanelSynthesizerSpec(vendor="claude", model="claude-sonnet-4-6"),
+            synthesizer=PanelSynthesizerSpec(vendor="claude", model="claude-sonnet-5"),
         ),
-        probe=ProbeConfig(vendor="claude", model="claude-sonnet-4-6"),
+        probe=ProbeConfig(vendor="claude", model="claude-haiku-4-5"),
     )
     orch = Orchestrator(OrchestratorConfig(
         repo_root=live_git_repo, vendors=vendors, session_id="live-sanity",

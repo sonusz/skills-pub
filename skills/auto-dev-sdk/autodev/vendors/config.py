@@ -27,12 +27,12 @@ STAGES = ("design", "build", "spec", "review")
 # Vendors allowed for coding (R3: agy excluded; panel-review handles it separately).
 # `openai` and `codex` both route through the Codex CLI in shared/vendors.
 # `cursor` (cursor-agent) is allowed for stages too — it pins a model SKU with
-# effort encoded in the model id (e.g. `gpt-5.5-high`); the `--effort` flag has
+# effort encoded in the model id (e.g. `gpt-5.6-sol-high`); the `--effort` flag has
 # no cursor analog (see shared/vendors/vendors.conf).
 ALLOWED_VENDORS = {"claude", "codex", "openai", "cursor", "grok"}
 
 # Panel review vendors. `cursor` is allowed as a reviewer (it proxies a
-# backing provider — e.g. a Gemini or Claude model — under cursor's own auth);
+# backing provider — e.g. a gemini or claude model — under cursor's own auth);
 # diversity is enforced on the inferred underlying provider, not the literal
 # `cursor` label (see _infer_cursor_underlying_vendor).
 PANEL_REVIEWER_VENDORS = {

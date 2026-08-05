@@ -497,6 +497,7 @@ def test_design_review_consulted_docs_include_context_and_feedback_refs(git_repo
         "prd.md",
         "architecture-proposal.md",
         "design-changelog.json",
+        "panel-coverage-map.json",
     }.issubset(names)
 
 

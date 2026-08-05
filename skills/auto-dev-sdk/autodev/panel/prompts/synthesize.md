@@ -52,6 +52,19 @@ For each reviewer who responded, emit one entry in `per_reviewer`:
     reviewer stated them. If the reviewer stated no targets, emit an
     empty list `[]`. Do NOT drop, filter, or re-classify targets — the
     harness post-processes targets separately.
+  - `category` — the lowercase category token the reviewer stated
+    (`missing`, `invented`, `ambiguous`, `undelivered`, `missized`,
+    `untestable`, `underspecified-contract`). Copy it verbatim; if the reviewer stated none,
+    omit the field. Do NOT infer a category from the summary.
+  - `evidence_refs` — the machine-readable evidence tokens the
+    reviewer listed (e.g. `prd:R3`, `scope:s-2`, `trace:s-1.r2`,
+    `design:2. Primitives`). Copy them into a list verbatim; omit
+    the field if the reviewer listed none. Do NOT invent tokens
+    from prose Evidence lines.
+  - `failure_class` — `mainline` or `edge`, exactly as the reviewer
+    stated on a `risk` finding; omit if not stated.
+  - `missized_direction` — `coarse` or `fine`, exactly as the
+    reviewer stated on a missized finding; omit if not stated.
 - `coverage` — if the reviewer included a PRD coverage table, extract
   each row as `{req_id, status, evidence, notes}`. Use the reviewer's
   exact status vocabulary from the close prompt:

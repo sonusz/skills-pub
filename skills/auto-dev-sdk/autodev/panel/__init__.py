@@ -98,7 +98,10 @@ def run_panel_gate(
         from autodev.state.hashing import hash_file
         seen_paths: set[str] = set()
 
-        def _add(path: Path, *, hash_value: str | None = None) -> None:
+        def _add(
+            path: Path, *, hash_value: str | None = None,
+            priority: str = "consulted",
+        ) -> None:
             key = str(path)
             if key in seen_paths or not path.exists():
                 return
@@ -106,7 +109,7 @@ def run_panel_gate(
             consulted_docs.append({
                 "path": key,
                 "hash": hash_value or hash_file(path),
-                "priority": "consulted",
+                "priority": priority,
             })
 
         if primary_artifact.exists():
@@ -132,6 +135,13 @@ def run_panel_gate(
             for ref in packet.get("response_to_feedback", []):
                 if isinstance(ref, dict) and isinstance(ref.get("path"), str):
                     _add(Path(ref["path"]), hash_value=ref.get("hash") if isinstance(ref.get("hash"), str) else None)
+        # Mechanically derived R → scope → trace → test coverage and design
+        # depth follows the same contract as every other substantial panel
+        # input: materialize it, hash-pin it, and let reviewers read the file.
+        from autodev.panel.coverage_map import write_panel_coverage_map
+        coverage_path = write_panel_coverage_map(feature_active)
+        if coverage_path is not None:
+            _add(coverage_path, priority="harness")
         if consulted_docs:
             from autodev.state.atomic import atomic_write_json
             docs_path = feature_active / f"panel-{gate}.docs.json"

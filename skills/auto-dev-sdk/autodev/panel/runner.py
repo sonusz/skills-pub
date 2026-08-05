@@ -3,7 +3,7 @@
 Flow:
   1. Compose per-reviewer prompt (gate-specific review-<gate>.md +
      file manifest with paths + hashes for the artifact and consulted docs).
-  2. Dispatch the configured reviewers (claude / grok / codex/openai, per
+  2. Dispatch the configured reviewers (for example claude / grok / codex,
      vendors.yml panel config) in parallel.
   3. Invoke the configured synthesizer with the three reviewer
      outputs under a pinned synthesize.md prompt and the pinned JSON
@@ -43,6 +43,9 @@ from autodev.artifacts.verdict import (
 )
 from autodev.errors import ConfigError, GatePending, QuotaHalt, SchemaError
 from autodev.panel.anchor_filter import filter_anchor_findings
+from autodev.panel.rigor_filter import (
+    RigorFilterResult, apply_rigor_filter, has_effective_blocking,
+)
 from autodev.panel.precheck import run_precheck
 from autodev.panel.schemas import synthesizer_output_schema_json
 from autodev.state.hashing import hash_file
@@ -89,14 +92,18 @@ DESIGN_REVIEW_GROUPS: tuple[dict, ...] = (
         # this panel not to audit them), so they are intentionally excluded.
         # Verified: codex survives at this size AND the design reviewer stays
         # design-focused (no spurious test-coverage findings).
-        "consulted_filter": {"design.md", "scope.json", "prd.md"},
+        "consulted_filter": {
+            "design.md", "scope.json", "prd.md", "panel-coverage-map.json",
+        },
     },
     {
         "name": "trace-review",
         "prompt_file": "review-trace-review.md",
         "verdict_file": "panel-trace-review.json",
         # Restrict to behavioral artifacts only
-        "consulted_filter": {"trace.md", "test-plan.md", "prd.md"},
+        "consulted_filter": {
+            "trace.md", "test-plan.md", "prd.md", "panel-coverage-map.json",
+        },
     },
 )
 
@@ -114,6 +121,51 @@ DOCTOR_SCRIPT = SHARED_VENDORS_DIR / "scripts" / "doctor.sh"
 # real shared-vendors call. The fake receives (vendor, role, prompt) via env vars
 # + stdin and writes markdown or JSON to stdout.
 FAKE_INVOKER_ENV = "AUTODEV_PANEL_FAKE_INVOKER"
+
+
+def _finding_from_synth(vendor: str, f: dict) -> PanelFinding:
+    """One synthesizer finding entry → PanelFinding. Must carry ALL
+    structured fields through — dropping the rigor-tier fields here
+    silently fail-closes the rigor filter on every finding."""
+    return PanelFinding(
+        severity=f.get("severity", "opinion"),
+        vendor=vendor,
+        summary=f.get("summary", ""),
+        targets=list(f.get("targets", [])),
+        category=f.get("category"),
+        evidence_refs=[str(x) for x in f.get("evidence_refs", [])],
+        failure_class=f.get("failure_class"),
+        missized_direction=f.get("missized_direction"),
+    )
+
+
+def _apply_rigor_to_findings(
+    findings: list[PanelFinding], *, feature_active: Path,
+) -> RigorFilterResult:
+    """Load the Assurance map (prd.md) + scope.json tolerantly and run
+    the rigor filter. Any load failure degrades to the all-strict
+    no-op (== current behavior), never to a crash inside verdict
+    assembly."""
+    from autodev.artifacts.scope import load_scope
+    from autodev.assurance import AssuranceMap, parse_assurance
+
+    assurance = AssuranceMap()
+    prd_path = feature_active / "prd.md"
+    try:
+        if prd_path.exists():
+            assurance, _ = parse_assurance(
+                prd_path.read_text(encoding="utf-8")
+            )
+    except Exception:
+        assurance = AssuranceMap()
+    scope = None
+    scope_path = feature_active / "scope.json"
+    try:
+        if scope_path.exists():
+            scope = load_scope(scope_path)
+    except Exception:
+        scope = None
+    return apply_rigor_filter(findings, assurance, scope)
 
 
 def _doctor_hint() -> str:
@@ -631,6 +683,7 @@ def _invoke_synthesizer(
     a wall-clock cap.
     """
     fake = os.environ.get(FAKE_INVOKER_ENV)
+    schema_json = synthesizer_output_schema_json()
     timeout_sec = probe_interval_sec  # for fake-mode subprocess + error messages
     # Quota gate (fail-closed; QuotaHalt propagates). Config validation guarantees
     # synthesizer fallbacks are schema-capable, so the schema-vendor guard below
@@ -645,22 +698,6 @@ def _invoke_synthesizer(
         )
         spec = PanelSynthesizerSpec(
             vendor=_cand.vendor, model=_cand.model, effort=_cand.effort
-        )
-    openai_compatible = (
-        not fake
-        and spec.vendor.strip().lower() in {"openai", "codex", "gpt"}
-    )
-    schema_json = synthesizer_output_schema_json(
-        openai_compatible=openai_compatible,
-    )
-    if openai_compatible:
-        prompt += (
-            "\n\n## OpenAI strict-schema field discipline\n\n"
-            "Emit every field declared by the schema. Use [] when a reviewer "
-            "has no findings, targets, or coverage; use an empty string when "
-            "a coverage row has no notes; and always emit prd_targeted for a "
-            "design decision. When the Gate in the context is not "
-            "design-review, emit the top-level decision field as null.\n"
         )
     try:
         if fake:
@@ -719,27 +756,6 @@ def _invoke_synthesizer(
             idle_callback=idle_callback,
         )
         if result.returncode != 0:
-            if debug_dir is not None:
-                try:
-                    (debug_dir / "panel-synthesizer-raw.txt").write_text(
-                        f"--- synthesizer raw output ({len(result.output)} chars) ---\n"
-                        f"{result.output}\n"
-                        f"--- end raw ---\n\n"
-                        f"--- shared-call returncode: {result.returncode} ---\n"
-                        f"--- timed_out: {result.timed_out} ---\n\n"
-                        f"--- shared-call status ({len(repr(result.status))} chars) ---\n"
-                        f"{result.status!r}\n"
-                        f"--- end status ---\n\n"
-                        f"--- shared-call log ({len(result.log)} chars) ---\n"
-                        f"{result.log}\n"
-                        f"--- end log ---\n\n"
-                        f"--- summary_stderr ({len(result.summary_stderr)} chars) ---\n"
-                        f"{result.summary_stderr}\n"
-                        f"--- end stderr ---\n",
-                        encoding="utf-8",
-                    )
-                except OSError:
-                    pass
             if result.timed_out:
                 return False, None, f"timeout after {timeout_sec}s"
             return False, None, (
@@ -999,12 +1015,7 @@ def _synthesize_and_build_verdict(
             if entry.get("coverage"):
                 coverage_map[vendor] = list(entry.get("coverage", []))
             for f in entry.get("findings", []):
-                findings.append(PanelFinding(
-                    severity=f.get("severity", "opinion"),
-                    vendor=vendor,
-                    summary=f.get("summary", ""),
-                    targets=list(f.get("targets", [])),
-                ))
+                findings.append(_finding_from_synth(vendor, f))
         if gate_label == "design-review" and isinstance(synth_parsed.get("decision"), dict):
             decision = _normalize_design_review_decision(
                 feature_active=feature_active,
@@ -1055,11 +1066,56 @@ def _synthesize_and_build_verdict(
         feature_log.emit(stage="gate", event="anchor-filter-warning",
                          feature=feature_active.parent.name,
                          detail={"gate": gate_label, "message": w})
-    if synth_ok and synth_parsed and decision is None:
-        has_blocking = any(
-            f.severity in ("invariant_violation", "risk") for f in kept_findings
+
+    # Rigor severity filter (docs/proposals/rigor-tier.md) — rewrites
+    # each finding's `severity` slot to its effective value per the
+    # PRD's `## Assurance` map; the reviewer's original is preserved in
+    # `severity_reported`. No-op when the PRD has no Assurance section
+    # (all-strict default == pre-rigor behavior).
+    decision_overridden_by_rigor: dict | None = None
+    rigor_result = _apply_rigor_to_findings(
+        kept_findings, feature_active=feature_active,
+    )
+    for e in rigor_result.events:
+        feature_log.emit(
+            stage="gate", event=f"rigor-filter-{e.kind}",
+            feature=feature_active.parent.name,
+            detail={
+                "gate": gate_label, "reason": e.reason, "vendor": e.vendor,
+                "severity_reported": e.severity_reported, "rigor": e.rigor,
+                "summary": e.summary,
+            },
         )
-        verdict_str = "needs_revision" if has_blocking else "pass"
+
+    if synth_ok and synth_parsed and decision is None:
+        verdict_str = (
+            "needs_revision" if has_effective_blocking(kept_findings)
+            else "pass"
+        )
+    elif decision is not None and rigor_result.downgraded:
+        # Decision reconciliation: blocking must stay a deterministic
+        # function of effective severities. If the canonical decision
+        # said retry_design but nothing effectively blocks after the
+        # filter, override to pass (audited). halt_for_human is NEVER
+        # overridden — fail closed toward human attention.
+        if (decision.outcome == "retry_design"
+                and not has_effective_blocking(kept_findings)):
+            decision_overridden_by_rigor = decision.to_dict()
+            decision = ReviewDecision(
+                node=decision.node, outcome="pass", blocking=False,
+                severity=decision.severity, summary=decision.summary,
+                prd_targeted=decision.prd_targeted,
+            )
+            verdict_str = _decision_outcome_to_legacy_verdict("pass")
+            feature_log.emit(
+                stage="gate", event="rigor-filter-decision-override",
+                feature=feature_active.parent.name,
+                detail={
+                    "gate": gate_label,
+                    "from_outcome": "retry_design", "to_outcome": "pass",
+                    "downgraded": rigor_result.downgraded,
+                },
+            )
 
     v = PanelVerdict(
         gate=gate_label, verdict=verdict_str,  # type: ignore[arg-type]
@@ -1075,6 +1131,7 @@ def _synthesize_and_build_verdict(
         dropped_findings=dropped,
         coverage_map=coverage_map,
         decision=decision,
+        decision_overridden_by_rigor=decision_overridden_by_rigor,
     )
     out_path = feature_active / f"panel-{gate_label}.json"
     return v, out_path, synth_infra_error

@@ -329,6 +329,12 @@ class Orchestrator:
                     detail={"gate": v.gate, "verdict": v.verdict,
                             "finding_count": len(v.findings)},
                 )
+                # Mechanism 2 (rigor-tier): fingerprint bookkeeping +
+                # stall diagnosis BEFORE the revision loop — a diagnosed
+                # round consumes no L[gate] and never dispatches a rerun.
+                diag = self._check_diagnosis(active, v.gate, v, logger, feature)
+                if diag is not None:
+                    raise GatePending(v.gate, diag.halt_reason)
                 decision = handle_panel_verdict(active, v.gate, v)
                 # When merging, override feedback_paths so the rerun
                 # agent reads BOTH verdict files.
@@ -513,6 +519,12 @@ class Orchestrator:
                 v = v_merged
 
         if v.effectively_blocks():
+            # Mechanism 2 (rigor-tier): fingerprint bookkeeping + stall
+            # diagnosis BEFORE the revision loop — a diagnosed round
+            # consumes no L[gate] and never dispatches a rerun.
+            diag = self._check_diagnosis(active, gate, v, logger, feature)
+            if diag is not None:
+                raise GatePending(gate, diag.halt_reason)
             # v3-core R4: revision loop picks a producer rerun based on
             # reviewer-emitted filename-qualified targets, or halts for
             # human when not auto-rerunnable / L_MAX reached.
@@ -557,7 +569,43 @@ class Orchestrator:
                                  else "panel verdict fail")
             raise GatePending(gate, f"verdict={v.verdict}; revise or skip-gate")
         reset_prd_target_streak(active, gate)
+        # The gate passed — any rework mode computed from its blocking
+        # verdict is now stale and must not leak into a later design
+        # rerun dispatched for an unrelated reason (P1: route_to_layer
+        # rerun inheriting `patch` from an already-fixed verdict).
+        (active / "rework-mode.json").unlink(missing_ok=True)
         return AdvanceResult(stage_name=f"panel-{gate}", success=True)
+
+    def _check_diagnosis(
+        self, active: Path, gate: str, v: PanelVerdict,
+        logger: JsonlLog, feature: str,
+    ):
+        """Mechanism 2 pre-revision-loop hook (docs/proposals/rigor-tier.md).
+
+        Records the verdict's blocking-finding fingerprints; on
+        recurrence runs the stall classifier and returns a
+        DiagnosisResult (caller halts). Otherwise refreshes
+        rework-mode.json for the upcoming producer rerun and returns
+        None. Never raises — a bookkeeping failure must not take down
+        gate enforcement; it degrades to the pre-mechanism-2 path.
+        """
+        try:
+            from autodev.diagnosis import check_and_diagnose
+            diag = check_and_diagnose(active, gate, v)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.emit(stage="gate", event="diagnosis-error",
+                        feature=feature,
+                        detail={"gate": gate, "error": str(e)[:300]})
+            return None
+        if diag is not None:
+            logger.emit(stage="gate", event="stall-diagnosed",
+                        feature=feature, detail={
+                            "gate": gate,
+                            "classification": diag.classification,
+                            "pivot_rs": diag.pivot_rs,
+                            "diagnosis": str(diag.diagnosis_path),
+                        })
+        return diag
 
     def _merge_trace_into_design(
         self, active: Path, v_design: PanelVerdict,
@@ -1510,6 +1558,31 @@ class Orchestrator:
             layer = dx["defective_layer"]
             trigger_ref = f"build.json#/deviations/{i}"
 
+            # Mechanism 4 deferral-bet settlement: the same scope items
+            # bouncing back from build across a design change means the
+            # interior deferral is falsified — halt with a depth-aware
+            # amendment draft instead of grinding L to the generic halt.
+            try:
+                from autodev.diagnosis import check_route_recurrence
+                scope_ids = sorted({
+                    str(d.get("scope_id"))
+                    for _, d, _dx in routable if d.get("scope_id")
+                })
+                route_diag = check_route_recurrence(
+                    active, layer, scope_ids, build_path,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.emit(stage="build", event="route-diagnosis-error",
+                            feature=feature, detail={"error": str(e)[:300]})
+                route_diag = None
+            if route_diag is not None:
+                logger.emit(stage="build", event="deferral-falsified",
+                            feature=feature, detail={
+                                "layer": layer,
+                                "pivot_rs": route_diag.pivot_rs,
+                            })
+                raise GatePending("build_blocking", route_diag.halt_reason)
+
             decision = route_to_layer(
                 active, layer, trigger_ref=trigger_ref,
             )
@@ -1587,6 +1660,10 @@ class Orchestrator:
             (active / downstream).unlink(missing_ok=True)
         # Also drop ralph-state since upstream changed.
         (active / "ralph-state.json").unlink(missing_ok=True)
+        # A routed design rerun is a structural rework dispatch the
+        # rework-mode selector never saw — a stale `patch` mode from an
+        # earlier gate verdict must not constrain it.
+        (active / "rework-mode.json").unlink(missing_ok=True)
 
     def _reanchor_route_feedback(
         self, active: Path, decision: RouteDecision, build_path: Path,

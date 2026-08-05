@@ -181,6 +181,7 @@ def test_design_review_records_consulted_docs(
     assert names == [
         "architecture-proposal.md",
         "design.md",
+        "panel-coverage-map.json",
         "prd.md",
         "scope.json",
         "test-plan.md",

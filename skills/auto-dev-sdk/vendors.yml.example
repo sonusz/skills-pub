@@ -6,7 +6,8 @@
 # intentionally override harness defaults.
 #
 # Required: `stages` mapping with every coding stage below.
-# Allowed coding vendors: claude, codex, openai. Agy is panel-review-only.
+# Allowed coding vendors: claude, codex, openai, cursor, and grok.
+# Agy is panel-review-only.
 # Vendor labels are case-insensitive and normalized to lowercase.
 # `codex` and `openai` both route through the Codex CLI.
 # `probe_interval_sec` is the stream-output idle threshold for the
@@ -42,7 +43,7 @@
 stages:
   design:
     vendor: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     probe_interval_sec: 1200
     effort: max
     # Example quota gate: prefer codex while it has >=20% of its window left;
@@ -50,51 +51,51 @@ stages:
     min_quota_pct: 20
     fallbacks:
       - vendor: claude
-        model: claude-opus-4-8
+        model: claude-fable-5
         effort: max
         min_quota_pct: 15
       - vendor: cursor
-        model: gpt-5.5-extra-high
+        model: gpt-5.6-sol-xhigh
         effort: max
         min_quota_pct: 10
 
   build:
     vendor: codex
-    model: gpt-5.4
+    model: gpt-5.6-terra
     probe_interval_sec: 3600
     effort: high
 
   spec:
     vendor: codex
-    model: gpt-5.4
+    model: gpt-5.6-terra
     probe_interval_sec: 900
     effort: high
 
   review:
     vendor: codex
-    model: gpt-5.4
+    model: gpt-5.6-terra
     probe_interval_sec: 900
     effort: high
 
 panel:
   reviewers:
     - vendor: claude
-      model: claude-sonnet-4-6
+      model: claude-sonnet-5
       effort: high
     - vendor: agy
       effort: high
     - vendor: codex
-      model: gpt-5.4
+      model: gpt-5.6-terra
       effort: high
   synthesizer:
     vendor: claude
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
 
 probe:
   vendor: claude
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   timeout_sec: 60
   effort: low

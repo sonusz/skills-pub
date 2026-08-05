@@ -136,35 +136,6 @@ def detect_after(state: GuardState, canonical_files: list[Path]) -> list[str]:
     # (1) Review surface — content hashes. Catches modification of tracked OR
     # untracked canonical files (a reviewer editing design.md etc.).
     canonical_keys = {str(Path(p)) for p in canonical_files}
-    canonical_abspaths = {
-        str(Path(p).resolve()) for p in canonical_files
-    }
-    # The panel writes its verdict and reviewer-cache files before this guard
-    # performs the post-round check. Those files are outputs of the round, not
-    # reviewer inputs, and may already be tracked from an earlier run. Treating
-    # their legitimate rewrite as an out-of-band reviewer mutation makes every
-    # subsequent panel run fail integrity. Keep the exemption narrowly scoped
-    # to the active feature directory and the output groups owned by this gate.
-    panel_output_abspaths: set[str] = set()
-    if canonical_files:
-        output_dir = Path(canonical_files[0]).parent
-        output_gates = (
-            ("design-review", "trace-review")
-            if state.gate == "design-review"
-            else (state.gate,)
-        )
-        for output_gate in output_gates:
-            panel_output_abspaths.add(
-                str((output_dir / f"panel-{output_gate}.json").resolve())
-            )
-            panel_output_abspaths.add(
-                str(
-                    (
-                        output_dir
-                        / f"panel-{output_gate}.reviewers.json"
-                    ).resolve()
-                )
-            )
     for raw in canonical_files:
         p = Path(raw)
         key = str(p)
@@ -196,10 +167,8 @@ def detect_after(state: GuardState, canonical_files: list[Path]) -> list[str]:
                 if code == "??":
                     continue  # new untracked file — panel scratch, skip
                 abspath = str((state.repo_root / path).resolve())
-                if abspath in canonical_abspaths:
+                if abspath in {str(Path(p).resolve()) for p in canonical_files}:
                     continue  # canonical handled by (1)
-                if abspath in panel_output_abspaths:
-                    continue  # harness-owned output, not review input
                 changes.append(f"{path} (tracked file modified during review)")
 
     return changes

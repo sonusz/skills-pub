@@ -12,9 +12,11 @@ from autodev.state.atomic import atomic_write_json
 
 Status = Literal["active", "removed", "superseded"]
 Mode = Literal["fresh", "update", "reopen"]
+DesignDepth = Literal["contract", "full"]
 
 _VALID_STATUS = {"active", "removed", "superseded"}
 _VALID_MODE = {"fresh", "update", "reopen"}
+_VALID_DESIGN_DEPTH = {"contract", "full"}
 
 
 @dataclass
@@ -28,6 +30,10 @@ class ScopeItem:
     design_ref: list[str] = field(default_factory=list)
     status: Status = "active"
     superseded_by: str | None = None
+    # Mechanism 4 (rigor-tier proposal): "contract" defers interior
+    # design to build time; "full" is current behavior. Absent in old
+    # files -> "full".
+    design_depth: DesignDepth = "full"
 
     def __post_init__(self) -> None:
         if not isinstance(self.prd_ref, list) or not all(isinstance(t, str) for t in self.prd_ref):
@@ -52,6 +58,8 @@ class ScopeItem:
             d["design_ref"] = list(self.design_ref)
         if self.superseded_by:
             d["superseded_by"] = self.superseded_by
+        if self.design_depth != "full":
+            d["design_depth"] = self.design_depth
         return d
 
 
@@ -126,6 +134,10 @@ def _validate(obj: dict) -> None:
         seen.add(item["id"])
         if item["status"] == "superseded" and not item.get("superseded_by"):
             raise SchemaError(f"in_scope[{i}] superseded missing superseded_by")
+        if "design_depth" in item and item["design_depth"] not in _VALID_DESIGN_DEPTH:
+            raise SchemaError(
+                f"in_scope[{i}].design_depth must be one of {_VALID_DESIGN_DEPTH}"
+            )
     if "design_notes" in obj:
         dn = obj["design_notes"]
         if not isinstance(dn, list) or not all(isinstance(s, str) for s in dn):
@@ -147,6 +159,7 @@ def load_scope(path: Path) -> Scope:
                 id=i["id"], description=i["description"], prd_ref=i["prd_ref"],
                 design_ref=i.get("design_ref", []),
                 status=i["status"], superseded_by=i.get("superseded_by"),
+                design_depth=i.get("design_depth", "full"),
             )
             for i in raw["in_scope"]
         ],
