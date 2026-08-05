@@ -169,14 +169,16 @@ def _lsof_ports(pid: int) -> list[int]:
 
 def _discover_ports(process: _AgyPTYProcess) -> list[int]:
     for _ in range(20):
-        if process.saw_login_prompt:
-            raise _AgyError("agy login required")
         ports = _lsof_ports(process.pid)
         if ports:
             return ports
         if not process.alive():
+            if process.saw_login_prompt:
+                raise _AgyError("agy login required")
             raise _AgyError("agy exited before opening its quota server")
         time.sleep(0.3)
+    if process.saw_login_prompt:
+        raise _AgyError("agy login required")
     raise _AgyError("timed out discovering agy quota server")
 
 
@@ -300,19 +302,26 @@ def _not_logged_in(parsed: dict | None) -> bool:
 def _fetch_local_summary(binary: str) -> dict:
     process = _AgyPTYProcess(binary)
     try:
-        ports = _discover_ports(process)
+        ports = set(_discover_ports(process))
+        saw_login_response = False
         for _ in range(15):
-            if process.saw_login_prompt:
-                raise _AgyError("agy login required")
-            for port in ports:
+            # Agy may open the authenticated Connect endpoint shortly after an
+            # unauthenticated bootstrap endpoint. Keep the candidate set fresh.
+            ports.update(_lsof_ports(process.pid))
+            for port in sorted(ports):
                 status, parsed = _loopback_json(port, QUOTA_METHOD)
                 if _not_logged_in(parsed):
-                    raise _AgyError("agy login required")
+                    saw_login_response = True
+                    continue
                 if status == 200 and parsed is not None and _windows(parsed, None):
                     return parsed
             if not process.alive():
+                if saw_login_response:
+                    raise _AgyError("agy login required")
                 raise _AgyError("agy exited before quota became available")
             time.sleep(1)
+        if saw_login_response:
+            raise _AgyError("agy login required")
         raise _AgyError("agy quota server did not become ready")
     finally:
         process.close()

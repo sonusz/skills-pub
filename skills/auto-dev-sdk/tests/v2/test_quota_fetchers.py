@@ -122,6 +122,38 @@ def test_agy_proto_zero_and_loopback_port_parsing():
     assert ports == [64440, 64441]
 
 
+def test_agy_transient_login_state_does_not_override_quota_api(monkeypatch):
+    summary = {
+        "groups": [
+            {
+                "displayName": "Claude and GPT models",
+                "buckets": [{"bucketId": "3p-weekly", "remainingFraction": 0.5}],
+            }
+        ]
+    }
+
+    class FakeProcess:
+        saw_login_prompt = True
+        pid = 123
+
+        def alive(self):
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agy, "_AgyPTYProcess", lambda binary: FakeProcess())
+    monkeypatch.setattr(agy, "_lsof_ports", lambda pid: [64440])
+    responses = iter([
+        (200, {"error": {"message": "Not logged into Antigravity"}}),
+        (200, summary),
+    ])
+    monkeypatch.setattr(agy, "_loopback_json", lambda port, method: next(responses))
+    monkeypatch.setattr(agy.time, "sleep", lambda seconds: None)
+
+    assert agy._fetch_local_summary("/fake/agy") == summary
+
+
 def test_agy_missing_binary_is_unknown(monkeypatch):
     monkeypatch.setattr(agy, "_binary", lambda: None)
     r = agy.fetch(model=None)

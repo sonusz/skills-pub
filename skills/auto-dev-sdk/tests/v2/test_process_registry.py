@@ -4,9 +4,11 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from autodev.state import process_registry
 from autodev.state.process_registry import (
     process_group_alive,
     read_processes,
@@ -27,6 +29,22 @@ def _wait_until(predicate, *, timeout: float = 3.0) -> bool:
             return True
         time.sleep(0.02)
     return bool(predicate())
+
+
+def test_ps_process_group_probe_ignores_zombie_members(monkeypatch):
+    monkeypatch.setattr(process_registry.shutil, "which", lambda name: "/bin/ps")
+    monkeypatch.setattr(
+        process_registry.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="101 S+\n202 Z\n202 Z+\n303 Ss\n",
+        ),
+    )
+
+    assert process_registry._process_group_alive_via_ps(101)
+    assert not process_registry._process_group_alive_via_ps(202)
+    assert not process_registry._process_group_alive_via_ps(404)
 
 
 def test_registry_tracks_parallel_process_groups_and_terminates_them(tmp_path):

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -119,6 +121,42 @@ def _entry_is_same_live_process(entry: dict) -> bool:
     return True
 
 
+def _process_group_alive_via_ps(pgid: int) -> bool | None:
+    """Return group liveness from POSIX ``ps``, or None if unavailable.
+
+    On macOS, ``killpg(pgid, 0)`` returns EPERM for a group containing only
+    zombies.  A successful process-table scan lets us distinguish that state
+    from an inaccessible group that may still contain executable work.
+    """
+    ps = shutil.which("ps")
+    if not ps:
+        return None
+    try:
+        result = subprocess.run(
+            [ps, "-axo", "pgid=,stat="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        try:
+            process_group = int(fields[0])
+        except ValueError:
+            continue
+        if process_group == pgid and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
 def process_group_alive(pgid: int) -> bool:
     proc_root = Path("/proc")
     if proc_root.is_dir():
@@ -141,6 +179,9 @@ def process_group_alive(pgid: int) -> bool:
                 return False
         except OSError:
             pass
+    ps_alive = _process_group_alive_via_ps(pgid)
+    if ps_alive is not None:
+        return ps_alive
     try:
         os.killpg(pgid, 0)
         return True
@@ -160,6 +201,8 @@ def terminate_process_group(pgid: int, *, grace_sec: float = 0.5) -> bool:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return True
+    except PermissionError:
+        return not process_group_alive(pgid)
     deadline = time.monotonic() + max(grace_sec, 0.0)
     while process_group_alive(pgid) and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -168,6 +211,8 @@ def terminate_process_group(pgid: int, *, grace_sec: float = 0.5) -> bool:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return not process_group_alive(pgid)
         kill_deadline = time.monotonic() + 1.0
         while process_group_alive(pgid) and time.monotonic() < kill_deadline:
             time.sleep(0.02)
@@ -218,7 +263,7 @@ def terminate_registered_processes(
     for pgid in pgids:
         try:
             os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
     deadline = time.monotonic() + max(grace_sec, 0.0)
@@ -231,7 +276,7 @@ def terminate_registered_processes(
     for pgid in forced:
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
     kill_deadline = time.monotonic() + 1.0
