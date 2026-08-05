@@ -69,16 +69,18 @@ panel:
     - vendor: claude
       model: opus
       effort: max
+    # Grok: independent xAI-backed reviewer for divergence signal.
+    - vendor: grok
+      model: grok-4.5
+      effort: max
+    # Agy/Gemini: independent reviewer through the Antigravity CLI.
+    - vendor: agy
+      model: gemini-3.1-pro-high
+      effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
       model: gpt-5.6-sol
       effort: max
-    # Agy/Gemini seat REMOVED 2026-07-29 20:14 UTC — agy CLI reported
-    # "Individual quota reached ... Resets in 153h39m" (≈ 2026-08-05 06:00 UTC).
-    # Re-add verbatim once `agy -p 'ok'` succeeds again:
-    #   - vendor: agy
-    #     model: gemini-3.1-pro-high
-    #     effort: max
   # Synthesizes reviewer outputs only; does not re-review the artifact.
   # Context: medium; reviewer outputs plus schema. Effort: high enough for
   # faithful extraction, lower than design generation.

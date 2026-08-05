@@ -9,7 +9,7 @@ design packet -> design-review -> build/Ralph loop -> implementation-index
 ```
 
 The design stage produces the whole design packet in one agent run,
-then a three-vendor panel reviews the design against the PRD. Build
+then a four-vendor panel reviews the design against the PRD. Build
 runs inside a Ralph loop until implementation coverage is complete or a
 route/human halt intervenes. Final close review compares code-first
 implementation facts against the PRD; coverage is produced by the panel,
@@ -49,16 +49,20 @@ stages:
 panel:
   reviewers:
     - vendor: claude
-      model: claude-sonnet-5
+      model: opus
+      effort: high
+    - vendor: grok
+      model: grok-4.5
       effort: high
     - vendor: agy
+      model: gemini-3.1-pro-high
       effort: high
     - vendor: codex
-      model: gpt-5.6-terra
+      model: gpt-5.6-sol
       effort: high
   synthesizer:
-    vendor: claude
-    model: claude-sonnet-5
+    vendor: codex
+    model: gpt-5.6-luna
     effort: high
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
@@ -94,7 +98,7 @@ Notes:
 - Panel reviewers (`design-review` and `close-approval`) and the
   synthesizer are configured under top-level `panel`. The synthesizer
   uses `--schema-file` through `shared/vendors` to enforce its output
-  schema, which works on `claude` and `codex`/`openai`. `agy` is not
+  schema, which works on `claude`, `grok`, and `codex`/`openai`. `agy` is not
   supported as a synthesizer because its CLI has no native schema
   enforcement.
 - `probe` configures the read-only idle-timeout LLM probe. It is not a
@@ -181,7 +185,7 @@ budget for *semantic* reruns) and from hard subprocess failures or
 out-of-scope writes, which still halt immediately. Watch the
 `output-rejected-retrying` / `output-rejected-exhausted` log events.
 
-Each panel runs its configured claude + agy + codex/openai reviewers independently,
+Each panel runs its configured claude + grok + agy + codex/openai reviewers independently,
 then a synthesizer merges their findings into a single verdict.
 Blocking findings (`invariant_violation` or `risk`) either dispatch
 a producer rerun (bumping the gate's L counter, cap L_MAX=3) or

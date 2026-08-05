@@ -82,7 +82,11 @@ panel:
     - vendor: claude
       model: claude-sonnet-5
       effort: high
+    - vendor: grok
+      model: grok-4.5
+      effort: high
     - vendor: agy
+      model: gemini-3.1-pro-high
       effort: high
     - vendor: codex
       model: gpt-5.6-terra
