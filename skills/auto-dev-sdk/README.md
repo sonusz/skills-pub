@@ -109,6 +109,28 @@ Notes:
   wedged or should get more time, and it also routes through
   `shared/vendors` when invoked.
 
+## Persistent agent sessions
+
+The agents that revise the same work across pipeline iterations keep distinct
+provider-native sessions:
+
+- one design session per repo + feature;
+- one build session and one Ralph-review session per repo + feature; and
+- one panel-reviewer session per repo + feature + gate + configured reviewer
+  slot/vendor/model.
+
+Reviewer sessions are never shared with one another or across
+`design-review`, `trace-review`, and `close-approval`. On later turns the
+harness sends a compact continuation prompt containing current paths and
+hashes; the full role contract remains in the native session. Filesystem state
+and current hashes are always authoritative, so a resumed agent must re-read
+changed feedback rather than trust stale conversational memory.
+
+The `spec` producer, panel synthesizer, and idle probe remain stateless because
+they do not participate in iterative producer/reviewer revision. Session
+mappings are maintained by canonical `shared/vendors` in the user's state
+directory, outside the target repo, so they do not dirty feature worktrees.
+
 ## Verify
 
 ```bash

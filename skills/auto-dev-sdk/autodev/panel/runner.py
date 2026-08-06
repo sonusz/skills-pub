@@ -28,7 +28,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from autodev import __version__ as HARNESS_VERSION
 from autodev.artifacts.revision_state import load_state
@@ -448,20 +448,37 @@ def _file_ref_line(*, label: str, path: Path, hash_value: str | None = None) -> 
 def _compose_reviewer_prompt(
     *, gate: str, artifact_path: Path, consulted_docs: list[dict],
     feature_active: Path | None = None, repo_root: Path | None = None,
+    continuation: bool = False,
 ) -> str:
-    """Build the full prompt sent to each reviewer.
+    """Build an initial or continuation prompt sent to each reviewer.
 
     Large review inputs are passed by file reference, not inlined. The
     verdict records the same paths + hashes, so the harness can invalidate
     stale panel results without relying on prompt-sized document snapshots.
     """
-    prompt_text = review_prompt_path(gate).read_text(encoding="utf-8")
+    if continuation:
+        prompt_text = (
+            f"# Continue the existing `{gate}` reviewer session\n\n"
+            "Keep the review role, severity rules, output contract, and "
+            "independence established by the initial turn. Re-read the "
+            "referenced files: their current hashes and contents are "
+            "authoritative. Review the current revision afresh, retain "
+            "unresolved findings, and do not repeat findings that the files "
+            "now resolve. If REVIEW_PROMPT_HASH changed, re-read "
+            "REVIEW_PROMPT_FILE before judging. Return a complete reviewer "
+            "response for this turn."
+        )
+    else:
+        prompt_text = review_prompt_path(gate).read_text(encoding="utf-8")
     prompt_text += "\n\n---\n\n## Orchestrator context\n\n"
     if feature_active is not None:
         prompt_text += f"- FEATURE_ACTIVE: `{feature_active}`\n"
     if repo_root is not None:
         prompt_text += f"- REPO_ROOT: `{repo_root}`\n"
     prompt_text += f"- GATE: `{gate}`\n"
+    prompt_file = review_prompt_path(gate)
+    prompt_text += f"- REVIEW_PROMPT_FILE: `{prompt_file}`\n"
+    prompt_text += f"- REVIEW_PROMPT_HASH: `{hash_file(prompt_file)}`\n"
     prompt_text += "\n## Required file inputs\n\n"
     prompt_text += (
         "The files you must judge are listed below as paths (with hash and "
@@ -491,6 +508,8 @@ def _invoke_reviewer(
     feature_active: Path | None = None,
     probe_config: ProbeConfig | None = None,
     log_emit: Callable[[dict], None] | None = None,
+    session_key: str | None = None,
+    resume_prompt: str | None = None,
 ) -> ReviewerResult:
     """Run one reviewer CLI. Captures stdout; empty on failure.
 
@@ -572,6 +591,8 @@ def _invoke_reviewer(
                     if feature_active is not None else None
                 ),
                 process_label=f"panel-reviewer:{spec.vendor}",
+                session_key=session_key,
+                resume_prompt=resume_prompt,
             )
             elapsed = time.monotonic() - t0
             if result.returncode != 0:
@@ -625,6 +646,29 @@ def _invoke_reviewer(
             elapsed_sec=time.monotonic() - t0,
             failure_detail=str(e),
         )
+
+
+def _reviewer_session_key_for_spec(
+    *,
+    feature_active: Path,
+    gate: str,
+    reviewer_specs: Sequence[PanelReviewerSpec],
+    spec: PanelReviewerSpec,
+) -> str:
+    """Return the stable session key for a configured reviewer slot."""
+
+    from autodev.vendors.session_keys import reviewer_session_key
+
+    for slot, configured in enumerate(reviewer_specs):
+        if configured == spec:
+            return reviewer_session_key(
+                feature_active,
+                gate=gate,
+                slot=slot,
+                configured_vendor=configured.vendor,
+                configured_model=configured.model,
+            )
+    raise ValueError(f"reviewer spec is not present in panel config: {spec!r}")
 
 
 def _compose_synthesizer_prompt(
@@ -1211,6 +1255,13 @@ def _run_one_group_pipeline(
                     feature_active=feature_active,
                     probe_config=probe_config,
                     log_emit=log_emit,
+                    session_key=_reviewer_session_key_for_spec(
+                        feature_active=feature_active,
+                        gate=group_spec["name"],
+                        reviewer_specs=cfg.reviewers,
+                        spec=r,
+                    ),
+                    resume_prompt=group_spec["reviewer_resume_prompt"],
                 )
                 for r in to_run
             ]
@@ -1307,6 +1358,14 @@ def _run_dual_group_design_review(
                 consulted_docs=group_docs,
                 feature_active=feature_active,
                 repo_root=repo_root,
+            ),
+            "reviewer_resume_prompt": _compose_reviewer_prompt(
+                gate=group["name"],
+                artifact_path=primary_artifact,
+                consulted_docs=group_docs,
+                feature_active=feature_active,
+                repo_root=repo_root,
+                continuation=True,
             ),
         })
 
@@ -1420,6 +1479,11 @@ def run_panel_gate_internal(
         gate=gate, artifact_path=primary_artifact, consulted_docs=consulted_docs,
         feature_active=feature_active, repo_root=repo_root,
     )
+    reviewer_resume_prompt = _compose_reviewer_prompt(
+        gate=gate, artifact_path=primary_artifact, consulted_docs=consulted_docs,
+        feature_active=feature_active, repo_root=repo_root,
+        continuation=True,
+    )
     vendor_cwd = repo_root or feature_active
     metadata = _reviewer_cache_metadata(
         gate_label=gate,
@@ -1449,6 +1513,13 @@ def run_panel_gate_internal(
                     feature_active=feature_active,
                     probe_config=probe_config,
                     log_emit=log_emit,
+                    session_key=_reviewer_session_key_for_spec(
+                        feature_active=feature_active,
+                        gate=gate,
+                        reviewer_specs=cfg.reviewers,
+                        spec=r,
+                    ),
+                    resume_prompt=reviewer_resume_prompt,
                 ): r
                 for r in to_run
             }

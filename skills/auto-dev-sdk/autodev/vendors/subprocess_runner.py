@@ -85,6 +85,7 @@ def run_stage_subprocess(
     extra_stdin: str = "",
     probe_config: ProbeConfig | None = None,
     preseed: bool = False,
+    resume_prompt: str | None = None,
 ) -> StageRunResult:
     """Execute a single stage subprocess end-to-end.
 
@@ -135,6 +136,11 @@ def run_stage_subprocess(
     effort = chosen.effort or flags_effort
     model = model_override or chosen.model
     vendor = chosen.vendor
+    session_key: str | None = None
+    if stage in {"design", "build", "ralph-review"}:
+        from autodev.vendors.session_keys import feature_session_key
+
+        session_key = feature_session_key(feature_active, stage)
 
     probe_enabled = probe_config is not None
     hard_backstop_sec = (
@@ -155,6 +161,7 @@ def run_stage_subprocess(
     exit_code: int | None = None
     failure_kind: str | None = None
     failure_detail = ""
+    session_mode: str | None = None
 
     idle_callback = (
         _build_idle_callback(
@@ -185,7 +192,10 @@ def run_stage_subprocess(
             idle_check_interval_sec=IDLE_POLL_INTERVAL_SEC,
             process_registry=registry_path(feature_active),
             process_label=stage,
+            session_key=session_key,
+            resume_prompt=resume_prompt if session_key is not None else None,
         )
+        session_mode = result.session_mode
         exit_code = _exit_code_from_status(result.status, result.returncode)
         stdout_path.write_text(
             result.output
@@ -261,7 +271,8 @@ def run_stage_subprocess(
     if log_emit:
         log_emit({"event": "subprocess-end", "stage": stage, "ok": ok,
                   "exit_code": exit_code, "failure_kind": failure_kind,
-                  "elapsed_sec": elapsed, "reaped": subprocess_reaped})
+                  "elapsed_sec": elapsed, "reaped": subprocess_reaped,
+                  "session_mode": session_mode})
 
     return StageRunResult(
         ok=ok,

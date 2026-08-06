@@ -250,6 +250,22 @@ vendors_python() {
   command -v python3 || command -v python || true
 }
 
+vendors_session_python() {
+  local candidate=""
+  local path=""
+
+  for candidate in python3 python; do
+    path=$(command -v "$candidate" 2>/dev/null || true)
+    [ -n "$path" ] || continue
+    if "$path" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+        >/dev/null 2>&1; then
+      printf "%s\n" "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
 vendors_collect_usage() {
   local vendor="$1"
   local output_file="$2"
@@ -382,6 +398,31 @@ if vendor == "claude":
                 "cache_creation_input_tokens": parse_int(raw_usage.get("cache_creation_input_tokens")),
                 "cache_read_input_tokens": parse_int(raw_usage.get("cache_read_input_tokens")),
                 "output_tokens": parse_int(raw_usage.get("output_tokens")),
+                "raw": raw_usage,
+            })
+elif vendor == "agy":
+    # Session-enabled Agy calls use --output-format json so the wrapper can
+    # discover `conversation_id`. Restore the historical plain-text `out`
+    # contract after session observation has consumed the raw envelope.
+    try:
+        data = json.loads(raw_out)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        response = data.get("response")
+        if isinstance(response, str):
+            output.write_text(response)
+        raw_usage = data.get("usage")
+        total = usage_total(raw_usage)
+        if isinstance(raw_usage, dict) and total is not None:
+            payload.update({
+                "available": True,
+                "source": "agy_json",
+                "total_tokens": total,
+                "input_tokens": parse_int(raw_usage.get("input_tokens")),
+                "cache_read_input_tokens": parse_int(raw_usage.get("cache_read_tokens")),
+                "output_tokens": parse_int(raw_usage.get("output_tokens")),
+                "reasoning_tokens": parse_int(raw_usage.get("thinking_tokens")),
                 "raw": raw_usage,
             })
 elif vendor == "grok":
@@ -685,8 +726,10 @@ vendors_run_codex() {
   local prompt_file="$1"
   local output_file="$2"
   local transcript_file="${VENDORS_TRANSCRIPT_FILE:-$output_file.codex-stdout}"
-  local -a command=(codex exec --skip-git-repo-check --json --output-last-message "$output_file")
+  local -a command=()
   local -a env_command=()
+
+  command=(codex exec --skip-git-repo-check --json --output-last-message "$output_file")
 
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
@@ -694,7 +737,9 @@ vendors_run_codex() {
   if [ -n "${VENDORS_RESOLVED_EFFORT:-}" ]; then
     command+=(-c "model_reasoning_effort=\"$VENDORS_RESOLVED_EFFORT\"")
   fi
-  if [ -n "${VENDORS_CWD:-}" ]; then
+  # `codex exec resume` restores the original thread cwd and does not expose
+  # `--cd`; the shell still executes from VENDORS_CWD below as a safety check.
+  if [ -n "${VENDORS_CWD:-}" ] && [ "${VENDORS_SESSION_MODE:-}" != "resume" ]; then
     command+=(--cd "$VENDORS_CWD")
   fi
   if [ "${VENDORS_YOLO:-0}" = "1" ]; then
@@ -705,7 +750,15 @@ vendors_run_codex() {
     command+=(--output-schema "$VENDORS_SCHEMA_FILE")
   fi
 
-  command+=("${VENDORS_NATIVE_ARGS[@]}" -)
+  command+=("${VENDORS_NATIVE_ARGS[@]}")
+  if [ "${VENDORS_SESSION_MODE:-}" = "resume" ]; then
+    # Native args belong to the `codex exec` scope. In particular, options
+    # such as --oss and --sandbox are rejected if placed after the `resume`
+    # subcommand even though they are valid for the initial turn.
+    command+=(resume "${VENDORS_SESSION_ID:?resume requires a session id}" -)
+  else
+    command+=(-)
+  fi
 
   if [ "${#VENDORS_ENV[@]}" -gt 0 ]; then
     env_command=(env "${VENDORS_ENV[@]}" "${command[@]}")
@@ -737,8 +790,16 @@ vendors_run_codex() {
 vendors_run_claude() {
   local prompt_file="$1"
   local output_file="$2"
-  local -a command=(claude -p --no-session-persistence)
+  local -a command=(claude -p)
   local -a env_command=()
+
+  if [ "${VENDORS_SESSION_MODE:-}" = "resume" ]; then
+    command+=(--resume "${VENDORS_SESSION_ID:?resume requires a session id}")
+  elif [ "${VENDORS_SESSION_MODE:-}" = "new" ]; then
+    command+=(--session-id "${VENDORS_SESSION_ID:?new Claude session requires an id}")
+  else
+    command+=(--no-session-persistence)
+  fi
 
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
@@ -794,6 +855,15 @@ vendors_run_agy() {
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
   fi
+  if [ "${VENDORS_SESSION_MODE:-}" = "resume" ]; then
+    command+=(--conversation "${VENDORS_SESSION_ID:?resume requires a conversation id}")
+  fi
+  # Agy's text format omits the conversation id. Its JSON envelope includes
+  # `conversation_id`, `response`, and usage, which lets the shared session
+  # layer persist the native id and then normalize `out` back to plain text.
+  if [ -n "${VENDORS_SESSION_MODE:-}" ]; then
+    command+=(--output-format json)
+  fi
   if [ "${VENDORS_YOLO:-0}" = "1" ]; then
     command+=(--dangerously-skip-permissions)
   fi
@@ -841,6 +911,9 @@ vendors_run_cursor() {
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
   fi
+  if [ "${VENDORS_SESSION_MODE:-}" = "resume" ]; then
+    command+=(--resume "${VENDORS_SESSION_ID:?resume requires a session id}")
+  fi
   if [ "${VENDORS_YOLO:-0}" = "1" ]; then
     command+=(--yolo)
   fi
@@ -873,6 +946,12 @@ vendors_run_grok() {
   local transcript_file="${VENDORS_TRANSCRIPT_FILE:-$output_file.grok-jsonl}"
   local py
   local -a command=(grok --output-format streaming-json)
+
+  if [ "${VENDORS_SESSION_MODE:-}" = "resume" ]; then
+    command+=(--resume "${VENDORS_SESSION_ID:?resume requires a session id}")
+  elif [ "${VENDORS_SESSION_MODE:-}" = "new" ]; then
+    command+=(--session-id "${VENDORS_SESSION_ID:?new Grok session requires an id}")
+  fi
 
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")

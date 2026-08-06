@@ -5,9 +5,42 @@
 # repeated --vendor values fan the same prompt out in parallel.
 set -eo pipefail
 
+VENDORS_INVOCATION_CWD=$(pwd -P)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=vendor-launch.sh
 . "$SCRIPT_DIR/vendor-launch.sh"
+
+# A keyed invocation owns durable leases, so it must also own a kernel process
+# group whose emptiness can be verified during handled-signal cleanup. The
+# Python re-exec preserves pid, argv, cwd, environment, and stdin; os.setsid()
+# gives direct shell callers the same isolation that auto-dev's
+# start_new_session=True already provides.
+VENDORS_RAW_SESSION_REQUESTED=0
+for vendors_raw_arg in "$@"; do
+  case "$vendors_raw_arg" in
+    --session-key|--session-key=*)
+      VENDORS_RAW_SESSION_REQUESTED=1
+      break
+      ;;
+  esac
+done
+if [ "$VENDORS_RAW_SESSION_REQUESTED" = "1" ]; then
+  vendors_bootstrap_python=$(vendors_session_python || true)
+  if [ -n "$vendors_bootstrap_python" ]; then
+    vendors_current_pgid=$(
+      "$vendors_bootstrap_python" -c 'import os; print(os.getpgrp())'
+    )
+    if [ "$vendors_current_pgid" != "$$" ]; then
+      exec "$vendors_bootstrap_python" -c '
+import os
+import sys
+script = sys.argv[1]
+os.setsid()
+os.execv("/bin/bash", ["/bin/bash", script, *sys.argv[2:]])
+' "$SCRIPT_DIR/call.sh" "$@"
+    fi
+  fi
+fi
 
 usage() {
   cat <<'USAGE'
@@ -24,6 +57,8 @@ Output:
                                  If omitted, a temp dir is kept and printed
   --id ID                        Output directory id; repeatable with --vendor
                                  Default: normalized vendor id, suffixed on duplicates
+  --session-key KEY              Persist/resume one logical agent conversation.
+                                 Repeat once per --vendor in fan-out calls.
 
 Selection hints:
   --effort min|low|medium|high|xhigh|max
@@ -40,6 +75,9 @@ Selection hints:
 Prompt and instruction input:
   --prompt TEXT                  Prompt text; repeatable
   --prompt-file FILE             Prompt file; repeatable
+  --resume-prompt TEXT           Smaller continuation prompt used only when
+                                 --session-key resolves to an existing session
+  --resume-prompt-file FILE      File form of --resume-prompt
   --system TEXT                  System instruction; repeatable
   --system-file FILE             System instruction file; repeatable
   --instruction TEXT             Additional instruction; repeatable
@@ -92,19 +130,28 @@ MODEL_OVERRIDE=""
 VENDORS_YOLO=0
 OUTPUT_DIR=""
 CALL_IDS=()
+SESSION_KEYS=()
 MIN_SUCCESS=""
 TIMEOUT_SECONDS=0
 
 VENDORS_CWD=""
+VENDORS_EFFECTIVE_CWD=""
 VENDORS_DRY_RUN=0
 VENDORS_NATIVE_ARGS=()
 VENDORS_ENV=()
 VENDORS_SYSTEM_PROMPT=""
 VENDORS_TRANSCRIPT_FILE=""
 VENDORS_SCHEMA_FILE=""
+VENDORS_SESSION_KEY=""
+VENDORS_SESSION_MODE=""
+VENDORS_SESSION_ID=""
+VENDORS_SESSION_PLAN_FILE=""
+VENDORS_SESSION_RESULT_FILE=""
 
 PROMPT_TEXTS=()
 PROMPT_FILES=()
+RESUME_PROMPT_TEXTS=()
+RESUME_PROMPT_FILES=()
 SYSTEM_TEXTS=()
 SYSTEM_FILES=()
 INSTRUCTION_TEXTS=()
@@ -156,6 +203,15 @@ while [ "$#" -gt 0 ]; do
       CALL_IDS+=("${1#*=}")
       shift
       ;;
+    --session-key)
+      require_value "$1" "${2-}"
+      SESSION_KEYS+=("$2")
+      shift 2
+      ;;
+    --session-key=*)
+      SESSION_KEYS+=("${1#*=}")
+      shift
+      ;;
     --effort)
       require_value "$1" "${2-}"
       EFFORT=$(vendors_lower "$2")
@@ -204,6 +260,24 @@ while [ "$#" -gt 0 ]; do
       ;;
     --prompt-file=*)
       PROMPT_FILES+=("${1#*=}")
+      shift
+      ;;
+    --resume-prompt)
+      require_value "$1" "${2-}"
+      RESUME_PROMPT_TEXTS+=("$2")
+      shift 2
+      ;;
+    --resume-prompt=*)
+      RESUME_PROMPT_TEXTS+=("${1#*=}")
+      shift
+      ;;
+    --resume-prompt-file)
+      require_value "$1" "${2-}"
+      RESUME_PROMPT_FILES+=("$2")
+      shift 2
+      ;;
+    --resume-prompt-file=*)
+      RESUME_PROMPT_FILES+=("${1#*=}")
       shift
       ;;
     --system)
@@ -362,6 +436,10 @@ if [ "${#CALL_IDS[@]}" -gt 0 ] && [ "${#CALL_IDS[@]}" -ne "${#VENDOR_IDS[@]}" ];
   die "when provided, --id must be repeated once per --vendor"
 fi
 
+if [ "${#SESSION_KEYS[@]}" -gt 0 ] && [ "${#SESSION_KEYS[@]}" -ne "${#VENDOR_IDS[@]}" ]; then
+  die "when provided, --session-key must be repeated once per --vendor"
+fi
+
 for i in "${!VENDOR_IDS[@]}"; do
   vendor_id="${VENDOR_IDS[$i]}"
   if [ "${#CALL_IDS[@]}" -gt 0 ]; then
@@ -383,6 +461,9 @@ for i in "${!VENDOR_IDS[@]}"; do
   fi
 
   case "$output_id" in
+    .|..)
+      die "--id must name a direct child directory, not $output_id"
+      ;;
     ""|*[!A-Za-z0-9_.-]*)
       die "--id may only contain letters, numbers, underscore, dot, and dash"
       ;;
@@ -406,6 +487,14 @@ fi
 if [ -n "$VENDORS_CWD" ] && [ ! -d "$VENDORS_CWD" ]; then
   die "--cwd is not a directory: $VENDORS_CWD"
 fi
+if [ -n "$VENDORS_CWD" ]; then
+  VENDORS_CWD=$(cd "$VENDORS_CWD" && pwd -P)
+  VENDORS_EFFECTIVE_CWD="$VENDORS_CWD"
+else
+  # The vendor inherits the invocation directory when --cwd is omitted, so
+  # that effective directory must also participate in session identity.
+  VENDORS_EFFECTIVE_CWD="$VENDORS_INVOCATION_CWD"
+fi
 
 if [ -n "$VENDORS_SCHEMA_FILE" ]; then
   if [ ! -r "$VENDORS_SCHEMA_FILE" ]; then
@@ -422,7 +511,7 @@ if [ -n "$VENDORS_SCHEMA_FILE" ]; then
   export VENDORS_SCHEMA_FILE
 fi
 
-for file in "${PROMPT_FILES[@]}" "${SYSTEM_FILES[@]}" "${INSTRUCTION_FILES[@]}" "${CONTEXT_FILES[@]}"; do
+for file in "${PROMPT_FILES[@]}" "${RESUME_PROMPT_FILES[@]}" "${SYSTEM_FILES[@]}" "${INSTRUCTION_FILES[@]}" "${CONTEXT_FILES[@]}"; do
   if [ ! -r "$file" ]; then
     die "cannot read file: $file"
   fi
@@ -446,11 +535,61 @@ if [ "${#PROMPT_TEXTS[@]}" -eq 0 ] && [ "${#PROMPT_FILES[@]}" -eq 0 ]; then
   die "provide --prompt, --prompt-file, positional prompt text, or stdin"
 fi
 
+vendors_session_state_dir() {
+  if [ -n "${VENDORS_SESSION_STATE_DIR:-}" ]; then
+    printf "%s\n" "$VENDORS_SESSION_STATE_DIR"
+  elif [ -n "${XDG_STATE_HOME:-}" ]; then
+    printf "%s\n" "$XDG_STATE_HOME/shared-vendors/sessions"
+  elif [ -n "${HOME:-}" ]; then
+    printf "%s\n" "$HOME/.local/state/shared-vendors/sessions"
+  else
+    printf "%s\n" "${TMPDIR:-/tmp}/shared-vendors-${UID:-unknown}/sessions"
+  fi
+}
+
 WORK_DIR=$(mktemp -d /tmp/vendors.XXXXXX)
 PIDS=()
+OUTPUT_LOCK_DIRS=()
+CALL_DIRS=()
+CLEANUP_SAFE=1
+
+COORDINATOR_PID=$$
 
 cleanup() {
+  local lock_dir=""
+
+  if [ "$CLEANUP_SAFE" != "1" ]; then
+    return
+  fi
+  for lock_dir in "${OUTPUT_LOCK_DIRS[@]}"; do
+    rm -f "$lock_dir/owner"
+    rmdir "$lock_dir" 2>/dev/null || true
+  done
   rm -rf "$WORK_DIR"
+}
+
+acquire_output_lock() {
+  local output_id="$1"
+  local lock_dir="$OUTPUT_DIR/.vendors-call-$output_id.lock"
+  local owner=""
+
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    if [ -r "$lock_dir/owner" ]; then
+      owner=$(tr '\n' ' ' < "$lock_dir/owner")
+    fi
+    printf "call.sh: output id is already in use: %s/%s" "$OUTPUT_DIR" "$output_id" >&2
+    if [ -n "$owner" ]; then
+      printf " (%s)" "$owner" >&2
+    fi
+    printf "\n" >&2
+    printf "call.sh: use a different --output-dir, or verify the recorded process is gone before removing a stale lock\n" >&2
+    exit 2
+  fi
+  OUTPUT_LOCK_DIRS+=("$lock_dir")
+  {
+    printf "pid=%s\n" "$COORDINATOR_PID"
+    printf "started_epoch=%s\n" "$(date +%s)"
+  } > "$lock_dir/owner"
 }
 kill_tree() {
   local pid="$1"
@@ -468,17 +607,113 @@ kill_tree() {
 
   kill "-$signal_name" "$pid" 2>/dev/null || true
 }
+
+collect_process_tree() {
+  local pid="$1"
+  local child=""
+
+  while read -r child; do
+    [ -n "$child" ] || continue
+    collect_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  SIGNAL_TARGET_PIDS+=("$pid")
+}
+
+pid_has_live_work() {
+  local pid="$1"
+  local stat=""
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  stat=$(ps -o stat= -p "$pid" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+  case "$stat" in
+    Z*) return 1 ;;
+    "") return 0 ;;
+    *) return 0 ;;
+  esac
+}
+
 handle_signal() {
   local code="$1"
   local pid=""
+  local target=""
+  local all_stopped=1
+  local py=""
+  local plan_file=""
+  local output_id=""
+  local -a interrupt_args=()
 
+  # Ignored dispositions survive exec, so the cleanup helper cannot be struck
+  # by a second copy of the signal while it drains the dedicated process group.
+  trap '' INT TERM HUP
+
+  if [ "${#SESSION_KEYS[@]}" -gt 0 ]; then
+    py=$(vendors_session_python || true)
+    if [ -n "$py" ]; then
+      interrupt_args=(
+        "$SCRIPT_DIR/session-state.py" interrupt
+        --process-group "$COORDINATOR_PID"
+        --coordinator-pid "$COORDINATOR_PID"
+      )
+      if [ -n "$OUTPUT_DIR" ]; then
+        for output_id in "${OUTPUT_IDS[@]}"; do
+          plan_file="$OUTPUT_DIR/$output_id/session-plan.json"
+          if [ -r "$plan_file" ]; then
+            interrupt_args+=(--plan "$plan_file")
+          fi
+        done
+      fi
+      if "$py" "${interrupt_args[@]}" >/dev/null; then
+        for pid in "${PIDS[@]}"; do
+          [ -n "$pid" ] || continue
+          wait "$pid" 2>/dev/null || true
+        done
+        cleanup
+        trap - EXIT
+        exit "$code"
+      fi
+    fi
+
+    # The kernel-scoped verifier failed, so best-effort termination is still
+    # appropriate, but leases/output locks must remain fail closed.
+    CLEANUP_SAFE=0
+    printf "call.sh: could not verify keyed process-group shutdown; retaining session/output locks fail closed\n" >&2
+  else
+    if ! command -v pgrep >/dev/null 2>&1; then
+      all_stopped=0
+    fi
+  fi
+
+  SIGNAL_TARGET_PIDS=()
   for pid in "${PIDS[@]}"; do
-    kill_tree "$pid" TERM
+    [ -n "$pid" ] || continue
+    collect_process_tree "$pid"
+  done
+  for target in "${SIGNAL_TARGET_PIDS[@]}"; do
+    kill -TERM "$target" 2>/dev/null || true
   done
   sleep 1
-  for pid in "${PIDS[@]}"; do
-    kill_tree "$pid" KILL
+  for target in "${SIGNAL_TARGET_PIDS[@]}"; do
+    if pid_has_live_work "$target"; then
+      kill -KILL "$target" 2>/dev/null || true
+    fi
   done
+  for pid in "${PIDS[@]}"; do
+    [ -n "$pid" ] || continue
+    wait "$pid" 2>/dev/null || true
+  done
+  if [ "${#SESSION_KEYS[@]}" -eq 0 ]; then
+    for target in "${SIGNAL_TARGET_PIDS[@]}"; do
+      if pid_has_live_work "$target"; then
+        all_stopped=0
+      fi
+    done
+    if [ "$all_stopped" != "1" ]; then
+      CLEANUP_SAFE=0
+      printf "call.sh: signal cleanup could not verify subprocess shutdown; retaining locks and temporary state fail closed\n" >&2
+    fi
+  fi
   cleanup
   trap - EXIT
   exit "$code"
@@ -490,6 +725,7 @@ trap 'handle_signal 129' HUP
 
 SYSTEM_FILE="$WORK_DIR/system.txt"
 BASE_PROMPT_FILE="$WORK_DIR/base-prompt.txt"
+BASE_RESUME_PROMPT_FILE="$WORK_DIR/base-resume-prompt.txt"
 
 {
   for file in "${SYSTEM_FILES[@]}"; do
@@ -538,12 +774,24 @@ fi
   fi
 } > "$BASE_PROMPT_FILE"
 
+{
+  for file in "${RESUME_PROMPT_FILES[@]}"; do
+    cat "$file"
+    printf "\n"
+  done
+  for text in "${RESUME_PROMPT_TEXTS[@]}"; do
+    printf "%s\n" "$text"
+  done
+} > "$BASE_RESUME_PROMPT_FILE"
+
 build_prompt_for_vendor() {
   local vendor_id="$1"
   local output_id="$2"
   local prompt_file="$WORK_DIR/$output_id.prompt.txt"
 
-  if [ "$vendor_id" != "claude" ] && [ -s "$SYSTEM_FILE" ]; then
+  if [ "$VENDORS_SESSION_MODE" = "resume" ] && [ -s "$BASE_RESUME_PROMPT_FILE" ]; then
+    cat "$BASE_RESUME_PROMPT_FILE" > "$prompt_file"
+  elif [ "$vendor_id" != "claude" ] && [ -s "$SYSTEM_FILE" ]; then
     {
       printf "System instructions:\n"
       cat "$SYSTEM_FILE"
@@ -557,6 +805,33 @@ build_prompt_for_vendor() {
   printf "%s\n" "$prompt_file"
 }
 
+vendors_session_missing() {
+  local output_file="$1"
+  local transcript_file="$2"
+  LC_ALL=C grep -Eqi \
+    '(session|conversation|thread|rollout).{0,80}(not found|does not exist|missing|unknown|invalid)|no .{0,40}(session|conversation|thread|rollout)|cannot .{0,40}(find|resume)|unable to resume' \
+    "$output_file" "$transcript_file" 2>/dev/null
+}
+
+vendors_session_arg_conflict() {
+  local vendor_id="$1"
+  local arg=""
+
+  for arg in "${VENDORS_NATIVE_ARGS[@]}"; do
+    case "$vendor_id:$arg" in
+      openai:resume|openai:--last|openai:--last=*|openai:--all|openai:--all=*|openai:--ephemeral|openai:--ephemeral=*) ;;
+      claude:--resume|claude:--resume=*|claude:-r|claude:-r=*|claude:-r?*|claude:--continue|claude:-c|claude:--session-id|claude:--session-id=*|claude:--fork-session|claude:--fork-session=*|claude:--no-session-persistence|claude:--from-pr|claude:--from-pr=*) ;;
+      agy:--conversation|agy:--conversation=*|agy:--continue|agy:-c|agy:--output-format|agy:--output-format=*) ;;
+      cursor:resume|cursor:--resume|cursor:--resume=*|cursor:--continue|cursor:--continue=*|cursor:--output-format|cursor:--output-format=*) ;;
+      grok:resume|grok:--resume|grok:--resume=*|grok:-r|grok:-r=*|grok:-r?*|grok:--continue|grok:-c|grok:--session-id|grok:--session-id=*|grok:-s|grok:-s=*|grok:-s?*|grok:--fork-session|grok:--fork-session=*) ;;
+      *) continue ;;
+    esac
+    printf "%s\n" "$arg"
+    return 0
+  done
+  return 1
+}
+
 run_one_vendor() {
   local label="$1"
   local vendor_id="$2"
@@ -565,16 +840,32 @@ run_one_vendor() {
   local output_file="$5"
   local log_file="${6:-}"
   local status_file="${7:-}"
+  local session_key="${8:-}"
   local call_dir=""
   local timeout_marker=""
   local usage_file=""
   local prompt_file=""
   local code=0
   local reason=""
+  local session_helper="$SCRIPT_DIR/session-state.py"
+  local session_state_dir=""
+  local session_plan_file=""
+  local session_result_file=""
+  local session_lease_sec=28860
+  local observed_session_id=""
+  local session_invalidated=0
+  local session_observe_status=0
+  local session_finalize_status=0
+  local session_owner_pid=""
+  local native_arg=""
+  local py=""
+  local -a session_plan_args=()
 
   call_dir=$(dirname "$output_file")
   timeout_marker="$call_dir/timed-out"
   usage_file="$call_dir/usage.json"
+  session_plan_file="$call_dir/session-plan.json"
+  session_result_file="$call_dir/session.json"
   VENDORS_STREAM_FILE="$call_dir/stream"
   rm -f "$VENDORS_STREAM_FILE"
   if [ "$vendor_id" = "openai" ]; then
@@ -613,12 +904,81 @@ run_one_vendor() {
     return 127
   fi
 
-  prompt_file=$(build_prompt_for_vendor "$vendor_id" "$output_id")
-
   VENDORS_VENDOR_ID="$vendor_id"
   VENDORS_VENDOR_CLI="$cli"
   VENDORS_RESOLVED_MODEL=$(vendors_select_model "$vendor_id" "$MODEL_OVERRIDE")
   VENDORS_RESOLVED_EFFORT=$(vendors_map_effort "$vendor_id" "$EFFORT")
+  VENDORS_SESSION_KEY="$session_key"
+  VENDORS_SESSION_MODE=""
+  VENDORS_SESSION_ID=""
+  VENDORS_SESSION_PLAN_FILE="$session_plan_file"
+  VENDORS_SESSION_RESULT_FILE="$session_result_file"
+
+  if [ -n "$session_key" ]; then
+    py=$(vendors_session_python || true)
+    if [ -z "$py" ]; then
+      printf "session support requires Python 3.10+\n" >&2
+      printf '{"available":false,"provider":"%s","total_tokens":null,"reason":"session support requires Python 3.10+"}\n' \
+        "$vendor_id" > "$usage_file"
+      {
+        printf "vendor=%s\n" "$vendor_id"
+        printf "cli=%s\n" "$cli"
+        printf "id=%s\n" "$output_id"
+        printf "exit_code=69\n"
+        printf "output=%s\n" "$output_file"
+        printf "stream=%s\n" "$VENDORS_STREAM_FILE"
+        printf "log=%s\n" "$log_file"
+        printf "usage=%s\n" "$usage_file"
+        printf "reason=session support requires Python 3.10+\n"
+      } > "$status_file"
+      return 69
+    fi
+    session_state_dir=$(vendors_session_state_dir)
+    if [ "$TIMEOUT_SECONDS" -gt 0 ]; then
+      session_lease_sec=$((TIMEOUT_SECONDS + 60))
+    fi
+    # Bash 3.2 has no BASHPID and `$$` keeps the top coordinator's pid in an
+    # async function. Process substitution launches this sh directly from the
+    # current supervisor shell, so its PPID is the lease owner we need.
+    read -r session_owner_pid < <(sh -c 'printf "%s\n" "$PPID"')
+    session_plan_args=(
+      "$session_helper" plan
+      --state-dir "$session_state_dir"
+      --key "$session_key"
+      --vendor "$vendor_id"
+      --model "${VENDORS_RESOLVED_MODEL:-}"
+      --cwd "$VENDORS_EFFECTIVE_CWD"
+      --owner-pid "$session_owner_pid"
+      --lease-sec "$session_lease_sec"
+      --output "$session_plan_file"
+    )
+    for native_arg in "${VENDORS_NATIVE_ARGS[@]}"; do
+      session_plan_args+=("--transport-arg=$native_arg")
+    done
+    if ! "$py" "${session_plan_args[@]}"; then
+      printf "failed to acquire session lease\n" >&2
+      printf '{"available":false,"provider":"%s","total_tokens":null,"reason":"session lease unavailable"}\n' \
+        "$vendor_id" > "$usage_file"
+      {
+        printf "vendor=%s\n" "$vendor_id"
+        printf "cli=%s\n" "$cli"
+        printf "id=%s\n" "$output_id"
+        printf "exit_code=75\n"
+        printf "output=%s\n" "$output_file"
+        printf "stream=%s\n" "$VENDORS_STREAM_FILE"
+        printf "log=%s\n" "$log_file"
+        printf "usage=%s\n" "$usage_file"
+        printf "reason=session lease unavailable\n"
+      } > "$status_file"
+      return 75
+    fi
+    VENDORS_SESSION_MODE=$("$py" "$session_helper" field --plan "$session_plan_file" --name mode)
+    VENDORS_SESSION_ID=$("$py" "$session_helper" field --plan "$session_plan_file" --name session_id)
+  fi
+
+  # Session mode determines whether the full initial prompt or the optional
+  # smaller continuation prompt is delivered.
+  prompt_file=$(build_prompt_for_vendor "$vendor_id" "$output_id")
 
   run_status=0
   if [ "$TIMEOUT_SECONDS" -gt 0 ] && [ "$VENDORS_DRY_RUN" != "1" ]; then
@@ -648,12 +1008,84 @@ run_one_vendor() {
   code="$run_status"
 
   if [ "$VENDORS_DRY_RUN" != "1" ]; then
+    # Capture provider-native session metadata before usage normalization.
+    # Claude and Cursor intentionally replace their raw protocol envelope in
+    # `out` with assistant prose, so observing afterward would discard the
+    # only copy of a newly allocated session id.
+    if [ -n "$session_key" ]; then
+      "$py" "$session_helper" observe \
+        --vendor "$vendor_id" \
+        --output-file "$output_file" \
+        --transcript-file "$VENDORS_TRANSCRIPT_FILE" \
+        --requested-session-id "$VENDORS_SESSION_ID" \
+        --mode "$VENDORS_SESSION_MODE" \
+        --exit-code "$run_status" \
+        --output "$session_result_file" || session_observe_status=$?
+      if [ "$session_observe_status" = "0" ]; then
+        observed_session_id=$(
+          "$py" "$session_helper" field \
+            --plan "$session_result_file" --name session_id 2>/dev/null
+        ) || session_observe_status=$?
+      fi
+      if [ "$VENDORS_SESSION_MODE" = "resume" ] \
+          && [ "$run_status" != "0" ] \
+          && vendors_session_missing "$output_file" "$VENDORS_TRANSCRIPT_FILE"; then
+        session_invalidated=1
+      fi
+    fi
+
     vendors_collect_usage "$vendor_id" "$output_file" "$VENDORS_TRANSCRIPT_FILE" "$usage_file"
     if [ "$code" = "0" ]; then
       reason=$(vendors_output_error_reason "$vendor_id" "$output_file" || true)
       if [ -n "$reason" ]; then
         code=1
       fi
+    fi
+    if [ -n "$session_key" ]; then
+      if [ "$code" = "0" ] && [ "$session_observe_status" != "0" ]; then
+        code=70
+        reason="session metadata observation failed"
+      elif [ "$code" = "0" ] && [ -z "$observed_session_id" ]; then
+        code=70
+        reason="session protocol did not yield a native session id"
+      fi
+      if [ "$VENDORS_SESSION_MODE" = "resume" ] \
+          && [ "$code" != "0" ] \
+          && [ "$session_invalidated" != "1" ] \
+          && vendors_session_missing "$output_file" "$VENDORS_TRANSCRIPT_FILE"; then
+        session_invalidated=1
+      fi
+      if [ "$code" = "0" ]; then
+        "$py" "$session_helper" finalize \
+          --plan "$session_plan_file" \
+          --success \
+          --observed-session-id "$observed_session_id" \
+          || session_finalize_status=$?
+      elif [ "$session_invalidated" = "1" ]; then
+        "$py" "$session_helper" finalize \
+          --plan "$session_plan_file" --invalidate \
+          || session_finalize_status=$?
+      else
+        "$py" "$session_helper" finalize \
+          --plan "$session_plan_file" \
+          || session_finalize_status=$?
+      fi
+      if [ "$session_finalize_status" != "0" ]; then
+        if [ "$code" = "0" ]; then
+          code=70
+        fi
+        if [ -z "$reason" ]; then
+          reason="session state finalization failed"
+        fi
+      fi
+    fi
+  elif [ -n "$session_key" ]; then
+    # Dry-run must never leave a live lease or establish a provider session.
+    "$py" "$session_helper" finalize --plan "$session_plan_file" \
+      || session_finalize_status=$?
+    if [ "$session_finalize_status" != "0" ]; then
+      code=70
+      reason="session state finalization failed"
     fi
   fi
 
@@ -671,6 +1103,13 @@ run_one_vendor() {
       printf "stream=%s\n" "$VENDORS_STREAM_FILE"
       printf "log=%s\n" "$log_file"
       printf "usage=%s\n" "$usage_file"
+      if [ -n "$session_key" ]; then
+        printf "session_key_hash=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name identity_hash 2>/dev/null || true)"
+        printf "session_mode=%s\n" "$VENDORS_SESSION_MODE"
+        printf "session_id=%s\n" "$observed_session_id"
+        printf "session=%s\n" "$session_result_file"
+        printf "session_invalidated=%s\n" "$session_invalidated"
+      fi
       if [ "$code" = "124" ]; then
         printf "reason=timeout\n"
       elif [ -n "$reason" ]; then
@@ -682,20 +1121,69 @@ run_one_vendor() {
   return "$code"
 }
 
+if [ "${#SESSION_KEYS[@]}" -gt 0 ]; then
+  for vendor_id in "${VENDOR_IDS[@]}"; do
+    conflict=$(vendors_session_arg_conflict "$vendor_id" || true)
+    if [ -n "$conflict" ]; then
+      die "--session-key owns native session transport for $vendor_id; remove conflicting --native-arg $conflict"
+    fi
+  done
+fi
+
 if [ -z "$OUTPUT_DIR" ]; then
   OUTPUT_DIR=$(mktemp -d /tmp/vendors-output.XXXXXX)
 else
   mkdir -p "$OUTPUT_DIR"
 fi
+OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd -P)
+
+# Resolve every existing call directory before locking. A call directory must
+# be a real direct child of the canonical output root; traversal aliases and
+# symlinked ids could otherwise give two syntactic locks one physical target.
+for output_id in "${OUTPUT_IDS[@]}"; do
+  call_dir="$OUTPUT_DIR/$output_id"
+  if [ -L "$call_dir" ]; then
+    die "output call directory must not be a symlink: $call_dir"
+  fi
+  if [ -e "$call_dir" ] && [ ! -d "$call_dir" ]; then
+    die "output path exists and is not a directory: $call_dir"
+  fi
+  if [ -d "$call_dir" ]; then
+    canonical_call_dir=$(cd "$call_dir" && pwd -P)
+    if [ "$(dirname "$canonical_call_dir")" != "$OUTPUT_DIR" ] \
+        || [ "$(basename "$canonical_call_dir")" != "$output_id" ]; then
+      die "output call directory must resolve to a direct child of $OUTPUT_DIR: $call_dir"
+    fi
+    call_dir="$canonical_call_dir"
+  fi
+  CALL_DIRS+=("$call_dir")
+done
+
+# Reserve every selected output id before creating or truncating any call
+# artifact. This makes fan-out startup atomic and prevents two coordinators
+# from cross-writing session plans, transcripts, or status files.
+for output_id in "${OUTPUT_IDS[@]}"; do
+  acquire_output_lock "$output_id"
+done
 
 for i in "${!VENDOR_IDS[@]}"; do
   vendor_id="${VENDOR_IDS[$i]}"
   output_id="${OUTPUT_IDS[$i]}"
-  call_dir="$OUTPUT_DIR/$output_id"
-  if [ -e "$call_dir" ] && [ ! -d "$call_dir" ]; then
-    die "output path exists and is not a directory: $call_dir"
-  fi
+  call_dir="${CALL_DIRS[$i]}"
   mkdir -p "$call_dir"
+  if [ -L "$call_dir" ]; then
+    die "output call directory became a symlink after locking: $call_dir"
+  fi
+  canonical_call_dir=$(cd "$call_dir" && pwd -P)
+  if [ "$(dirname "$canonical_call_dir")" != "$OUTPUT_DIR" ] \
+      || [ "$(basename "$canonical_call_dir")" != "$output_id" ]; then
+    die "output call directory escaped its canonical output root: $call_dir"
+  fi
+  call_dir="$canonical_call_dir"
+  session_key=""
+  if [ "${#SESSION_KEYS[@]}" -gt 0 ]; then
+    session_key="${SESSION_KEYS[$i]}"
+  fi
 
   run_one_vendor \
     "${VENDOR_LABELS[$i]}" \
@@ -705,12 +1193,17 @@ for i in "${!VENDOR_IDS[@]}"; do
     "$call_dir/out" \
     "$call_dir/log" \
     "$call_dir/status" \
+    "$session_key" \
     > "$call_dir/log" 2>&1 &
   PIDS+=("$!")
 done
 
-for pid in "${PIDS[@]}"; do
+for i in "${!PIDS[@]}"; do
+  pid="${PIDS[$i]}"
   wait "$pid" 2>/dev/null || true
+  # Never retain an already-reaped numeric PID: it can be reused by an
+  # unrelated process before a later handled signal in a long fan-out call.
+  PIDS[$i]=""
 done
 
 SUCCESS=0

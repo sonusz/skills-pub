@@ -31,6 +31,7 @@ def render_stage_prompt(
     extra_targets: list[Path],
     context_artifacts: list[str] | None = None,
     preseeded: bool = False,
+    continuation: bool = False,
 ) -> str:
     """Build the prompt string passed to the shared vendors adapter.
 
@@ -38,7 +39,21 @@ def render_stage_prompt(
     body, listing the concrete paths + hashes the subagent needs.
     """
     prompt_file = _prompt_file_for_stage(stage)
-    body = prompt_file.read_text(encoding="utf-8")
+    if continuation:
+        body = (
+            f"# Continue the existing `{stage}` agent session\n\n"
+            "Keep the role, invariants, output contract, and implementation "
+            "discipline established by the initial turn in this session. "
+            "The filesystem and hashes below are authoritative for this "
+            "turn: re-read changed feedback and targets, do not rely on stale "
+            "in-memory file contents, and continue by editing the current "
+            "working artifacts rather than restarting the assignment. If a "
+            "listed PROMPT_HASH changed, re-read PROMPT_FILE before acting. "
+            "If a previous turn failed or was interrupted, reconcile your "
+            "memory with the current files before acting.\n"
+        )
+    else:
+        body = prompt_file.read_text(encoding="utf-8")
 
     ctx_lines: list[str] = [
         "",

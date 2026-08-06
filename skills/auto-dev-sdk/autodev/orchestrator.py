@@ -812,7 +812,9 @@ class Orchestrator:
         # harness appends <stage>-output-rejection.json (and the prior
         # artifacts) to CONTEXT_ARTIFACTS so the agent amends in place
         # rather than regenerating from scratch.
-        def render_prompt(extra_context: list[str]) -> str:
+        def render_prompt(
+            extra_context: list[str], continuation: bool = False,
+        ) -> str:
             merged = list(self._context_artifacts_for_stage(
                 active, stage, primary_target, extra_targets,
             ))
@@ -828,6 +830,7 @@ class Orchestrator:
                 extra_targets=extra_targets,
                 context_artifacts=merged,
                 preseeded=preseeded,
+                continuation=continuation,
             )
 
         logger.emit(stage=stage, event="subprocess-dispatch", feature=feature,
@@ -993,6 +996,7 @@ class Orchestrator:
         logger: JsonlLog,
         stage_spec,
         prompt: str,
+        resume_prompt: str | None,
         primary_target: Path,
         extra_targets: list[Path],
         allowed_write_paths: list[Path],
@@ -1037,6 +1041,7 @@ class Orchestrator:
                                            feature=feature, detail=d),
             probe_config=self.cfg.vendors.probe,
             preseed=preseed,
+            resume_prompt=resume_prompt,
         )
 
         if not result.ok:
@@ -1121,7 +1126,7 @@ class Orchestrator:
         stage: str,
         logger: JsonlLog,
         stage_spec,
-        render_prompt: Callable[[list[str]], str],
+        render_prompt: Callable[[list[str], bool], str],
         primary_target: Path,
         extra_targets: list[Path],
         allowed_write_paths: list[Path],
@@ -1162,6 +1167,7 @@ class Orchestrator:
                         extra_context.append(str(et))
                 extra_context.append(str(feedback_path))
             prompt = render_prompt(extra_context)
+            resume_prompt = render_prompt(extra_context, True)
             pre_snap = snapshot(self.cfg.repo_root)
             try:
                 result = self._run_stage_subprocess_checked(
@@ -1171,6 +1177,7 @@ class Orchestrator:
                     logger=logger,
                     stage_spec=stage_spec,
                     prompt=prompt,
+                    resume_prompt=resume_prompt,
                     primary_target=primary_target,
                     extra_targets=extra_targets,
                     allowed_write_paths=allowed_write_paths,
@@ -1312,6 +1319,18 @@ class Orchestrator:
                     active, "build", primary_target, [],
                 ),
             )
+            resume_prompt = render_stage_prompt(
+                stage="build",
+                feature=feature,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                primary_target=primary_target,
+                extra_targets=[],
+                context_artifacts=self._context_artifacts_for_stage(
+                    active, "build", primary_target, [],
+                ),
+                continuation=True,
+            )
             pre_snap = snapshot(self.cfg.repo_root)
             result = self._run_stage_subprocess_checked(
                 feature=feature,
@@ -1320,6 +1339,7 @@ class Orchestrator:
                 logger=logger,
                 stage_spec=stage_spec,
                 prompt=prompt,
+                resume_prompt=resume_prompt,
                 primary_target=primary_target,
                 extra_targets=[],
                 allowed_write_paths=allowed_write_paths,
@@ -1399,6 +1419,16 @@ class Orchestrator:
                 extra_targets=[],
                 context_artifacts=context_artifacts or None,
             )
+            resume_prompt = render_stage_prompt(
+                stage="ralph-review",
+                feature=feature,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                primary_target=review_target,
+                extra_targets=[],
+                context_artifacts=context_artifacts or None,
+                continuation=True,
+            )
             result = self._run_stage_subprocess_checked(
                 feature=feature,
                 active=active,
@@ -1406,6 +1436,7 @@ class Orchestrator:
                 logger=logger,
                 stage_spec=review_spec,
                 prompt=prompt,
+                resume_prompt=resume_prompt,
                 primary_target=review_target,
                 extra_targets=[],
                 allowed_write_paths=[active],

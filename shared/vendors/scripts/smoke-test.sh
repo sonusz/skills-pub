@@ -44,6 +44,7 @@ else
 fi
 [ -n "$out" ] && printf "%s\n" "$response" > "$out"
 if [ "$json" = "1" ]; then
+  printf '{"type":"thread.started","thread_id":"11111111-1111-4111-8111-111111111111"}\n'
   printf '{"type":"turn.completed","usage":{"input_tokens":101,"cached_input_tokens":11,"output_tokens":7,"reasoning_output_tokens":3}}\n'
 else
   printf "fake codex transcript\n"
@@ -56,6 +57,7 @@ format=""
 verbose=0
 include_partials=0
 schema=0
+session_id="22222222-2222-4222-8222-222222222222"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-format)
@@ -72,6 +74,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --json-schema)
       schema=1
+      shift 2
+      ;;
+    --session-id|--resume)
+      session_id="$2"
       shift 2
       ;;
     *)
@@ -93,13 +99,14 @@ if [ "$format" = "stream-json" ]; then
     printf "stream-json requires --verbose\n" >&2
     exit 2
   fi
-  python3 - "$response" "$include_partials" <<'PY'
+  python3 - "$response" "$include_partials" "$session_id" <<'PY'
 import json
 import sys
 
 response = sys.argv[1]
 include_partials = sys.argv[2] == "1"
-print(json.dumps({"type": "system", "subtype": "init"}))
+session_id = sys.argv[3]
+print(json.dumps({"type": "system", "subtype": "init", "session_id": session_id}))
 if include_partials:
     print(json.dumps({
         "type": "assistant",
@@ -109,6 +116,7 @@ print(json.dumps({
     "type": "result",
     "subtype": "success",
     "result": response,
+    "session_id": session_id,
     "usage": {
         "input_tokens": 103,
         "cache_creation_input_tokens": 5,
@@ -139,10 +147,20 @@ FAKE_CLAUDE
 cat > "$BIN_DIR/agy" <<'FAKE_AGY'
 #!/usr/bin/env bash
 prompt=""
+format=""
+conversation_id="33333333-3333-4333-8333-333333333333"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --print|-p)
       prompt="$2"
+      shift 2
+      ;;
+    --output-format)
+      format="$2"
+      shift 2
+      ;;
+    --conversation)
+      conversation_id="$2"
       shift 2
       ;;
     *)
@@ -155,7 +173,27 @@ if printf "%s" "$prompt" | grep -qi 'single word READY'; then
 else
   response="agy received: $prompt"
 fi
-printf "%s\n" "$response"
+if [ "$format" = "json" ]; then
+  python3 - "$response" "$conversation_id" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "conversation_id": sys.argv[2],
+    "status": "SUCCESS",
+    "response": sys.argv[1],
+    "usage": {
+        "input_tokens": 107,
+        "output_tokens": 19,
+        "thinking_tokens": 3,
+        "cache_read_tokens": 11,
+        "total_tokens": 140,
+    },
+}))
+PY
+else
+  printf "%s\n" "$response"
+fi
 FAKE_AGY
 
 cat > "$BIN_DIR/cursor-agent" <<'FAKE_CURSOR'
@@ -163,6 +201,7 @@ cat > "$BIN_DIR/cursor-agent" <<'FAKE_CURSOR'
 print=0
 format=""
 prompt=""
+session_id="44444444-4444-4444-8444-444444444444"
 seen_dashdash=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -178,7 +217,11 @@ while [ "$#" -gt 0 ]; do
       format="${1#*=}"
       shift
       ;;
-    --model|--api-key|-H|--header|--mode|--resume|--sandbox|--workspace|-w|--worktree|--worktree-base)
+    --resume)
+      session_id="$2"
+      shift 2
+      ;;
+    --model|--api-key|-H|--header|--mode|--sandbox|--workspace|-w|--worktree|--worktree-base)
       shift 2
       ;;
     --yolo|-f|--force|--continue|--plan|--list-models|--approve-mcps|--trust|--skip-worktree-setup|--stream-partial-output|-v|--version|-h|--help)
@@ -211,25 +254,29 @@ else
   response="cursor received: $prompt"
 fi
 if [ "$format" = "stream-json" ]; then
-  python3 - "$response" <<'PY'
+  python3 - "$response" "$session_id" <<'PY'
 import json
 import sys
 
 response = sys.argv[1]
-print(json.dumps({"type": "system", "subtype": "init", "model": "fake-cursor"}))
+session_id = sys.argv[2]
+print(json.dumps({"type": "system", "subtype": "init", "model": "fake-cursor", "session_id": session_id}))
 print(json.dumps({
     "type": "user",
     "message": {"role": "user", "content": [{"type": "text", "text": "fake-prompt"}]},
+    "session_id": session_id,
 }))
 print(json.dumps({
     "type": "assistant",
     "message": {"role": "assistant", "content": [{"type": "text", "text": response}]},
+    "session_id": session_id,
 }))
 print(json.dumps({
     "type": "result",
     "subtype": "success",
     "is_error": False,
     "result": response,
+    "session_id": session_id,
     "usage": {
         "inputTokens": 117,
         "outputTokens": 23,
@@ -265,6 +312,7 @@ cat > "$BIN_DIR/grok" <<'FAKE_GROK'
 format=""
 schema=""
 prompt_file=""
+session_id="fake-grok-session"
 fail=0
 delay=0
 malformed_schema=0
@@ -282,6 +330,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --prompt-file)
       prompt_file="${2-}"
+      shift 2
+      ;;
+    --session-id|--resume)
+      session_id="${2-}"
       shift 2
       ;;
     --model|--reasoning-effort|--cwd|--fake-native)
@@ -342,11 +394,11 @@ if [ "$format" != "streaming-json" ]; then
   printf "fake grok requires --output-format streaming-json\n" >&2
   exit 2
 fi
-python3 - "$response" "$schema" "$malformed_schema" "$no_text" <<'PY'
+python3 - "$response" "$schema" "$malformed_schema" "$no_text" "$session_id" <<'PY'
 import json
 import sys
 
-response, schema, malformed_schema, no_text = sys.argv[1:5]
+response, schema, malformed_schema, no_text, session_id = sys.argv[1:6]
 print(json.dumps({"type": "thought", "data": "fake-control-frame"}))
 if no_text != "1":
     mid = max(1, len(response) // 2)
@@ -355,7 +407,7 @@ if no_text != "1":
 end = {
     "type": "end",
     "stopReason": "EndTurn",
-    "sessionId": "fake-grok-session",
+    "sessionId": session_id,
     "requestId": "fake-grok-request",
     "usage": {
         "input_tokens": 127,
@@ -381,6 +433,59 @@ chmod +x \
   "$BIN_DIR/agy" \
   "$BIN_DIR/cursor-agent" \
   "$BIN_DIR/grok"
+
+# Provider-neutral session contract: every fake CLI establishes a native id,
+# the second turn resumes it, and only the continuation prompt is delivered.
+session_state_dir="$WORK/session-state"
+for turn in 1 2; do
+  session_run_dir="$RUN_ROOT/session-turn-$turn"
+  PATH="$BIN_DIR:$PATH" \
+  VENDORS_SESSION_STATE_DIR="$session_state_dir" \
+  "$SCRIPT_DIR/call.sh" \
+    --vendor OpenAI \
+    --vendor Claude \
+    --vendor Agy \
+    --vendor Cursor \
+    --vendor Grok \
+    --session-key smoke-session-openai \
+    --session-key smoke-session-claude \
+    --session-key smoke-session-agy \
+    --session-key smoke-session-cursor \
+    --session-key smoke-session-grok \
+    --prompt SESSION_INITIAL_PROMPT \
+    --resume-prompt SESSION_DELTA_PROMPT \
+    --output-dir "$session_run_dir" \
+    --min-success 5 >/dev/null
+
+  if [ "$turn" = "1" ]; then
+    expected_mode="new"
+    expected_prompt="SESSION_INITIAL_PROMPT"
+  else
+    expected_mode="resume"
+    expected_prompt="SESSION_DELTA_PROMPT"
+  fi
+  for session_vendor in openai claude agy cursor grok; do
+    if ! grep -q "^session_mode=$expected_mode$" \
+        "$session_run_dir/$session_vendor/status" \
+        || ! grep -Eq '^session_id=.+$' \
+        "$session_run_dir/$session_vendor/status" \
+        || ! grep -q "$expected_prompt" \
+        "$session_run_dir/$session_vendor/out"; then
+      printf "FAIL: expected %s session turn %s to be %s with %s\n" \
+        "$session_vendor" "$turn" "$expected_mode" "$expected_prompt" >&2
+      cat "$session_run_dir/$session_vendor/status" >&2
+      cat "$session_run_dir/$session_vendor/out" >&2
+      exit 1
+    fi
+  done
+done
+
+if grep -R -q 'smoke-session-' "$session_state_dir" \
+    || ! grep -q '"source": "agy_json"' \
+      "$RUN_ROOT/session-turn-2/agy/usage.json"; then
+  printf "FAIL: expected hashed session state and normalized Agy JSON usage\n" >&2
+  exit 1
+fi
 
 for caller in openai claude agy cursor grok; do
   call_dir="$RUN_ROOT/$caller"
@@ -1142,4 +1247,4 @@ assert usage == {
 }
 PY
 
-printf "OK: vendors smoke test passed (5 calls x 5 vendors + Grok aliases/runtime/schema/failure/timeout/doctor)\n"
+printf "OK: vendors smoke test passed (native sessions + 5 calls x 5 vendors + Grok aliases/runtime/schema/failure/timeout/doctor)\n"

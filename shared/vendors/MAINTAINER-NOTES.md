@@ -82,6 +82,48 @@ real integration is intentionally being tested.
   Missing Python must leave a valid unavailable `usage.json`.
 - Keep raw Grok NDJSON in `stream`; expose only normalized final text or the
   structured-output envelope in `out`.
+- Keep provider-neutral session state in `scripts/session-state.py`; callers
+  supply opaque keys and must not implement provider-specific resume logic.
+- Session identity includes the opaque key, normalized vendor, resolved model,
+  real effective cwd (including the invocation cwd when `--cwd` is omitted),
+  and the ordered native-argument fingerprint. Do not weaken that boundary or
+  two incompatible agents can inherit one another's context. Persist only the
+  fingerprint, never raw native arguments.
+- Session mappings are user-level runtime state, never repository files. Store
+  only a key hash, use mode 0700/0600, atomic replacement, and the per-record
+  lease. Concurrent turns for one native conversation must fail closed.
+- Observe native session ids before `vendors_collect_usage` rewrites `out`.
+  This ordering is required for Claude and Cursor. Session-enabled Agy uses
+  `--output-format json`; normalize its `response` only after observing
+  `conversation_id`. Extract only trusted provider-specific top-level protocol
+  fields/event types; nested model and tool payloads are attacker-controlled.
+  Validate id shape and reject any mismatch with a wrapper-requested id.
+- A keyed provider exit 0 is successful only when native id observation and
+  state finalization also succeed. Fail with status exit code 70 and release
+  the lease when a dynamic provider omits its id. Session state requires Python
+  3.10+ because `session-state.py` uses that language level.
+- Reserve each output id with its parent-level hidden lock before touching the
+  call directory. Lock every fan-out id before launching any provider. Normal
+  cleanup removes owned locks; a `SIGKILL`-orphaned lock stays fail closed and
+  requires a verified manual cleanup or a new output directory. Reject `.` and
+  `..`, directory symlinks, and any call directory that does not resolve to a
+  direct child of the canonical output root.
+- A session lease is live while either its timestamp is unexpired or its actual
+  per-call supervisor pid is alive. Do not use Bash `$$` from an async function:
+  on Bash 3.2 it still names the top coordinator. Keyed calls must own a
+  dedicated process group (direct calls re-exec through `os.setsid()` when
+  needed). On handled signals, repeatedly drain and verify that group, then
+  finalize only the exact plan/token capabilities published by that invocation.
+  Never scan leases by numeric PID: PID reuse can release unrelated work.
+- Keep Codex native args in the `codex exec` option scope, before the `resume`
+  subcommand. Several valid exec flags (including `--oss` and `--sandbox`) are
+  rejected in the resume-subcommand scope.
+- Preserve stateless compatibility: when `--session-key` is absent, Claude
+  retains `--no-session-persistence` and all other launchers keep their prior
+  command shape.
+- A missing native session invalidates only that mapping. Do not silently retry
+  the same logical turn in a fresh context; report the failure and let the next
+  workflow attempt establish a new session with its full prompt.
 
 ## Common bug signatures
 
@@ -98,6 +140,11 @@ real integration is intentionally being tested.
 | Grok exits zero but produces no final text | Require a non-empty `text` event unless native structured output was requested |
 | Grok schema succeeds without an envelope | Treat `structuredOutputError` or missing `structuredOutput` as failure |
 | Grok has no Python interpreter | Fail before invoking `grok` and write unavailable Grok usage metadata |
+| Keyed call repeatedly reports `session_mode=new` | Native id observation failed; inspect raw protocol before normalization and the keyed `session.json` |
+| Exit 75 with `session lease unavailable` | The same logical session has a live turn; wait for it or diagnose its owner instead of running concurrent prompts |
+| Exit 70 with a session protocol/state reason | A keyed provider omitted its native id, observation failed, or durable finalization failed; do not treat the turn as resumable |
+| `output id is already in use` | Another coordinator owns that `<output-dir>/<id>`, or a killed coordinator left a fail-closed hidden lock; verify the recorded pid before cleanup |
+| Resume fails with a native not-found error | The mapping is invalidated intentionally; the next call starts new and must receive the full prompt |
 
 ## Maintaining this file
 
