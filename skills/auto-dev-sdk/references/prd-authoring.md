@@ -118,6 +118,7 @@ Section shape (absent section ⇒ every R is `strict`):
 ## Assurance
 
 Default: loose
+Release threshold: P1
 
 | Req | Rigor | Rationale |
 |---|---|---|
@@ -129,6 +130,12 @@ Rows are needed only for Rs deviating from the default. Rationale is
 required — it calibrates reviewers and is re-asked verbatim at
 graduation or stall re-audits. Amendments override levels with
 `Assurance: R3 core -> strict` lines (latest wins).
+
+`Release threshold` is separate from rigor and severity. It accepts `P0`,
+`P1`, or `P2`; `P1` is the default and preserves historical behavior. Use
+`P0` for a time-critical release where P1/P2 findings must be retained as
+deferred work but must not trigger another producer/design round. A later
+amendment may set `Release threshold: P0` (last declaration wins).
 
 **Elicitation protocol — never ask for a level by name.** Users have
 no stable intuition for the labels but do for "can you accept this

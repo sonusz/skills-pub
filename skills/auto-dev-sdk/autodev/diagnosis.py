@@ -71,11 +71,12 @@ class DiagnosisResult:
 
 
 def _blocking_findings(v: PanelVerdict) -> list[PanelFinding]:
-    return [f for f in v.findings if f.severity in _BLOCKING]
+    return v.blocking_findings()
 
 
 def select_rework_mode(
-    blocking: list[PanelFinding], recurring: set[str],
+    blocking: list[PanelFinding], recurring: set[str], *,
+    issue_count: int | None = None,
 ) -> str:
     """Trust-region step size for the next producer rerun. Computed by
     the harness — never left to the design agent's judgment (under gate
@@ -85,7 +86,8 @@ def select_rework_mode(
         # the conservative answer for any other caller.
         return MODE_ROOT_CAUSE
     if (
-        len(blocking) <= PATCH_MAX_BLOCKING
+        (issue_count if issue_count is not None else len(blocking))
+        <= PATCH_MAX_BLOCKING
         and blocking
         and all(f.targets for f in blocking)
     ):
@@ -162,7 +164,7 @@ def classify_stall(
         if c.severity_reported is not None:
             c.severity = c.severity_reported
     apply_rigor_filter(copies, assurance, scope, override_level=override)
-    if has_effective_blocking(copies):
+    if has_effective_blocking(copies, assurance.release_threshold):
         return "coherence", sorted(implicated, key=lambda r: int(r[1:]))
     return "rigor-pivotal", sorted(implicated, key=lambda r: int(r[1:]))
 
@@ -194,15 +196,31 @@ def check_and_diagnose(
     no L) on recurrence."""
     report = record_verdict(feature_active, gate, verdict)
     blocking = _blocking_findings(verdict)
-
-    recurring_findings = [
-        f for f in blocking if compute_fingerprint(f) in report.recurring
-    ]
+    by_id = {f.finding_id: f for f in blocking if f.finding_id}
+    recurring_findings: list[PanelFinding] = []
+    seen_ids: set[int] = set()
+    for cluster in verdict.issue_clusters:
+        if cluster.cluster_id not in report.recurring_cluster_ids:
+            continue
+        for finding_id in cluster.finding_ids:
+            finding = by_id.get(finding_id)
+            if finding is not None and id(finding) not in seen_ids:
+                recurring_findings.append(finding)
+                seen_ids.add(id(finding))
+    # Legacy/singleton verdicts have no persisted cluster membership.
+    for finding in blocking:
+        if (id(finding) not in seen_ids
+                and compute_fingerprint(finding) in report.recurring):
+            recurring_findings.append(finding)
+            seen_ids.add(id(finding))
     if not recurring_findings:
-        mode = select_rework_mode(blocking, report.recurring)
+        issue_count = len(verdict.blocking_issue_clusters())
+        mode = select_rework_mode(
+            blocking, report.recurring, issue_count=issue_count,
+        )
         write_rework_mode(
             feature_active, mode, gate=gate, run_ts=verdict.run_ts,
-            blocking_count=len(blocking),
+            blocking_count=issue_count,
         )
         return None
 

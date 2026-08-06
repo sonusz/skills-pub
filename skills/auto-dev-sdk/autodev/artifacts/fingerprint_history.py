@@ -1,11 +1,11 @@
 """fingerprint-history.json — mechanism 2's per-gate finding-fingerprint
 history + declined re-audit records (docs/proposals/rigor-tier.md).
 
-Fingerprint = hash of normalized ``(category, sorted targets, sorted
-evidence_refs, summary_sig)``. The summary component keeps two distinct
-findings on the same section+category from colliding — a collision
-triggers a spurious stop-and-diagnose (expensive); a reworded
-recurrence the strict key misses merely costs one extra rerun (cheap).
+Fingerprint = a coarse structural identity over category, targets,
+evidence references, failure class, and missized direction. Summary wording
+is deliberately excluded: reviewers routinely restate the same defect and
+exact prose matching caused needless redesign rounds. Synthesizer cluster IDs
+provide the semantic identity; this coarse key is the deterministic fallback.
 
 Recurrence = the same fingerprint appearing under two DIFFERENT
 ``source_hash`` values — the reviewed package changed (producer ran)
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,19 +38,23 @@ FILENAME = "fingerprint-history.json"
 _BLOCKING = ("invariant_violation", "risk")
 
 
-def _summary_sig(summary: str) -> str:
-    normalized = re.sub(r"\s+", " ", summary.strip().lower())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-
-
 def compute_fingerprint(f: PanelFinding) -> str:
     key = json.dumps([
         f.category or "",
         sorted(f.targets),
         sorted(f.evidence_refs),
-        _summary_sig(f.summary),
+        f.failure_class or "",
+        f.missized_direction or "",
     ], separators=(",", ":"))
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+
+
+def _cluster_fingerprint(findings: list[PanelFinding]) -> str:
+    member_keys = sorted({compute_fingerprint(f) for f in findings})
+    if len(member_keys) == 1:
+        return member_keys[0]
+    raw = json.dumps(member_keys, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 @dataclass
@@ -63,6 +66,9 @@ class RecurrenceReport:
     recurring: set[str] = field(default_factory=set)
     # All blocking fingerprints of this verdict.
     blocking: set[str] = field(default_factory=set)
+    # Semantic cluster IDs in the current verdict that matched either a
+    # prior ID or a prior coarse fingerprint.
+    recurring_cluster_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -127,6 +133,18 @@ def write_history(feature_active: Path, h: FingerprintHistory) -> None:
     atomic_write_json(history_path(feature_active), d)
 
 
+def prior_cluster_catalog(feature_active: Path, gate: str) -> list[dict]:
+    """Return the newest audit record for each prior semantic cluster."""
+    h = load_history(feature_active)
+    by_id: dict[str, dict] = {}
+    for entry in reversed(h.rounds.get(gate, [])):
+        for cluster in entry.get("clusters", []):
+            cid = cluster.get("cluster_id") if isinstance(cluster, dict) else None
+            if isinstance(cid, str) and cid and cid not in by_id:
+                by_id[cid] = dict(cluster)
+    return [by_id[cid] for cid in sorted(by_id)]
+
+
 def clear_history(feature_active: Path) -> None:
     """Amendment reset — a new PRD cycle starts fingerprint-clean."""
     history_path(feature_active).unlink(missing_ok=True)
@@ -138,12 +156,42 @@ def record_verdict(
     """Record one enforced verdict's blocking fingerprints; report
     recurrence. Idempotent per verdict ``run_ts``."""
     h = load_history(feature_active)
-    blocking = {
-        compute_fingerprint(f)
-        for f in verdict.findings if f.severity in _BLOCKING
-    }
+    blocking_findings = verdict.blocking_findings()
+    by_id = {f.finding_id: f for f in blocking_findings if f.finding_id}
+    assigned: set[str] = set()
+    cluster_records: list[dict] = []
+    for cluster in verdict.issue_clusters:
+        members = [by_id[i] for i in cluster.finding_ids if i in by_id]
+        if not members:
+            continue
+        assigned.update(f.finding_id for f in members if f.finding_id)
+        cluster_records.append({
+            "cluster_id": cluster.cluster_id,
+            "fingerprint": _cluster_fingerprint(members),
+            "summary": cluster.summary,
+            "targets": sorted({t for f in members for t in f.targets}),
+            "evidence_refs": sorted({r for f in members for r in f.evidence_refs}),
+            "categories": sorted({f.category for f in members if f.category}),
+            "priority": cluster.priority,
+        })
+    for index, finding in enumerate(blocking_findings):
+        if finding.finding_id and finding.finding_id in assigned:
+            continue
+        fp = compute_fingerprint(finding)
+        cluster_records.append({
+            "cluster_id": f"singleton-{fp}-{index}",
+            "fingerprint": fp,
+            "summary": finding.summary,
+            "targets": sorted(finding.targets),
+            "evidence_refs": sorted(finding.evidence_refs),
+            "categories": [finding.category] if finding.category else [],
+            "priority": finding.effective_priority(),
+        })
+    blocking = {c["fingerprint"] for c in cluster_records}
+    cluster_ids = {c["cluster_id"] for c in cluster_records}
     entries = h.rounds.setdefault(gate, [])
     prior: set[str] = set()
+    prior_cluster_ids: set[str] = set()
     for e in entries:
         # Recurrence evidence requires an intervening producer rerun,
         # witnessed by a source_hash change. Same-hash rounds are
@@ -155,18 +203,30 @@ def record_verdict(
             and e["source_hash"] != verdict.source_hash
         ):
             prior.update(e["fingerprints"])
+            prior_cluster_ids.update(e.get("cluster_ids", []))
     new_round = not any(e["run_ts"] == verdict.run_ts for e in entries)
     if new_round:
         entries.append({
             "run_ts": verdict.run_ts,
             "source_hash": verdict.source_hash,
             "fingerprints": sorted(blocking),
+            "cluster_ids": sorted(cluster_ids),
+            "clusters": cluster_records,
         })
         write_history(feature_active, h)
+    recurring_ids = {
+        c["cluster_id"] for c in cluster_records
+        if c["cluster_id"] in prior_cluster_ids or c["fingerprint"] in prior
+    }
+    recurring_fingerprints = {
+        c["fingerprint"] for c in cluster_records
+        if c["cluster_id"] in recurring_ids
+    }
     return RecurrenceReport(
         new_round=new_round,
-        recurring=blocking & prior,
+        recurring=recurring_fingerprints,
         blocking=blocking,
+        recurring_cluster_ids=recurring_ids,
     )
 
 

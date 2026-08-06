@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from autodev.artifacts.verdict import (
-    DroppedFinding, PanelFinding, PanelVerdict, load_verdict, write_verdict,
+    DroppedFinding, IssueCluster, PanelFinding, PanelVerdict, load_verdict,
+    write_verdict,
 )
 from autodev.panel.schemas import synthesizer_output_schema
 
@@ -41,6 +42,31 @@ def test_panel_finding_targets_round_trip(tmp_path):
     assert loaded.findings[0].targets == [
         "primary_pair.prd.md", "anchor.scope.json",
     ]
+
+
+def test_priority_cluster_and_release_threshold_round_trip(tmp_path):
+    finding = PanelFinding(
+        severity="risk", priority="P0", finding_id="claude:1",
+        vendor="claude", summary="core path broken",
+    )
+    verdict = PanelVerdict(
+        gate="design-review", verdict="needs_revision", findings=[finding],
+        source="src", source_hash="sha256:" + "0" * 64,
+        prompt_file="p", prompt_hash="sha256:" + "0" * 64,
+        harness_version="t", run_ts="t", release_threshold="P0",
+        issue_clusters=[IssueCluster(
+            cluster_id="issue-core", finding_ids=["claude:1"],
+            summary="core path broken", priority="P0",
+        )],
+    )
+    path = tmp_path / "panel.json"
+    write_verdict(path, verdict)
+    loaded = load_verdict(path)
+    assert loaded.release_threshold == "P0"
+    assert loaded.findings[0].priority == "P0"
+    assert loaded.findings[0].finding_id == "claude:1"
+    assert loaded.issue_clusters[0].cluster_id == "issue-core"
+    assert loaded.effectively_blocks()
 
 
 def test_panel_finding_omits_empty_targets_in_json(tmp_path):
@@ -118,10 +144,10 @@ def test_synthesizer_schema_accepts_targets_field():
     assert targets_schema["items"]["type"] == "string"
 
 
-def test_synthesizer_schema_targets_is_optional():
+def test_synthesizer_schema_requires_targets_with_empty_list_default():
     schema = synthesizer_output_schema()
     entry = schema["properties"]["per_reviewer"]["items"]
-    # targets is allowed but not required — synthesizer copies what
-    # reviewers emit; reviewers may legitimately emit no targets.
+    # Strict structured output requires every property.  A reviewer with no
+    # target is represented by the prompt-mandated empty list.
     finding_schema = entry["properties"]["findings"]["items"]
-    assert "targets" not in finding_schema["required"]
+    assert "targets" in finding_schema["required"]

@@ -228,6 +228,19 @@ def apply_rigor_filter(
     return result
 
 
-def has_effective_blocking(findings: list[PanelFinding]) -> bool:
-    """Post-filter blocking predicate (pure function of findings)."""
-    return any(f.severity in _BLOCKING for f in findings)
+def has_effective_blocking(
+    findings: list[PanelFinding], release_threshold: str = "P1",
+) -> bool:
+    """Post-filter + release-policy blocking predicate.
+
+    ``P1`` is the backward-compatible default. Priority remains independent
+    from severity: a finding must have blocking severity *and* meet the
+    configured release threshold.
+    """
+    rank = {"P0": 0, "P1": 1, "P2": 2}
+    threshold = rank.get(release_threshold, rank["P1"])
+    return any(
+        f.severity in _BLOCKING
+        and rank[f.effective_priority()] <= threshold
+        for f in findings
+    )

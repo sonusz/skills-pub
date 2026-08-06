@@ -8,7 +8,7 @@ from autodev.artifacts.fingerprint_history import (
     clear_history, compute_fingerprint, load_history, record_declined,
     record_verdict,
 )
-from autodev.artifacts.verdict import PanelFinding, PanelVerdict
+from autodev.artifacts.verdict import IssueCluster, PanelFinding, PanelVerdict
 from autodev.diagnosis import (
     MODE_PATCH, MODE_ROOT_CAUSE, check_and_diagnose, read_rework_mode,
     record_skip_as_declined, select_rework_mode,
@@ -59,12 +59,17 @@ def _finding(summary="cache corrupts on concurrent write", severity="risk",
     )
 
 
-def _verdict(findings, run_ts, gate="design-review", source_hash="sha256:0"):
+def _verdict(
+    findings, run_ts, gate="design-review", source_hash="sha256:0",
+    issue_clusters=None, release_threshold="P1",
+):
     return PanelVerdict(
         gate=gate, verdict="needs_revision", findings=findings,
         source="design-packet.json", source_hash=source_hash,
         prompt_file="p", prompt_hash="sha256:1",
         harness_version="test", run_ts=run_ts,
+        issue_clusters=issue_clusters or [],
+        release_threshold=release_threshold,
     )
 
 
@@ -77,14 +82,16 @@ def _feature(tmp_path, prd=PRD):
 
 # ---- fingerprints ----------------------------------------------------------
 
-def test_fingerprint_stability_and_summary_sensitivity():
+def test_fingerprint_stability_ignores_summary_but_tracks_structure():
     a = _finding()
     b = _finding()
     assert compute_fingerprint(a) == compute_fingerprint(b)
     c = _finding(summary="a different defect entirely")
-    assert compute_fingerprint(a) != compute_fingerprint(c)
+    assert compute_fingerprint(a) == compute_fingerprint(c)
     d = _finding(summary="  CACHE   corrupts on concurrent write ")
-    assert compute_fingerprint(a) == compute_fingerprint(d)  # normalized
+    assert compute_fingerprint(a) == compute_fingerprint(d)
+    e = _finding(category="invented")
+    assert compute_fingerprint(a) != compute_fingerprint(e)
 
 
 def test_record_verdict_idempotent_and_recurrence(tmp_path):
@@ -102,6 +109,18 @@ def test_record_verdict_idempotent_and_recurrence(tmp_path):
     )
     assert r2.new_round
     assert r2.recurring == {compute_fingerprint(f)}
+
+
+def test_reworded_finding_recurs_by_coarse_identity(tmp_path):
+    active = _feature(tmp_path)
+    first = _finding(summary="cache corrupts on concurrent write")
+    second = _finding(summary="concurrent writers can damage the cache")
+    record_verdict(active, "design-review", _verdict([first], "t1"))
+    report = record_verdict(
+        active, "design-review",
+        _verdict([second], "t2", source_hash="sha256:1"),
+    )
+    assert report.recurring == {compute_fingerprint(second)}
 
 
 def test_panel_rerun_on_unchanged_package_is_not_recurrence(tmp_path):
@@ -152,6 +171,25 @@ def test_mode_root_cause_unanchored():
 
 def test_mode_root_cause_on_empty():
     assert select_rework_mode([], set()) == MODE_ROOT_CAUSE
+
+
+def test_clustered_duplicate_findings_count_as_one_patch_ticket(tmp_path):
+    active = _feature(tmp_path)
+    findings = [_finding(summary=f"wording {i}") for i in range(3)]
+    for i, finding in enumerate(findings, 1):
+        finding.finding_id = f"reviewer:{i}"
+    cluster = IssueCluster(
+        cluster_id="issue-cache", finding_ids=[f.finding_id for f in findings],
+        summary="cache concurrency defect", priority="P1",
+    )
+    diag = check_and_diagnose(
+        active, "design-review",
+        _verdict(findings, "t1", issue_clusters=[cluster]),
+    )
+    assert diag is None
+    payload = json.loads((active / "rework-mode.json").read_text())
+    assert payload["mode"] == MODE_PATCH
+    assert payload["blocking_count"] == 1
 
 
 # ---- check_and_diagnose ----------------------------------------------------

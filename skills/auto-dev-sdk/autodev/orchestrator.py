@@ -5,6 +5,7 @@ checks all gates, and invokes the vendor subprocess runner.
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -644,10 +645,7 @@ class Orchestrator:
         # design-review group's verdict is not authoritative over the whole
         # design evaluation. Drop the decision in that case so handle_panel_verdict
         # falls back to filename-based dispatch on the merged findings list.
-        trace_has_blocking = any(
-            f.severity in ("invariant_violation", "risk")
-            for f in v_trace.findings
-        )
+        trace_has_blocking = bool(v_trace.blocking_findings())
         merged_decision = v_design.decision
         if (
             merged_decision is not None
@@ -655,10 +653,39 @@ class Orchestrator:
             and trace_has_blocking
         ):
             merged_decision = None
+        trace_findings = copy.deepcopy(v_trace.findings)
+        trace_id_map: dict[str, str] = {}
+        for index, finding in enumerate(trace_findings):
+            if finding.finding_id:
+                new_id = f"trace-review/{finding.finding_id}"
+                trace_id_map[finding.finding_id] = new_id
+                finding.finding_id = new_id
+            elif v_trace.issue_clusters:
+                # A clustered verdict should always carry IDs; preserve a
+                # conservative unique identity if loading older mixed data.
+                finding.finding_id = f"trace-review/legacy-{index}"
+        trace_clusters = copy.deepcopy(v_trace.issue_clusters)
+        for cluster in trace_clusters:
+            cluster.finding_ids = [
+                trace_id_map.get(i, f"trace-review/{i}")
+                for i in cluster.finding_ids
+            ]
+        merged_clusters = copy.deepcopy(v_design.issue_clusters)
+        by_cluster_id = {c.cluster_id: c for c in merged_clusters}
+        priority_rank = {"P0": 0, "P1": 1, "P2": 2}
+        for cluster in trace_clusters:
+            existing = by_cluster_id.get(cluster.cluster_id)
+            if existing is None:
+                merged_clusters.append(cluster)
+                by_cluster_id[cluster.cluster_id] = cluster
+                continue
+            existing.finding_ids.extend(cluster.finding_ids)
+            if priority_rank[cluster.priority] < priority_rank[existing.priority]:
+                existing.priority = cluster.priority
         merged = PanelVerdict(
             gate="design-review",
             verdict=_worst_verdict(v_design.verdict, v_trace.verdict),  # type: ignore[arg-type]
-            findings=list(v_design.findings) + list(v_trace.findings),
+            findings=list(v_design.findings) + trace_findings,
             source=v_design.source,
             source_hash=v_design.source_hash,
             prompt_file=v_design.prompt_file,
@@ -670,6 +697,10 @@ class Orchestrator:
             dropped_findings=list(v_design.dropped_findings) + list(v_trace.dropped_findings),
             coverage_map={**v_design.coverage_map, **v_trace.coverage_map},
             decision=merged_decision,
+            issue_clusters=merged_clusters,
+            release_threshold=v_design.release_threshold,
+            decision_overridden_by_rigor=v_design.decision_overridden_by_rigor,
+            decision_overridden_by_policy=v_design.decision_overridden_by_policy,
         )
         return merged, ["panel-design-review.json", "panel-trace-review.json"]
 

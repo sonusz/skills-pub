@@ -68,9 +68,8 @@ def _gate_verdict_filename(gate: str) -> str:
 
 
 def _blocking_findings(v: PanelVerdict) -> list:
-    """Findings that drive rerun dispatch: invariant_violation + risk.
-    ``opinion`` findings' targets are ignored for rerun purposes."""
-    return [f for f in v.findings if f.severity in ("invariant_violation", "risk")]
+    """Findings that meet both severity and release-priority policy."""
+    return v.blocking_findings()
 
 
 def _extract_primary_filenames(findings) -> tuple[set[str], bool]:

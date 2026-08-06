@@ -13,17 +13,19 @@ from pathlib import Path
 
 import pytest
 
-from autodev.artifacts.verdict import load_verdict
+from autodev.artifacts.verdict import IssueCluster, PanelFinding, PanelVerdict, load_verdict
+from autodev.artifacts.fingerprint_history import record_verdict
 from autodev.panel.runner import (
     FAKE_INVOKER_ENV, _compose_reviewer_prompt, _compose_synthesizer_prompt,
-    _invoke_reviewer, _invoke_synthesizer,
+    _build_issue_clusters, _invoke_reviewer, _invoke_synthesizer,
+    _synthesize_and_build_verdict,
     _read_only_native_args, run_panel_gate_internal,
 )
 from autodev.panel.schemas import synthesizer_output_schema
 from autodev.vendors.config import (
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
-from autodev.errors import GatePending
+from autodev.errors import GatePending, SchemaError
 from autodev.vendors.shared_call import cli_name_for_vendor, normalize_shared_vendor
 
 FAKE_SCRIPT = Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"
@@ -62,29 +64,53 @@ def _make_artifact(feature_active: Path) -> Path:
 def test_schema_is_per_reviewer_extraction():
     """Synthesizer JSON schema keeps per-reviewer extraction and may add a canonical decision."""
     schema = synthesizer_output_schema()
-    assert schema["required"] == ["per_reviewer"]
+    assert set(schema["required"]) == {
+        "per_reviewer", "issue_clusters", "decision",
+    }
     entry = schema["properties"]["per_reviewer"]["items"]
-    assert set(entry["required"]) == {"vendor", "verdict", "findings"}
+    assert set(entry["required"]) == {"vendor", "verdict", "findings", "coverage"}
     assert set(entry["properties"]["verdict"]["enum"]) == {
         "pass", "needs_revision", "fail"
     }
     finding_schema = entry["properties"]["findings"]["items"]
     # Findings live INSIDE a reviewer entry — they do NOT carry
     # originating_vendors; the reviewer's own vendor label owns them.
-    assert set(finding_schema["required"]) == {"severity", "summary"}
+    assert set(finding_schema["required"]) == set(finding_schema["properties"])
     assert "originating_vendors" not in finding_schema["properties"]
+    assert {"finding_id", "priority"} <= set(finding_schema["required"])
+    cluster_schema = schema["properties"]["issue_clusters"]["items"]
+    assert set(cluster_schema["required"]) == {
+        "prior_cluster_id", "finding_ids", "summary",
+    }
     coverage_schema = entry["properties"]["coverage"]["items"]
-    assert set(coverage_schema["required"]) == {"req_id", "status", "evidence"}
+    assert set(coverage_schema["required"]) == {"req_id", "status", "evidence", "notes"}
     assert set(coverage_schema["properties"]["status"]["enum"]) == {
         "satisfied", "partial", "missing", "deviated", "ambiguous",
     }
-    decision = schema["properties"]["decision"]
+    decision = schema["properties"]["decision"]["anyOf"][0]
     assert set(decision["required"]) == {
         "node", "outcome", "blocking", "severity", "summary",
     }
     assert set(decision["properties"]["outcome"]["enum"]) == {
         "pass", "retry_design", "halt_for_human",
     }
+
+
+def test_schema_meets_openai_strict_required_property_rule():
+    """Every object declares all properties required; optionality is nullable."""
+    schema = synthesizer_output_schema()
+
+    def visit(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                assert set(node.get("required", [])) == set(node.get("properties", {}))
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(schema)
 
 
 def test_compose_reviewer_prompt_references_artifact_file(feature_active):
@@ -196,6 +222,232 @@ def test_compose_synthesizer_prompt_does_not_truncate_or_inline_artifact(feature
     assert str(artifact) in sp
     assert "Artifact hash" in sp
     assert tail not in sp
+
+
+def test_harness_validates_clusters_and_keeps_raw_findings(feature_active):
+    findings = [
+        PanelFinding(
+            severity="risk", priority="P1", finding_id="claude:1",
+            vendor="claude", summary="cache race",
+        ),
+        PanelFinding(
+            severity="risk", priority="P0", finding_id="codex:1",
+            vendor="codex", summary="concurrent cache corruption",
+        ),
+    ]
+    clusters = _build_issue_clusters(
+        findings,
+        {"issue_clusters": [{
+            "prior_cluster_id": None,
+            "finding_ids": ["claude:1", "codex:1"],
+            "summary": "cache concurrency defect",
+        }]},
+        feature_active=feature_active, gate="design-review",
+    )
+    assert len(findings) == 2
+    assert len(clusters) == 1
+    assert clusters[0].priority == "P0"
+
+
+def test_harness_rejects_cluster_that_drops_a_raw_finding(feature_active):
+    findings = [
+        PanelFinding(
+            severity="risk", finding_id="claude:1", vendor="claude",
+            summary="one",
+        ),
+        PanelFinding(
+            severity="risk", finding_id="codex:1", vendor="codex",
+            summary="two",
+        ),
+    ]
+    with pytest.raises(SchemaError, match="assign every raw finding"):
+        _build_issue_clusters(
+            findings,
+            {"issue_clusters": [{
+                "prior_cluster_id": None,
+                "finding_ids": ["claude:1"], "summary": "one",
+            }]},
+            feature_active=feature_active, gate="design-review",
+        )
+
+
+def test_synth_prompt_includes_prior_cluster_catalog(feature_active):
+    artifact = _make_artifact(feature_active)
+    finding = PanelFinding(
+        severity="risk", priority="P1", finding_id="claude:1",
+        vendor="claude", summary="cache race",
+    )
+    record_verdict(
+        feature_active, "design-review",
+        PanelVerdict(
+            gate="design-review", verdict="needs_revision", findings=[finding],
+            source=str(artifact), source_hash="sha256:first",
+            prompt_file="p", prompt_hash="sha256:p", harness_version="t",
+            run_ts="t1", issue_clusters=[IssueCluster(
+                cluster_id="issue-cache", finding_ids=["claude:1"],
+                summary="cache concurrency defect", priority="P1",
+            )],
+        ),
+    )
+    from autodev.panel.runner import ReviewerResult
+    prompt = _compose_synthesizer_prompt(
+        gate="design-review", artifact_path=artifact,
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True, output="Verdict: pass",
+            elapsed_sec=0.1,
+        )],
+        feature_active=feature_active,
+    )
+    assert '"cluster_id": "issue-cache"' in prompt
+    assert "Reuse a `cluster_id`" in prompt
+
+
+def test_p0_policy_overrides_p1_halt_but_retains_finding(
+    feature_active, panel_config, monkeypatch,
+):
+    artifact = feature_active / "design.md"
+    artifact.write_text("design", encoding="utf-8")
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n## Assurance\n\nDefault: strict\nRelease threshold: P0\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "per_reviewer": [{
+            "vendor": "claude", "verdict": "fail", "coverage": [],
+            "findings": [{
+                "finding_id": "claude:1", "severity": "risk",
+                "priority": "P1", "summary": "deferrable concern",
+                "targets": ["primary_pair.design.md"], "category": "other",
+                "evidence_refs": [], "failure_class": "mainline",
+                "missized_direction": None,
+            }],
+        }],
+        "issue_clusters": [{
+            "prior_cluster_id": None, "finding_ids": ["claude:1"],
+            "summary": "deferrable concern",
+        }],
+        "decision": {
+            "node": "design_review", "outcome": "halt_for_human",
+            "blocking": True, "severity": "risk", "summary": "halt",
+        },
+    }
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, payload, ""),
+    )
+    from autodev.panel.runner import ReviewerResult
+    verdict, _path, error = _synthesize_and_build_verdict(
+        gate_label="design-review",
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True, output="review",
+            elapsed_sec=0.1,
+        )],
+        primary_artifact=artifact, prompt_file_for_audit=artifact,
+        consulted_docs=[], per_vendor_raw={"claude": "review"},
+        panel_config=panel_config, feature_active=feature_active,
+        vendor_cwd=feature_active, probe_config=None, log_emit=None,
+    )
+    assert error is None
+    assert verdict.verdict == "pass"
+    assert verdict.findings[0].priority == "P1"
+    assert verdict.decision.outcome == "pass"
+    assert verdict.decision_overridden_by_policy["outcome"] == "halt_for_human"
+    assert not verdict.effectively_blocks()
+
+
+def test_synthesizer_cannot_omit_a_responding_reviewer(
+    feature_active, panel_config, monkeypatch,
+):
+    artifact = _make_artifact(feature_active)
+    payload = {
+        "per_reviewer": [{
+            "vendor": "claude", "verdict": "pass", "findings": [],
+            "coverage": [],
+        }],
+        "issue_clusters": [],
+        "decision": {
+            "node": "design_review", "outcome": "pass", "blocking": False,
+            "severity": "opinion", "summary": "pass",
+        },
+    }
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, payload, ""),
+    )
+    from autodev.panel.runner import ReviewerResult
+    verdict, _path, error = _synthesize_and_build_verdict(
+        gate_label="design-review",
+        reviewer_results=[
+            ReviewerResult(
+                vendor="claude", model="m", ok=True, output="pass",
+                elapsed_sec=0.1,
+            ),
+            ReviewerResult(
+                vendor="codex", model="m", ok=True, output="P0 failure",
+                elapsed_sec=0.1,
+            ),
+        ],
+        primary_artifact=artifact, prompt_file_for_audit=artifact,
+        consulted_docs=[], per_vendor_raw={}, panel_config=panel_config,
+        feature_active=feature_active, vendor_cwd=feature_active,
+        probe_config=None, log_emit=None,
+    )
+    assert "exactly match responding reviewers" in error
+    assert verdict.verdict == "fail"
+    assert verdict.findings[0].priority == "P0"
+    assert verdict.effectively_blocks()
+
+
+def test_blocking_p0_finding_overrides_design_pass_decision(
+    feature_active, panel_config, monkeypatch,
+):
+    artifact = feature_active / "design.md"
+    artifact.write_text("design", encoding="utf-8")
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n## Assurance\n\nDefault: strict\nRelease threshold: P0\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "per_reviewer": [{
+            "vendor": "claude", "verdict": "pass", "coverage": [],
+            "findings": [{
+                "finding_id": "claude:1", "severity": "risk",
+                "priority": "P0", "summary": "core path cannot run",
+                "targets": ["primary_pair.design.md"], "category": "missing",
+                "evidence_refs": [], "failure_class": "mainline",
+                "missized_direction": None,
+            }],
+        }],
+        "issue_clusters": [{
+            "prior_cluster_id": None, "finding_ids": ["claude:1"],
+            "summary": "core path cannot run",
+        }],
+        "decision": {
+            "node": "design_review", "outcome": "pass", "blocking": False,
+            "severity": "opinion", "summary": "pass",
+        },
+    }
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, payload, ""),
+    )
+    from autodev.panel.runner import ReviewerResult
+    verdict, _path, error = _synthesize_and_build_verdict(
+        gate_label="design-review",
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True, output="review",
+            elapsed_sec=0.1,
+        )],
+        primary_artifact=artifact, prompt_file_for_audit=artifact,
+        consulted_docs=[], per_vendor_raw={}, panel_config=panel_config,
+        feature_active=feature_active, vendor_cwd=feature_active,
+        probe_config=None, log_emit=None,
+    )
+    assert error is None
+    assert verdict.verdict == "needs_revision"
+    assert verdict.decision.outcome == "retry_design"
+    assert verdict.effectively_blocks()
+    assert verdict.decision_overridden_by_policy["outcome"] == "pass"
 
 
 def test_reviewer_invocation_via_fake(fake_invoker, monkeypatch):
@@ -377,9 +629,12 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
         "  exit 0\n"
         "fi\n"
         "cat <<'EOF'\n"
-        '{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},'
-        '{"vendor":"agy","verdict":"pass","findings":[]},'
-        '{"vendor":"codex","verdict":"pass","findings":[]}]}\n'
+            '{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},'
+            '{"vendor":"agy","verdict":"pass","findings":[]},'
+            '{"vendor":"codex","verdict":"pass","findings":[]}],'
+            '"issue_clusters":[],"decision":{"node":"design_review",'
+            '"outcome":"pass","blocking":false,"severity":"opinion",'
+            '"summary":"pass"}}\n'
         "EOF\n"
         "exit 0\n"
     )
@@ -479,7 +734,7 @@ def test_parallel_dispatch_uses_threadpool(fake_invoker, monkeypatch, feature_ac
         "  echo \"Verdict: pass\"\n"
         "  exit 0\n"
         "fi\n"
-        '  echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},{"vendor":"agy","verdict":"pass","findings":[]},{"vendor":"codex","verdict":"pass","findings":[]}]}\'\n'
+        '  echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},{"vendor":"agy","verdict":"pass","findings":[]},{"vendor":"codex","verdict":"pass","findings":[]}],"issue_clusters":[],"decision":{"node":"design_review","outcome":"pass","blocking":false,"severity":"opinion","summary":"pass"}}\'\n'
         "exit 0\n"
     )
     wrapper.chmod(0o755)

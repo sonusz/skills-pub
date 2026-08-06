@@ -81,13 +81,13 @@ panel:
     - vendor: codex
       model: gpt-5.6-sol
       effort: max
-  # Synthesizes reviewer outputs only; does not re-review the artifact.
-  # Context: medium; reviewer outputs plus schema. Effort: high enough for
-  # faithful extraction, lower than design generation.
+  # Preserves reviewer findings and performs semantic issue clustering.
+  # This identity work controls rerun sizing and recurrence, so use the
+  # strongest configured reasoning model rather than the extraction model.
   synthesizer:
     vendor: codex
-    model: gpt-5.6-luna
-    effort: high
+    model: gpt-5.6-sol
+    effort: max
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
 

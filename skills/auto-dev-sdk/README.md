@@ -210,11 +210,16 @@ budget for *semantic* reruns) and from hard subprocess failures or
 out-of-scope writes, which still halt immediately. Watch the
 `output-rejected-retrying` / `output-rejected-exhausted` log events.
 
-Each panel runs its configured claude + grok + agy + codex/openai reviewers independently,
-then a synthesizer merges their findings into a single verdict.
-Blocking findings (`invariant_violation` or `risk`) either dispatch
-a producer rerun (bumping the gate's L counter, cap L_MAX=3) or
-halt for human decision.
+Each panel runs its configured claude + grok + agy + codex/openai reviewers
+independently. The synthesizer preserves every raw finding and adds semantic
+issue clusters; the harness validates membership and counts clusters, rather
+than repeated reviewer wording, as tickets. Every finding also has an
+independent `P0` / `P1` / `P2` release priority. PRDs default to
+`Release threshold: P1` (historical behavior) and may select `P0` so P1/P2
+findings remain auditable without dispatching redesign. Blocking clusters
+either dispatch a producer rerun (bumping the gate's L counter) or halt for
+human decision. Cross-round recurrence first reuses synthesizer cluster IDs
+and falls back to structural identity that deliberately ignores summary prose.
 For `design-review`, a blocking finding that targets `prd.md` first
 reruns the design stage so the design agent can try to remove the
 apparent PRD conflict. A second consecutive PRD-targeted design-review

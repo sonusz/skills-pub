@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ from typing import Callable, Sequence
 from autodev import __version__ as HARNESS_VERSION
 from autodev.artifacts.revision_state import load_state
 from autodev.artifacts.verdict import (
+    IssueCluster,
     NO_RESPONSE_PREFIX,
     PanelFinding,
     PanelVerdict,
@@ -41,6 +43,7 @@ from autodev.artifacts.verdict import (
     panel_verdict_transport_incomplete,
     write_verdict,
 )
+from autodev.artifacts.fingerprint_history import prior_cluster_catalog
 from autodev.errors import ConfigError, GatePending, QuotaHalt, SchemaError
 from autodev.panel.anchor_filter import filter_anchor_findings
 from autodev.panel.rigor_filter import (
@@ -137,12 +140,14 @@ def _finding_from_synth(vendor: str, f: dict) -> PanelFinding:
         evidence_refs=[str(x) for x in f.get("evidence_refs", [])],
         failure_class=f.get("failure_class"),
         missized_direction=f.get("missized_direction"),
+        priority=f.get("priority"),
+        finding_id=f.get("finding_id"),
     )
 
 
 def _apply_rigor_to_findings(
     findings: list[PanelFinding], *, feature_active: Path,
-) -> RigorFilterResult:
+) -> tuple[RigorFilterResult, str]:
     """Load the Assurance map (prd.md) + scope.json tolerantly and run
     the rigor filter. Any load failure degrades to the all-strict
     no-op (== current behavior), never to a crash inside verdict
@@ -166,7 +171,113 @@ def _apply_rigor_to_findings(
             scope = load_scope(scope_path)
     except Exception:
         scope = None
-    return apply_rigor_filter(findings, assurance, scope)
+    return apply_rigor_filter(findings, assurance, scope), assurance.release_threshold
+
+
+def _build_issue_clusters(
+    findings: list[PanelFinding], payload: dict, *, feature_active: Path,
+    gate: str,
+) -> list[IssueCluster]:
+    """Validate synthesizer clustering without making semantic judgments."""
+    ids = [f.finding_id for f in findings]
+    if any(not finding_id for finding_id in ids):
+        raise SchemaError("synthesizer finding missing finding_id")
+    if len(set(ids)) != len(ids):
+        raise SchemaError("synthesizer finding_id values are not unique")
+    by_id = {f.finding_id: f for f in findings}
+    raw_clusters = payload.get("issue_clusters")
+    if not isinstance(raw_clusters, list):
+        raise SchemaError("synthesizer output missing issue_clusters array")
+    prior_ids = {
+        c["cluster_id"] for c in prior_cluster_catalog(feature_active, gate)
+        if isinstance(c.get("cluster_id"), str)
+    }
+    assigned: set[str] = set()
+    reused: set[str] = set()
+    result: list[IssueCluster] = []
+    priority_rank = {"P0": 0, "P1": 1, "P2": 2}
+    for index, raw in enumerate(raw_clusters):
+        member_ids = raw.get("finding_ids") if isinstance(raw, dict) else None
+        if not isinstance(member_ids, list) or not member_ids:
+            raise SchemaError(f"issue_clusters[{index}] has no finding_ids")
+        if len(set(member_ids)) != len(member_ids):
+            raise SchemaError(f"issue_clusters[{index}] repeats a finding_id")
+        unknown = set(member_ids) - set(by_id)
+        if unknown:
+            raise SchemaError(
+                f"issue_clusters[{index}] references unknown finding ids "
+                f"{sorted(unknown)!r}"
+            )
+        duplicate = set(member_ids) & assigned
+        if duplicate:
+            raise SchemaError(
+                f"findings assigned to multiple issue clusters: {sorted(duplicate)!r}"
+            )
+        prior_id = raw.get("prior_cluster_id")
+        if prior_id is not None:
+            if prior_id not in prior_ids:
+                raise SchemaError(
+                    f"issue_clusters[{index}] reuses unknown prior cluster "
+                    f"{prior_id!r}"
+                )
+            if prior_id in reused:
+                raise SchemaError(f"prior cluster {prior_id!r} reused more than once")
+            cluster_id = prior_id
+            reused.add(prior_id)
+        else:
+            identity = json.dumps({
+                "summary": raw.get("summary", "").strip().lower(),
+                "members": sorted(member_ids),
+            }, sort_keys=True, separators=(",", ":"))
+            cluster_id = "issue-" + hashlib.sha256(
+                identity.encode("utf-8")
+            ).hexdigest()[:16]
+        members = [by_id[i] for i in member_ids]
+        priority = min(
+            (f.effective_priority() for f in members),
+            key=priority_rank.__getitem__,
+        )
+        summary = raw.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise SchemaError(f"issue_clusters[{index}] summary is empty")
+        result.append(IssueCluster(
+            cluster_id=cluster_id,
+            finding_ids=list(member_ids),
+            summary=summary.strip(),
+            priority=priority,
+        ))
+        assigned.update(member_ids)
+    missing = set(by_id) - assigned
+    if missing:
+        raise SchemaError(
+            "issue_clusters must assign every raw finding exactly once; "
+            f"missing {sorted(missing)!r}"
+        )
+    if len({c.cluster_id for c in result}) != len(result):
+        raise SchemaError("issue cluster IDs are not unique")
+    return result
+
+
+def _trim_issue_clusters(
+    clusters: list[IssueCluster], findings: list[PanelFinding],
+) -> list[IssueCluster]:
+    """Remove anchor-dropped members while retaining validated grouping."""
+    by_id = {f.finding_id: f for f in findings if f.finding_id}
+    rank = {"P0": 0, "P1": 1, "P2": 2}
+    trimmed: list[IssueCluster] = []
+    for cluster in clusters:
+        member_ids = [i for i in cluster.finding_ids if i in by_id]
+        if not member_ids:
+            continue
+        priority = min(
+            (by_id[i].effective_priority() for i in member_ids),
+            key=rank.__getitem__,
+        )
+        trimmed.append(IssueCluster(
+            cluster_id=cluster.cluster_id, finding_ids=member_ids,
+            summary=cluster.summary, priority=priority,
+        ))
+    return trimmed
 
 
 def _doctor_hint() -> str:
@@ -676,7 +787,6 @@ def _compose_synthesizer_prompt(
     feature_active: Path | None = None,
 ) -> str:
     """Build the prompt for the synthesizer given reviewer outputs."""
-    del feature_active  # retained for call-site compatibility
     base = synthesize_prompt_path().read_text(encoding="utf-8")
     responded = [r.vendor for r in reviewer_results if r.ok]
     missing = [r.vendor for r in reviewer_results if not r.ok]
@@ -690,9 +800,22 @@ def _compose_synthesizer_prompt(
     out += f"- **Reviewers who responded**: {', '.join(responded) if responded else '(none)'}\n"
     if missing:
         out += f"- **Reviewers who did NOT respond**: {', '.join(missing)}\n"
+    catalog: list[dict] = []
+    if feature_active is not None:
+        catalog = prior_cluster_catalog(feature_active, gate)
+    out += "\n## Prior semantic issue clusters\n\n"
+    if catalog:
+        out += (
+            "Reuse a `cluster_id` below only when a current finding is the "
+            "same underlying issue. Otherwise use null.\n\n```json\n"
+            + json.dumps(catalog, sort_keys=True, indent=2)
+            + "\n```\n"
+        )
+    else:
+        out += "No prior clusters exist for this gate; use null for every prior_cluster_id.\n"
     out += (
-        "\nThe synthesizer is an extractor, not a reviewer. Do not re-review "
-        "the artifact and do not add findings absent from reviewer outputs.\n"
+        "\nThe synthesizer extracts and clusters; it is not a reviewer. Do not "
+        "re-review the artifact and do not add or drop findings.\n"
     )
     for r in reviewer_results:
         if r.ok:
@@ -1069,32 +1192,60 @@ def _synthesize_and_build_verdict(
     )
 
     findings: list[PanelFinding] = []
+    issue_clusters: list[IssueCluster] = []
     coverage_map: dict[str, list[dict]] = {}
     decision: ReviewDecision | None = None
     synth_infra_error: str | None = None
     if synth_ok and synth_parsed:
-        per_reviewer = synth_parsed.get("per_reviewer", [])
-        per_vendor_verdicts: list[str] = []
-        for entry in per_reviewer:
-            vendor = entry.get("vendor", "unknown")
-            per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
-            if entry.get("coverage"):
-                coverage_map[vendor] = list(entry.get("coverage", []))
-            for f in entry.get("findings", []):
-                findings.append(_finding_from_synth(vendor, f))
-        if gate_label == "design-review" and isinstance(synth_parsed.get("decision"), dict):
-            decision = _normalize_design_review_decision(
-                feature_active=feature_active,
-                decision_payload=synth_parsed["decision"],
-                findings=findings,
+        try:
+            per_reviewer = synth_parsed.get("per_reviewer", [])
+            expected_reviewers = Counter(
+                r.vendor for r in reviewer_results if r.ok
             )
-            verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
-        else:
+            actual_reviewers = Counter(
+                entry.get("vendor") for entry in per_reviewer
+                if isinstance(entry, dict)
+            )
+            if actual_reviewers != expected_reviewers:
+                raise SchemaError(
+                    "synthesizer per_reviewer must exactly match responding "
+                    f"reviewers: expected {dict(expected_reviewers)!r}, "
+                    f"got {dict(actual_reviewers)!r}"
+                )
+            per_vendor_verdicts: list[str] = []
+            for entry in per_reviewer:
+                vendor = entry.get("vendor", "unknown")
+                per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
+                if entry.get("coverage"):
+                    coverage_map[vendor] = list(entry.get("coverage", []))
+                for f in entry.get("findings", []):
+                    findings.append(_finding_from_synth(vendor, f))
+            issue_clusters = _build_issue_clusters(
+                findings, synth_parsed, feature_active=feature_active,
+                gate=gate_label,
+            )
             verdict_str = _derive_overall_verdict(per_vendor_verdicts)
-    else:
+        except (SchemaError, TypeError, ValueError) as exc:
+            synth_ok = False
+            synth_detail = f"invalid synthesized issue structure: {exc}"
+            findings = []
+            issue_clusters = []
+            coverage_map = {}
+            decision = None
+    if (synth_ok and synth_parsed and gate_label == "design-review"
+            and isinstance(synth_parsed.get("decision"), dict)):
+        decision = _normalize_design_review_decision(
+            feature_active=feature_active,
+            decision_payload=synth_parsed["decision"],
+            findings=findings,
+        )
+        verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
+    if not synth_ok or not synth_parsed:
         findings = [
             PanelFinding(
                 severity="invariant_violation",
+                priority="P0",
+                finding_id="harness:synthesizer-failed",
                 vendor="harness",
                 summary=(
                     f"synthesizer_failed: {synth_detail[:300]}. The "
@@ -1118,6 +1269,7 @@ def _synthesize_and_build_verdict(
     kept_findings, dropped = filter_anchor_findings(
         findings, warn=warnings.append,
     )
+    issue_clusters = _trim_issue_clusters(issue_clusters, kept_findings)
     if decision is not None:
         _validate_design_review_targets(kept_findings + [  # keep invariant after audit-only filtering
             PanelFinding(
@@ -1139,7 +1291,8 @@ def _synthesize_and_build_verdict(
     # `severity_reported`. No-op when the PRD has no Assurance section
     # (all-strict default == pre-rigor behavior).
     decision_overridden_by_rigor: dict | None = None
-    rigor_result = _apply_rigor_to_findings(
+    decision_overridden_by_policy: dict | None = None
+    rigor_result, release_threshold = _apply_rigor_to_findings(
         kept_findings, feature_active=feature_active,
     )
     for e in rigor_result.events:
@@ -1155,18 +1308,55 @@ def _synthesize_and_build_verdict(
 
     if synth_ok and synth_parsed and decision is None:
         verdict_str = (
-            "needs_revision" if has_effective_blocking(kept_findings)
+            "needs_revision" if has_effective_blocking(
+                kept_findings, release_threshold,
+            )
             else "pass"
         )
-    elif decision is not None and rigor_result.downgraded:
-        # Decision reconciliation: blocking must stay a deterministic
-        # function of effective severities. If the canonical decision
-        # said retry_design but nothing effectively blocks after the
-        # filter, override to pass (audited). halt_for_human is NEVER
-        # overridden — fail closed toward human attention.
-        if (decision.outcome == "retry_design"
-                and not has_effective_blocking(kept_findings)):
-            decision_overridden_by_rigor = decision.to_dict()
+    elif decision is not None:
+        blocks = has_effective_blocking(kept_findings, release_threshold)
+        # A canonical decision cannot bypass explicit release policy. The
+        # original decision remains in the audit fields. Under the legacy P1
+        # threshold, halt_for_human retains its historical fail-closed rule.
+        policy_override = (
+            not blocks and decision.outcome != "pass"
+            and release_threshold != "P1"
+        )
+        rigor_override = (
+            not blocks and decision.outcome == "retry_design"
+            and rigor_result.downgraded > 0
+        )
+        finding_override = blocks and decision.outcome == "pass"
+        if finding_override:
+            original = decision.to_dict()
+            decision_overridden_by_policy = {
+                **original,
+                "release_threshold": release_threshold,
+                "reason": "blocking findings override pass decision",
+            }
+            decision = ReviewDecision(
+                node=decision.node, outcome="retry_design", blocking=False,
+                severity=decision.severity, summary=decision.summary,
+                prd_targeted=decision.prd_targeted,
+            )
+            verdict_str = _decision_outcome_to_legacy_verdict("retry_design")
+            feature_log.emit(
+                stage="gate", event="release-policy-decision-override",
+                feature=feature_active.parent.name,
+                detail={
+                    "gate": gate_label, "from_outcome": "pass",
+                    "to_outcome": "retry_design",
+                    "release_threshold": release_threshold,
+                },
+            )
+        elif policy_override or rigor_override:
+            original = decision.to_dict()
+            if policy_override:
+                decision_overridden_by_policy = {
+                    **original, "release_threshold": release_threshold,
+                }
+            if rigor_override:
+                decision_overridden_by_rigor = original
             decision = ReviewDecision(
                 node=decision.node, outcome="pass", blocking=False,
                 severity=decision.severity, summary=decision.summary,
@@ -1174,12 +1364,12 @@ def _synthesize_and_build_verdict(
             )
             verdict_str = _decision_outcome_to_legacy_verdict("pass")
             feature_log.emit(
-                stage="gate", event="rigor-filter-decision-override",
+                stage="gate", event="release-policy-decision-override",
                 feature=feature_active.parent.name,
                 detail={
-                    "gate": gate_label,
-                    "from_outcome": "retry_design", "to_outcome": "pass",
-                    "downgraded": rigor_result.downgraded,
+                    "gate": gate_label, "from_outcome": original["outcome"],
+                    "to_outcome": "pass", "downgraded": rigor_result.downgraded,
+                    "release_threshold": release_threshold,
                 },
             )
 
@@ -1198,6 +1388,9 @@ def _synthesize_and_build_verdict(
         coverage_map=coverage_map,
         decision=decision,
         decision_overridden_by_rigor=decision_overridden_by_rigor,
+        issue_clusters=issue_clusters,
+        release_threshold=release_threshold,  # type: ignore[arg-type]
+        decision_overridden_by_policy=decision_overridden_by_policy,
     )
     out_path = feature_active / f"panel-{gate_label}.json"
     return v, out_path, synth_infra_error

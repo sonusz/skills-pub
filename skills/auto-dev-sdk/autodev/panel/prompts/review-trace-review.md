@@ -179,6 +179,10 @@ guarantee that finding-writing is exhaustive across R<N>s.
 Per finding state:
 
 - `severity`: `invariant_violation` / `risk` / `opinion`
+- `priority`: `P0` only when the core release path or an explicitly
+  highest-rigor acceptance event cannot run; otherwise `P1` for important
+  deferrable work or `P2` for polish/optional hardening. Priority is
+  independent from severity.
 - `summary`: one sentence naming the category (MISSING /
   INCOMPLETE / WEAKENED / UNTESTED / UNTESTABLE) and the
   specific defect

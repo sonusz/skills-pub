@@ -12,11 +12,14 @@ from autodev.state.atomic import atomic_write_json
 
 InvariantViolation = "invariant_violation"  # re-exported for convenience
 Severity = Literal["invariant_violation", "risk", "opinion"]
+Priority = Literal["P0", "P1", "P2"]
 Verdict = Literal["pass", "needs_revision", "fail", "skipped"]
 Gate = Literal["design-review", "trace-review", "close-approval"]
 DecisionOutcome = Literal["pass", "retry_design", "halt_for_human"]
 
 _VALID_SEVERITY = {"invariant_violation", "risk", "opinion"}
+_VALID_PRIORITY = {"P0", "P1", "P2"}
+_PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
 _VALID_VERDICT = {"pass", "needs_revision", "fail", "skipped"}
 _VALID_GATE = {"design-review", "trace-review", "close-approval"}
 _VALID_DECISION_SEVERITY = {"invariant_violation", "risk", "opinion"}
@@ -127,6 +130,21 @@ class PanelFinding:
     failure_class: str | None = None            # FailureClass
     missized_direction: str | None = None       # MissizedDirection
     severity_reported: Severity | None = None
+    # Release priority is deliberately independent from severity. Severity
+    # describes the kind of review concern; priority decides whether this
+    # release must stop for it. Missing legacy values use the old severity
+    # behavior (invariant=P0, risk=P1, opinion=P2).
+    priority: Priority | None = None
+    finding_id: str | None = None
+
+    def effective_priority(self) -> Priority:
+        if self.priority in _VALID_PRIORITY:
+            return self.priority
+        return {
+            "invariant_violation": "P0",
+            "risk": "P1",
+            "opinion": "P2",
+        }[self.severity]  # type: ignore[return-value]
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -149,7 +167,34 @@ class PanelFinding:
             self.severity_reported != self.severity
         ):
             d["severity_reported"] = self.severity_reported
+        if self.priority is not None:
+            d["priority"] = self.priority
+        if self.finding_id is not None:
+            d["finding_id"] = self.finding_id
         return d
+
+
+@dataclass
+class IssueCluster:
+    """Synthesizer-proposed semantic grouping of raw reviewer findings.
+
+    Findings remain the source-of-truth audit records. Clusters only provide
+    issue identity for release gating, patch sizing, and cross-round
+    recurrence.
+    """
+
+    cluster_id: str
+    finding_ids: list[str]
+    summary: str
+    priority: Priority
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cluster_id": self.cluster_id,
+            "finding_ids": list(self.finding_ids),
+            "summary": self.summary,
+            "priority": self.priority,
+        }
 
 
 @dataclass
@@ -208,19 +253,67 @@ class PanelVerdict:
     # Rigor filter audit: when the filter downgraded every blocking
     # finding and the harness therefore overrode a canonical
     # `retry_design` decision to `pass`, the original decision dict is
-    # preserved here. `halt_for_human` is never overridden.
+    # preserved here.
     decision_overridden_by_rigor: dict[str, Any] | None = None
+    # Semantic issue groups proposed by the synthesizer and mechanically
+    # validated by the harness. Legacy verdicts may omit them.
+    issue_clusters: list[IssueCluster] = field(default_factory=list)
+    # Minimum urgency that blocks this release. P1 preserves the historical
+    # behavior: invariant violations and risks block; opinions do not.
+    release_threshold: Priority = "P1"
+    decision_overridden_by_policy: dict[str, Any] | None = None
 
     def has_invariant_violation(self) -> bool:
         return any(f.severity == "invariant_violation" for f in self.findings)
+
+    def blocking_findings(self) -> list[PanelFinding]:
+        threshold = _PRIORITY_RANK[self.release_threshold]
+        return [
+            f for f in self.findings
+            if f.severity in {"invariant_violation", "risk"}
+            and _PRIORITY_RANK[f.effective_priority()] <= threshold
+        ]
+
+    def blocking_issue_clusters(self) -> list[IssueCluster]:
+        """Return unique blocking issues, synthesizer-clustered when present.
+
+        A malformed/partial legacy cluster list cannot hide a finding: any
+        unclustered blocker is represented as a conservative singleton.
+        """
+        blocking = self.blocking_findings()
+        by_id = {f.finding_id: f for f in blocking if f.finding_id}
+        seen: set[str] = set()
+        clusters: list[IssueCluster] = []
+        for cluster in self.issue_clusters:
+            members = [by_id[i] for i in cluster.finding_ids if i in by_id]
+            if not members:
+                continue
+            seen.update(f.finding_id for f in members if f.finding_id)
+            clusters.append(cluster)
+        for index, finding in enumerate(blocking):
+            if finding.finding_id and finding.finding_id in seen:
+                continue
+            from autodev.artifacts.fingerprint_history import compute_fingerprint
+            fid = finding.finding_id or f"legacy-{index}"
+            clusters.append(IssueCluster(
+                cluster_id=f"singleton-{compute_fingerprint(finding)}",
+                finding_ids=[fid],
+                summary=finding.summary,
+                priority=finding.effective_priority(),
+            ))
+        return clusters
 
     def effectively_blocks(self) -> bool:
         """True if this verdict should block gate advance."""
         if self.verdict == "skipped":
             return False  # override path — surfaces in status; does not block
-        if self.verdict == "pass" and not self.has_invariant_violation():
-            return False
-        return True
+        if self.blocking_findings():
+            return True
+        # The runner projects an explicitly deferred result to `pass` before
+        # persistence. Any remaining non-pass verdict (especially a canonical
+        # halt_for_human) is malformed or intentionally fail-closed and must
+        # not be waved through merely because its findings are below policy.
+        return self.verdict != "pass"
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -251,6 +344,14 @@ class PanelVerdict:
         if self.decision_overridden_by_rigor is not None:
             d["decision_overridden_by_rigor"] = dict(
                 self.decision_overridden_by_rigor
+            )
+        if self.issue_clusters:
+            d["issue_clusters"] = [c.to_dict() for c in self.issue_clusters]
+        if self.release_threshold != "P1":
+            d["release_threshold"] = self.release_threshold
+        if self.decision_overridden_by_policy is not None:
+            d["decision_overridden_by_policy"] = dict(
+                self.decision_overridden_by_policy
             )
         return d
 
@@ -336,6 +437,37 @@ def _validate(obj: dict) -> None:
             raise SchemaError(
                 f"findings[{i}].severity_reported must be one of {_VALID_SEVERITY}"
             )
+        if "priority" in f and f["priority"] not in _VALID_PRIORITY:
+            raise SchemaError(
+                f"findings[{i}].priority must be one of {_VALID_PRIORITY}"
+            )
+        if "finding_id" in f and (
+            not isinstance(f["finding_id"], str) or not f["finding_id"].strip()
+        ):
+            raise SchemaError(f"findings[{i}].finding_id must be a non-empty string")
+    threshold = obj.get("release_threshold", "P1")
+    if threshold not in _VALID_PRIORITY:
+        raise SchemaError(
+            f"panel-verdict.release_threshold must be one of {_VALID_PRIORITY}"
+        )
+    finding_ids = {
+        f.get("finding_id") for f in obj["findings"] if f.get("finding_id")
+    }
+    if len(finding_ids) != sum(bool(f.get("finding_id")) for f in obj["findings"]):
+        raise SchemaError("panel-verdict finding_id values must be unique")
+    for i, cluster in enumerate(obj.get("issue_clusters", [])):
+        required_cluster = {"cluster_id", "finding_ids", "summary", "priority"}
+        if not isinstance(cluster, dict) or not required_cluster <= set(cluster):
+            raise SchemaError(f"issue_clusters[{i}] missing required fields")
+        if cluster["priority"] not in _VALID_PRIORITY:
+            raise SchemaError(f"issue_clusters[{i}].priority must be one of {_VALID_PRIORITY}")
+        if not isinstance(cluster["finding_ids"], list) or not cluster["finding_ids"]:
+            raise SchemaError(f"issue_clusters[{i}].finding_ids must be a non-empty list")
+        unknown = set(cluster["finding_ids"]) - finding_ids
+        if unknown:
+            raise SchemaError(
+                f"issue_clusters[{i}] references unknown finding ids {sorted(unknown)!r}"
+            )
     if "decision" in obj:
         if not isinstance(obj["decision"], dict):
             raise SchemaError("decision must be an object")
@@ -367,6 +499,8 @@ def load_verdict(path: Path) -> PanelVerdict:
                 failure_class=f.get("failure_class"),
                 missized_direction=f.get("missized_direction"),
                 severity_reported=f.get("severity_reported"),
+                priority=f.get("priority"),
+                finding_id=f.get("finding_id"),
             )
             for f in raw["findings"]
         ],
@@ -389,6 +523,17 @@ def load_verdict(path: Path) -> PanelVerdict:
         ],
         coverage_map=raw.get("coverage_map", {}),
         decision_overridden_by_rigor=raw.get("decision_overridden_by_rigor"),
+        issue_clusters=[
+            IssueCluster(
+                cluster_id=c["cluster_id"],
+                finding_ids=[str(x) for x in c["finding_ids"]],
+                summary=c["summary"],
+                priority=c["priority"],
+            )
+            for c in raw.get("issue_clusters", [])
+        ],
+        release_threshold=raw.get("release_threshold", "P1"),
+        decision_overridden_by_policy=raw.get("decision_overridden_by_policy"),
         decision=(
             ReviewDecision(
                 node=raw["decision"]["node"],

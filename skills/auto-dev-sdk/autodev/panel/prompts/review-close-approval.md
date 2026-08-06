@@ -138,7 +138,9 @@ First include a compact coverage table:
 
 `PRD ID | status | evidence | notes`
 
-Then list findings. Per finding include `severity`, `summary`,
+Then list findings. Per finding include `severity`, `priority` (`P0` only when
+the core release path or an explicitly highest-rigor acceptance event cannot
+run; otherwise `P1` for important deferrable work or `P2` for polish), `summary`,
 `targets`, and an `Evidence:` line:
 
 - `Evidence: spec:<section> "short quote"`

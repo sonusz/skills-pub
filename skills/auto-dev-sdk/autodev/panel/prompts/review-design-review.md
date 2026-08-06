@@ -151,6 +151,18 @@ trace-review panel's job; do not audit them here.
 - `opinion` — style, phrasing, or preference; informational,
   never blocks.
 
+## Release priority (independent from severity)
+
+- `P0` — blocks the core release path: data loss/security, a required mainline
+  cannot run, or the release's explicitly highest-rigor acceptance event would
+  fail.
+- `P1` — important correctness or maintainability work that can be deferred
+  without breaking that core release path.
+- `P2` — polish, optional hardening, or low-cost follow-up.
+
+Assign exactly one priority to every finding. Do not promote an issue merely
+because several reviewers might notice it.
+
 ## Rigor calibration (PRD `## Assurance` map)
 
 The PRD may carry an `## Assurance` section assigning each `R<n>` a
@@ -284,6 +296,7 @@ guarantee that finding-writing is exhaustive across R<n>s.
 Per finding state:
 
 - `severity`: `invariant_violation` / `risk` / `opinion`
+- `priority`: `P0` / `P1` / `P2`
 - `summary`: one sentence naming the category (MISSING /
   INVENTED / AMBIGUOUS / UNDELIVERED / MISSIZED / UNTESTABLE /
   UNDERSPECIFIED-CONTRACT) and the specific defect

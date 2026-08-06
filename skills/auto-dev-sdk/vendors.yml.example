@@ -94,9 +94,9 @@ panel:
       model: gpt-5.6-terra
       effort: high
   synthesizer:
-    vendor: claude
-    model: claude-sonnet-5
-    effort: high
+    vendor: codex
+    model: gpt-5.6-sol
+    effort: max
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
 

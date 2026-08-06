@@ -35,6 +35,8 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Runs `design-review` over the unified design packet and `close-approval` over `implemented-spec.md` + PRD + judgment-free PRD checklist.
 - Uses configured `claude` + `grok` + `agy` + `codex`/`openai` panel reviewers
   for review diversity.
+- Preserves each reviewer finding, clusters semantically equivalent findings
+  into one ticket, and enforces the PRD's `Release threshold: P0|P1|P2`.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
 - Writes bridge artifacts: `design-packet.json`, `accepted-design.json`, `implementation-index.json`, `prd-checklist.json`.
 - Blocks on missing/stale artifacts, failed gates, dirty workspace without `acknowledge-dirty`, or locks.
