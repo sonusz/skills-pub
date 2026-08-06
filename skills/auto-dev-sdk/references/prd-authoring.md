@@ -49,7 +49,8 @@ PRD MUST have:
 
 Plus optional `## Amendment <date>` blocks appended via
 `autodev update <feature> --amendment "..."` after a feature is
-underway.
+underway. An amendment may introduce a new, uniquely numbered
+`### R<n>: <Title>` requirement without rewriting the original section.
 
 Every requirement is a `### R<n>: <Title>` block followed by 1-3
 short paragraphs and optional bullets. Number sequentially without

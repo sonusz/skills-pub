@@ -208,6 +208,36 @@ def test_prd_intake_rejects_malformed_assurance():
     assert any("R9" in e for e in res.errors)
 
 
+def test_prd_intake_accepts_new_requirement_in_dated_amendment():
+    text = PRD_BASE + """
+
+## Amendment 2026-08-06
+
+### R4: Dated release rehearsal
+
+Run the live dev rehearsal.
+
+Assurance: R4 -> strict
+"""
+    res = validate_prd_text(text)
+    assert res.ok, res.errors
+    assert res.requirement_markers == ["R1", "R2", "R3", "R4"]
+
+
+def test_prd_intake_ignores_fenced_requirement_example_in_amendment():
+    text = PRD_BASE + """
+
+## Amendment 2026-08-06
+
+```markdown
+### R4: Example only
+```
+"""
+    res = validate_prd_text(text)
+    assert res.ok, res.errors
+    assert res.requirement_markers == ["R1", "R2", "R3"]
+
+
 def test_assurance_map_default_ctor_is_strict():
     m = AssuranceMap()
     assert m.level_for("R1") == "strict"

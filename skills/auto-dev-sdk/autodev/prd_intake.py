@@ -91,6 +91,45 @@ def _requirements_body(text: str, sections: list[tuple[int, str]]) -> str:
     return "\n".join(lines[req_idx + 1:next_h2])
 
 
+def _requirement_declaration_bodies(
+    text: str, sections: list[tuple[int, str]],
+) -> list[str]:
+    """Bodies allowed to introduce addressable requirements.
+
+    The original Requirements section and append-only, date-stamped Amendment
+    sections are authoritative. This makes ``autodev update --amendment`` able
+    to add a requirement without rewriting the PRD, while unrelated headings
+    and fenced examples remain non-authoritative.
+    """
+    lines = text.splitlines()
+    bodies: list[str] = []
+    for position, (start, name) in enumerate(sections):
+        if name != "requirements" and not re.fullmatch(
+            r"amendment(?:\s+\d{4}-\d{2}-\d{2})?", name,
+        ):
+            continue
+        end = sections[position + 1][0] if position + 1 < len(sections) else len(lines)
+        bodies.append("\n".join(lines[start + 1:end]))
+    return bodies
+
+
+def _unfenced_lines(body: str):
+    fence: str | None = None
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        marker = "```" if stripped.startswith("```") else (
+            "~~~" if stripped.startswith("~~~") else None
+        )
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+            continue
+        if fence is None:
+            yield line
+
+
 def validate_prd_text(text: str) -> PrdIntakeResult:
     """Run the Stage 0 mechanical checks against PRD markdown text."""
     errors: list[str] = []
@@ -110,23 +149,24 @@ def validate_prd_text(text: str) -> PrdIntakeResult:
             f"{list(REQUIRED_SECTIONS)!r}"
         )
 
-    # Requirement markers (only if Requirements section present).
+    # Requirement markers in the original section plus append-only
+    # amendments (only if Requirements section is present).
     if "requirements" in sections_found:
-        body = _requirements_body(text, h2s)
         seen_n: set[int] = set()
-        for line in body.splitlines():
-            m = _R_MARKER_RE.match(line)
-            if not m:
-                continue
-            n = int(m.group(1))
-            marker = f"R{n}"
-            if n in seen_n:
-                errors.append(
-                    f"duplicate requirement marker {marker!r} in "
-                    f"Requirements section"
-                )
-            seen_n.add(n)
-            markers_found.append(marker)
+        for body in _requirement_declaration_bodies(text, h2s):
+            for line in _unfenced_lines(body):
+                m = _R_MARKER_RE.match(line)
+                if not m:
+                    continue
+                n = int(m.group(1))
+                marker = f"R{n}"
+                if n in seen_n:
+                    errors.append(
+                        f"duplicate requirement marker {marker!r} across "
+                        "Requirements and Amendment sections"
+                    )
+                seen_n.add(n)
+                markers_found.append(marker)
         if not markers_found:
             errors.append(
                 "Requirements section contains no `### R<N>:` markers"
