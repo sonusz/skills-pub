@@ -79,6 +79,7 @@ def _infer_cursor_underlying_vendor(model: str) -> str:
 DEFAULT_TIMEOUT_SEC = 1800
 DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC = 600
 DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC = 300
+DEFAULT_PANEL_MIN_RESPONDING_REVIEWERS = 2
 DEFAULT_PROBE_TIMEOUT_SEC = 60
 
 EFFORT_ORDER = ("min", "low", "medium", "high", "xhigh", "max")
@@ -206,6 +207,10 @@ class PanelConfig:
     # generous multiple in panel/runner.
     reviewer_probe_interval_sec: int = DEFAULT_PANEL_REVIEWER_TIMEOUT_SEC
     synthesizer_probe_interval_sec: int = DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
+    # Transport quorum. Review content still passes through the synthesizer;
+    # this only controls how many independent responses are required when a
+    # retried reviewer is confirmed quota-exhausted.
+    min_responding_reviewers: int = DEFAULT_PANEL_MIN_RESPONDING_REVIEWERS
 
 
 @dataclass(frozen=True)
@@ -478,6 +483,19 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
             _deprecation_warn(path, f"panel.{old}", f"panel.{new}")
             del raw[old]
 
+    min_responding = _int_field(
+        "min_responding_reviewers", DEFAULT_PANEL_MIN_RESPONDING_REVIEWERS,
+    )
+    if isinstance(min_responding, bool) or min_responding < 2:
+        raise ConfigError(
+            f"{path}: panel.min_responding_reviewers must be an int >= 2"
+        )
+    if min_responding > len(reviewers):
+        raise ConfigError(
+            f"{path}: panel.min_responding_reviewers={min_responding} exceeds "
+            f"configured reviewer count {len(reviewers)}"
+        )
+
     return PanelConfig(
         reviewers=reviewers,
         synthesizer=synthesizer,
@@ -487,6 +505,7 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
         synthesizer_probe_interval_sec=_int_field(
             "synthesizer_probe_interval_sec", DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
         ),
+        min_responding_reviewers=min_responding,
     )
 
 

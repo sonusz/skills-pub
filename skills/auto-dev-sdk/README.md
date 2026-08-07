@@ -47,6 +47,9 @@ stages:
     effort: high
 
 panel:
+  # Default transport quorum. An omitted reviewer must first fail a retry and
+  # then have quota exhaustion positively confirmed.
+  min_responding_reviewers: 2
   reviewers:
     - vendor: claude
       model: opus
@@ -104,6 +107,12 @@ Notes:
   schema, which works on `claude`, `grok`, and `codex`/`openai`. `agy` is not
   supported as a synthesizer because its CLI has no native schema
   enforcement.
+- Panel transport defaults to two responding reviewers. A failed reviewer is
+  retried once immediately. The harness then force-refreshes that vendor's
+  quota and permits omission only when exhaustion is positively confirmed;
+  unknown quota and ordinary transport failures still block. If confirmed
+  quota leaves fewer than `min_responding_reviewers`, the normal quota-pause
+  path is used instead of synthesizing an undersized panel.
 - `probe` configures the read-only idle-timeout LLM probe. It is not a
   product reviewer; it only decides whether a quiet subprocess looks
   wedged or should get more time, and it also routes through
@@ -130,6 +139,22 @@ The `spec` producer, panel synthesizer, and idle probe remain stateless because
 they do not participate in iterative producer/reviewer revision. Session
 mappings are maintained by canonical `shared/vendors` in the user's state
 directory, outside the target repo, so they do not dirty feature worktrees.
+
+## Design revision navigation
+
+Every archived design package has a local, package-only Git ref at
+`refs/autodev/design/<feature>/package-NNN`. The commits contain only the
+archived design artifacts and changelog; they do not stage the user's index,
+capture unrelated worktree changes, move the checked-out branch, or push
+anything. Revision reviewers receive the previous/current refs and bounded
+`git diff` commands so they can inspect changes before selectively re-reading
+the authoritative current files.
+
+The current feature's harness-owned `docs/features/<feature>/active/**` files
+are excluded from the preflight dirty-worktree decision. Changes elsewhere in
+the repository still require `acknowledge-dirty`, and writes outside the
+allowed stage scope—including another feature's active directory—remain
+containment failures.
 
 ## Verify
 

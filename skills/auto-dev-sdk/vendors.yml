@@ -61,6 +61,10 @@ stages:
     effort: medium
 
 panel:
+  # A panel may synthesize after two independent reviewers respond when every
+  # omitted reviewer has failed a real retry and quota is then confirmed
+  # exhausted. Non-quota transport failures still block.
+  min_responding_reviewers: 2
   # Independent design/close-gate reviewers. Each sees the primary artifact and
   # consulted docs, then returns findings; they should not generate new design.
   # Context: medium-large, bounded to attached context files. Effort: high.

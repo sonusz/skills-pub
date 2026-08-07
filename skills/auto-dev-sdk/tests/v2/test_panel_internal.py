@@ -13,11 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from autodev.artifacts.verdict import IssueCluster, PanelFinding, PanelVerdict, load_verdict
+from autodev.artifacts.verdict import (
+    IssueCluster, PanelFinding, PanelVerdict, load_verdict,
+    panel_verdict_transport_incomplete,
+)
+from autodev.artifacts.design_package_history import archive_design_package
 from autodev.artifacts.fingerprint_history import record_verdict
 from autodev.panel.runner import (
     FAKE_INVOKER_ENV, _compose_reviewer_prompt, _compose_synthesizer_prompt,
-    _build_issue_clusters, _invoke_reviewer, _invoke_synthesizer,
+    _build_issue_clusters, _invoke_reviewer, _invoke_reviewer_with_retry,
+    _invoke_synthesizer,
     _synthesize_and_build_verdict,
     _read_only_native_args, run_panel_gate_internal,
 )
@@ -25,8 +30,9 @@ from autodev.panel.schemas import synthesizer_output_schema
 from autodev.vendors.config import (
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
-from autodev.errors import GatePending, SchemaError
+from autodev.errors import GatePending, QuotaHalt, SchemaError
 from autodev.vendors.shared_call import cli_name_for_vendor, normalize_shared_vendor
+from autodev.vendors.quota.base import QuotaResult, now_utc
 
 FAKE_SCRIPT = Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"
 
@@ -38,6 +44,14 @@ def fake_invoker(monkeypatch):
     # v3-core R5: these tests stub synthetic single-artifact fixtures
     # and target the runner's dispatch path, not the pre-check.
     monkeypatch.setenv("AUTODEV_PANEL_SKIP_PRECHECK", "1")
+    # Reviewer-failure tests must not depend on the developer machine's live
+    # vendor quota. Individual quota tests replace this with a numeric result.
+    monkeypatch.setattr(
+        "autodev.panel.runner.get_quota_remaining",
+        lambda vendor, model=None, force=False: QuotaResult.unknown(
+            vendor, "test quota intentionally unknown",
+        ),
+    )
     yield
 
 
@@ -59,6 +73,37 @@ def _make_artifact(feature_active: Path) -> Path:
     p = feature_active / "prd.md"
     p.write_text("# demo PRD\n\nR1: do a thing.\n")
     return p
+
+
+def test_revision_reviewer_prompt_exposes_package_git_diff(feature_active):
+    for name, content in {
+        "design.md": "# Design\nold\n",
+        "scope.json": "{}\n",
+        "trace.md": "# Trace\n",
+        "test-plan.md": "# Tests\n",
+        "design-changelog.json": '{"kind":"design-changelog"}\n',
+    }.items():
+        (feature_active / name).write_text(content)
+    archive_design_package(feature_active)
+    (feature_active / "design.md").write_text("# Design\nnew\n")
+    archive_design_package(feature_active)
+    repo_root = feature_active.parents[3]
+
+    prompt = _compose_reviewer_prompt(
+        gate="design-review",
+        artifact_path=feature_active / "design.md",
+        consulted_docs=[],
+        feature_active=feature_active,
+        repo_root=repo_root,
+        continuation=True,
+    )
+
+    assert "CURRENT_DESIGN_REF: `refs/autodev/design/demo/package-002`" in prompt
+    assert "PREVIOUS_DESIGN_REF: `refs/autodev/design/demo/package-001`" in prompt
+    assert "DIFF_COMMAND:" in prompt
+    assert "design.md" in prompt
+    assert "scope.json" in prompt
+    assert "Read the revision diff first" in prompt
 
 
 def test_schema_is_per_reviewer_extraction():
@@ -475,6 +520,38 @@ def test_reviewer_timeout(fake_invoker, monkeypatch):
     assert "timeout" in r.failure_detail.lower()
 
 
+def test_quota_preflight_failure_is_rechecked_before_skip(monkeypatch):
+    forced: list[bool] = []
+
+    def quota_halt(*args, force_quota=False, **kwargs):
+        forced.append(force_quota)
+        raise QuotaHalt(
+            role="reviewer:agy",
+            diagnostics=[{
+                "vendor": "agy",
+                "model": "fake",
+                "min_quota_pct": 10.0,
+                "remaining_pct": 0.0,
+                "resets_at": None,
+                "error": None,
+            }],
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", quota_halt)
+    result = _invoke_reviewer_with_retry(
+        PanelReviewerSpec(
+            vendor="agy", model="fake", min_quota_pct=10.0,
+        ),
+        "prompt",
+        10,
+    )
+
+    assert forced == [False, True]
+    assert result.quota_skipped
+    assert result.attempt_count == 2
+    assert len(result.failure_history) == 2
+
+
 def test_synthesizer_pass(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "synth_pass")
     spec = PanelSynthesizerSpec(vendor="claude", model="fake")
@@ -545,9 +622,7 @@ def test_end_to_end_inv_violation_fails(fake_invoker, monkeypatch, feature_activ
 def test_incomplete_panel_one_missing_halts_and_caches_successes(
     fake_invoker, monkeypatch, feature_active, panel_config,
 ):
-    """Any missing reviewer is panel transport failure, not a content
-    verdict. Successful reviewers are cached so restart retries only the
-    missing reviewer."""
+    """Two responses do not excuse a non-quota reviewer failure."""
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
     artifact = _make_artifact(feature_active)
     # The design-review gate runs the design-review and trace-review groups
@@ -570,6 +645,100 @@ def test_incomplete_panel_one_missing_halts_and_caches_successes(
     )
     assert set(cache["reviewers"]) == {"claude", "codex"}
     assert "agy" in cache["failures"]
+    assert cache["failures"]["agy"]["attempt_count"] == 2
+    assert len(cache["failures"]["agy"]["failure_history"]) == 2
+    assert cache["quota_skipped"] == {}
+
+
+def test_panel_quorum_skips_only_retried_quota_exhausted_reviewer(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
+    quota_calls: list[tuple[str, str | None, bool]] = []
+
+    def exhausted(vendor, model=None, *, force=False):
+        quota_calls.append((vendor, model, force))
+        return QuotaResult(
+            vendor=vendor,
+            remaining_pct=0.0,
+            resets_at=None,
+            fetched_at=now_utc(),
+            detail="test quota exhausted",
+        )
+
+    monkeypatch.setattr("autodev.panel.runner.get_quota_remaining", exhausted)
+    artifact = _make_artifact(feature_active)
+    verdict = run_panel_gate_internal(
+        gate="design-review",
+        feature_active=feature_active,
+        primary_artifact=artifact,
+        prompt_file_for_audit=artifact,
+        consulted_docs=[],
+        panel_config=panel_config,
+    )
+
+    assert quota_calls == [
+        ("agy", "fake-agy", True),
+        ("agy", "fake-agy", True),
+    ]
+    assert verdict.per_vendor_raw["agy"].startswith(
+        "[SKIPPED: quota confirmed after 2 dispatch attempt(s)"
+    )
+    assert not panel_verdict_transport_incomplete(verdict)
+    cache = json.loads(
+        (feature_active / "panel-design-review.reviewers.json").read_text()
+    )
+    assert cache["quota_skipped"]["agy"]["attempt_count"] == 2
+    assert len(cache["quota_skipped"]["agy"]["failure_history"]) == 2
+    confirmation = cache["quota_skipped"]["agy"]["quota_confirmation"]
+    assert confirmation["confirmed"]
+    assert confirmation["min_quota_pct"] > 0.0
+
+
+def test_quota_shortfall_halts_then_retries_skipped_vendor_after_recovery(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
+    monkeypatch.setattr(
+        "autodev.panel.runner.get_quota_remaining",
+        lambda vendor, model=None, force=False: QuotaResult(
+            vendor=vendor,
+            remaining_pct=0.0,
+            resets_at=None,
+            fetched_at=now_utc(),
+        ),
+    )
+    strict_quorum = PanelConfig(
+        reviewers=panel_config.reviewers,
+        synthesizer=panel_config.synthesizer,
+        reviewer_probe_interval_sec=panel_config.reviewer_probe_interval_sec,
+        synthesizer_probe_interval_sec=panel_config.synthesizer_probe_interval_sec,
+        min_responding_reviewers=3,
+    )
+    artifact = _make_artifact(feature_active)
+    with pytest.raises(QuotaHalt, match="panel-reviewers"):
+        run_panel_gate_internal(
+            gate="close-approval",
+            feature_active=feature_active,
+            primary_artifact=artifact,
+            prompt_file_for_audit=artifact,
+            consulted_docs=[],
+            panel_config=strict_quorum,
+        )
+
+    # A later run represents quota-resume recovery. Cached successful reviews
+    # remain reusable, but the formerly quota-skipped reviewer must run again.
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
+    verdict = run_panel_gate_internal(
+        gate="close-approval",
+        feature_active=feature_active,
+        primary_artifact=artifact,
+        prompt_file_for_audit=artifact,
+        consulted_docs=[],
+        panel_config=strict_quorum,
+    )
+    assert verdict.verdict == "pass"
+    assert not verdict.per_vendor_raw["agy"].startswith("[SKIPPED:")
 
 
 def test_incomplete_panel_restart_retries_missing_reviewer_only(

@@ -35,6 +35,9 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Runs `design-review` over the unified design packet and `close-approval` over `implemented-spec.md` + PRD + judgment-free PRD checklist.
 - Uses configured `claude` + `grok` + `agy` + `codex`/`openai` panel reviewers
   for review diversity.
+- Requires two responding panel reviewers by default. A failed reviewer is
+  retried once and may be omitted only after a forced quota refresh positively
+  confirms exhaustion; unknown and non-quota failures still block.
 - Preserves each reviewer finding, clusters semantically equivalent findings
   into one ticket, and enforces the PRD's `Release threshold: P0|P1|P2`.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
@@ -103,6 +106,13 @@ first fallback with enough quota. The harness owns all of this — I do **not** 
 Quota lookup is implemented for Claude, Codex/OpenAI, Cursor, Agy, and Grok.
 Agy uses its prompt-free loopback quota server and Grok uses ACP billing; neither
 lookup spends model quota. Unreadable quota fails closed.
+
+For panel transport, the default response quorum is
+`panel.min_responding_reviewers: 2`. Each failed reviewer gets one immediate
+retry, then a forced quota refresh. The synthesizer may proceed without that
+reviewer only when the refresh positively confirms exhaustion. If fewer than
+the configured quorum respond, the harness quota-pauses; if quota is unknown or
+the failure is non-quota, the panel stays pending.
 
 When **every** candidate for a role is below its minimum, `autodev run`/`next`:
 - exits **2 (GATE_PENDING)**,

@@ -46,6 +46,7 @@ def test_parses_all_roles():
     assert c.panel.reviewers[0].min_quota_pct == 25.0
     assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["cursor"]
     assert c.panel.synthesizer.min_quota_pct == 30.0
+    assert c.panel.min_responding_reviewers == 2
     assert [f.vendor for f in c.panel.synthesizer.fallbacks] == ["codex"]
     assert c.probe.min_quota_pct == 5.0
     assert [f.vendor for f in c.probe.fallbacks] == ["codex"]
@@ -69,6 +70,19 @@ def test_backward_compatible_without_quota_fields():
     )
     assert c.stages["design"].min_quota_pct is None
     assert c.stages["design"].fallbacks == ()
+    assert c.panel.min_responding_reviewers == 2
+
+
+@pytest.mark.parametrize("value", [0, 1, 3, True])
+def test_rejects_invalid_panel_response_quorum(value):
+    with pytest.raises(ConfigError, match="min_responding_reviewers"):
+        _load(
+            _GOOD.replace(
+                "panel:\n",
+                f"panel:\n  min_responding_reviewers: {str(value).lower()}\n",
+                1,
+            )
+        )
 
 
 _BASE = (

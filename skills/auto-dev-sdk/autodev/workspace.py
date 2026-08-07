@@ -2,21 +2,26 @@
 
 Best-effort: wraps `git status --porcelain`. Not a security boundary.
 
-Harness-internal paths (`.lock/`, `.pause`, `.running.pid`,
+Harness-owned feature workspaces (`docs/features/<feature>/active/`) and
+internal paths (`.lock/`, `.pause`, `.running.pid`,
 `.running-pids.json`, `.route-feedback.json`, `*.stdout.log`,
 `*.stderr.log`, `*.tmp` mid-rename, `*-failure.json`, `log.jsonl`,
 `overrides.json`, `panel-*.json`) are excluded from the dirty check —
-they're orchestration state, not user code. `is_dirty` reflects only
-user-visible modifications.
+they're pipeline state, not user code. The raw porcelain snapshot is retained,
+so post-stage containment checks still catch an agent writing into a different
+feature workspace. `is_dirty` reflects only user-visible modifications.
 """
 from __future__ import annotations
 
 import fnmatch
+import os
+import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from autodev.errors import PreflightError
+from autodev.state.hashing import hash_file
 
 # Harness-internal filename patterns — NOT considered "dirty" for the
 # pipeline-blocking check. Per-feature state + subprocess byproducts.
@@ -39,23 +44,83 @@ _HARNESS_IGNORE_PATTERNS = (
 )
 
 
-def _parse_porcelain_path(line: str) -> str:
+def _unquote_porcelain_path(value: str) -> str:
+    return value.strip().strip('"')
+
+
+def _parse_porcelain_paths(line: str) -> tuple[str, ...]:
+    """Return every path represented by a porcelain-v1 status entry."""
     if len(line) < 4:
-        return ""
-    path = line[3:].strip().strip('"')
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
-    return path
+        return ()
+    payload = line[3:].strip()
+    if " -> " in payload:
+        source, destination = payload.split(" -> ", 1)
+        return (
+            _unquote_porcelain_path(source),
+            _unquote_porcelain_path(destination),
+        )
+    path = _unquote_porcelain_path(payload)
+    return (path,) if path else ()
 
 
 def _line_is_harness_internal(porcelain_line: str) -> bool:
-    path = _parse_porcelain_path(porcelain_line)
-    if not path:
+    paths = _parse_porcelain_paths(porcelain_line)
+    if not paths:
         return False
-    for pat in _HARNESS_IGNORE_PATTERNS:
-        if fnmatch.fnmatchcase(path, pat):
-            return True
-    return False
+    return all(
+        any(fnmatch.fnmatchcase(path, pat) for pat in _HARNESS_IGNORE_PATTERNS)
+        for path in paths
+    )
+
+
+def _line_is_active_feature_workspace(porcelain_line: str) -> bool:
+    """True for a path owned by an active auto-dev feature workspace.
+
+    Keep this separate from ``_line_is_harness_internal``: active feature
+    artifacts should not block preflight, but a stage writing into another
+    feature's workspace must still be visible to out-of-scope-write detection.
+    ``git status --untracked-files=all`` ensures an untracked active directory
+    is reported as individual paths rather than a collapsed parent directory.
+    """
+    paths = _parse_porcelain_paths(porcelain_line)
+    if not paths:
+        return False
+    return all(
+        len(parts) >= 4
+        and parts[:2] == ["docs", "features"]
+        and parts[3] == "active"
+        for parts in (Path(path).as_posix().split("/") for path in paths)
+    )
+
+
+def _path_fingerprint(repo_root: Path, relative_path: str) -> str:
+    """Fingerprint a dirty path without following symlinks."""
+    path = Path(repo_root) / relative_path
+    try:
+        info = path.lstat()
+    except OSError:
+        return "missing"
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            return f"symlink:{os.readlink(path)}"
+        except OSError:
+            return "symlink:unreadable"
+    if stat.S_ISREG(info.st_mode):
+        try:
+            return hash_file(path)
+        except OSError:
+            return "file:unreadable"
+    return f"mode:{info.st_mode}:size:{info.st_size}:mtime_ns:{info.st_mtime_ns}"
+
+
+def _snapshot_fingerprints(repo_root: Path, raw: str) -> dict[str, str]:
+    paths = {
+        path
+        for line in raw.splitlines()
+        if line.strip()
+        for path in _parse_porcelain_paths(line)
+    }
+    return {path: _path_fingerprint(repo_root, path) for path in paths}
 
 
 @dataclass
@@ -68,12 +133,18 @@ class WorkspaceState:
     is_git: bool
     is_dirty: bool
     raw: str
+    path_fingerprints: dict[str, str] = field(default_factory=dict)
 
     def lines(self) -> list[str]:
         return [l for l in self.raw.splitlines() if l.strip()]
 
     def user_visible_lines(self) -> list[str]:
-        return [l for l in self.lines() if not _line_is_harness_internal(l)]
+        return [
+            line
+            for line in self.lines()
+            if not _line_is_harness_internal(line)
+            and not _line_is_active_feature_workspace(line)
+        ]
 
 
 def _run_git(args: list[str], cwd: Path) -> tuple[int, str]:
@@ -108,19 +179,34 @@ def snapshot(cwd: Path) -> WorkspaceState:
     """Take a `git status --porcelain` snapshot. is_dirty filters harness-internal."""
     if not is_git_repo(cwd):
         return WorkspaceState(is_git=False, is_dirty=False, raw="")
-    rc, out = _run_git(["status", "--porcelain"], cwd)
+    rc, out = _run_git(
+        ["status", "--porcelain", "--untracked-files=all"], cwd,
+    )
     if rc != 0:
         raise PreflightError(f"git status failed (rc={rc})")
-    state = WorkspaceState(is_git=True, is_dirty=False, raw=out)
+    state = WorkspaceState(
+        is_git=True,
+        is_dirty=False,
+        raw=out,
+        path_fingerprints=_snapshot_fingerprints(Path(cwd), out),
+    )
     state.is_dirty = bool(state.user_visible_lines())
     return state
 
 
 def diff_snapshots(before: WorkspaceState, after: WorkspaceState) -> list[str]:
-    """Files touched between two porcelain snapshots (set diff by status+path)."""
+    """Status entries added/removed or whose represented file bytes changed."""
     before_keys = set(before.lines())
     after_keys = set(after.lines())
-    return sorted(after_keys - before_keys)
+    changed = before_keys.symmetric_difference(after_keys)
+    for entry in before_keys.intersection(after_keys):
+        if any(
+            before.path_fingerprints.get(path)
+            != after.path_fingerprints.get(path)
+            for path in _parse_porcelain_paths(entry)
+        ):
+            changed.add(entry)
+    return sorted(changed)
 
 
 def detect_out_of_scope_writes(
@@ -141,11 +227,16 @@ def detect_out_of_scope_writes(
     for entry in new_entries:
         if _line_is_harness_internal(entry):
             continue
-        path_str = _parse_porcelain_path(entry)
-        if not path_str:
+        path_strs = _parse_porcelain_paths(entry)
+        if not path_strs:
             continue
-        resolved = (Path(repo_root) / path_str).resolve()
-        if not any(_is_under(resolved, a) for a in allowed_resolved):
+        if any(
+            not any(
+                _is_under((Path(repo_root) / path_str).resolve(), allowed)
+                for allowed in allowed_resolved
+            )
+            for path_str in path_strs
+        ):
             escapes.append(entry)
     return escapes
 

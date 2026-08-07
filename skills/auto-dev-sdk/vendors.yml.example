@@ -80,6 +80,9 @@ stages:
     effort: high
 
 panel:
+  # Minimum independent responses after retried, quota-confirmed reviewer
+  # failures are omitted. Non-quota failures never count as skippable.
+  min_responding_reviewers: 2
   reviewers:
     - vendor: claude
       model: claude-sonnet-5

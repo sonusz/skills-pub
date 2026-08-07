@@ -420,7 +420,9 @@ def test_handle_verdict_design_review_scope_and_spec_still_halt(active):
 
 # ---------- Design package snapshots ----------
 
-def test_design_package_history_archives_distinct_package_versions(active):
+def test_design_package_history_archives_distinct_package_versions(git_repo):
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
     _seed_prd_and_scope(active)
     (active / "design-changelog.json").write_text(
         json.dumps({
@@ -470,4 +472,38 @@ def test_design_package_history_archives_distinct_package_versions(active):
         "test-plan.md",
         "design-changelog.json",
     }
+    first_manifest = json.loads((first / "manifest.json").read_text())
+    first_git = first_manifest["git_snapshot"]
+    second_git = manifest["git_snapshot"]
+    assert first_git["ref"] == "refs/autodev/design/demo/package-001"
+    assert second_git["ref"] == "refs/autodev/design/demo/package-002"
+    assert second_git["parent_ref"] == first_git["ref"]
+    assert second_git["parent_commit"] == first_git["commit"]
+    assert subprocess.run(
+        ["git", "rev-parse", "--verify", f"{second_git['ref']}^{{commit}}"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == second_git["commit"]
+    design_path = active.relative_to(git_repo) / "design.md"
+    revision_diff = subprocess.run(
+        [
+            "git", "diff", "--no-ext-diff", first_git["ref"],
+            second_git["ref"], "--", design_path.as_posix(),
+        ],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "+new package version" in revision_diff
+    # Package refs use a throwaway index and never stage the user's worktree.
+    assert subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
     assert not (active / "design-rework-memory.json").exists()
