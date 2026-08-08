@@ -17,7 +17,12 @@ from autodev.panel.runner import _compose_reviewer_prompt, _invoke_reviewer
 from autodev.vendors.config import PanelReviewerSpec, StageSpec
 from autodev.vendors.shared_call import SharedVendorResult
 from autodev.vendors import subprocess_runner
-from autodev.vendors.session_keys import feature_session_key, reviewer_session_key
+from autodev.vendors.session_keys import (
+    DEFAULT_SESSION_MAX_TURNS,
+    DESIGN_SESSION_MAX_TURNS,
+    feature_session_key,
+    reviewer_session_key,
+)
 from autodev.vendors.subprocess_runner import run_stage_subprocess
 
 
@@ -231,6 +236,57 @@ def test_shared_vendor_reuses_native_session_and_delta_prompt(
     assert resume_flag in mine[1]["args"]
 
 
+def test_shared_vendor_rotates_session_after_successful_turn_limit(
+    tmp_path: Path,
+    fake_vendor_env: tuple[dict[str, str], Path],
+) -> None:
+    env, capture = fake_vendor_env
+    modes: list[str] = []
+    turns: list[str] = []
+    auto_resets: list[str] = []
+
+    for run_no in range(1, 8):
+        output_dir = tmp_path / f"rotation-{run_no}"
+        proc = subprocess.run(
+            [
+                "/bin/bash", str(SHARED_CALL),
+                "--vendor", "claude",
+                "--id", "claude",
+                "--session-key", "rotation-key",
+                "--session-max-turns", "3",
+                "--prompt", "INITIAL",
+                "--resume-prompt", "DELTA",
+                "--output-dir", str(output_dir),
+                "--timeout", "30",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=45,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        status = {}
+        for line in (output_dir / "claude" / "status").read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                status[key] = value
+        modes.append(status["session_mode"])
+        turns.append(status["session_turn"])
+        auto_resets.append(status["session_auto_reset"])
+
+    assert modes == ["new", "resume", "resume", "new", "resume", "resume", "new"]
+    assert turns == ["1", "2", "3", "1", "2", "3", "1"]
+    assert auto_resets == ["false", "false", "false", "true", "false", "false", "true"]
+    events = [json.loads(line) for line in capture.read_text().splitlines()]
+    session_ids = [event["session_id"] for event in events]
+    assert session_ids[0] == session_ids[1] == session_ids[2]
+    assert session_ids[3] == session_ids[4] == session_ids[5]
+    assert len({session_ids[0], session_ids[3], session_ids[6]}) == 3
+    assert [event["prompt"].strip() for event in events] == [
+        "INITIAL", "DELTA", "DELTA", "INITIAL", "DELTA", "DELTA", "INITIAL",
+    ]
+
+
 def test_codex_native_arguments_remain_in_exec_scope_on_resume(
     tmp_path: Path,
     fake_vendor_env: tuple[dict[str, str], Path],
@@ -393,6 +449,147 @@ def test_session_state_rejects_concurrent_owner_and_never_stores_raw_key(
     assert third.returncode == 0, third.stderr
     subprocess.run(
         [sys.executable, str(SESSION_HELPER), "finalize", "--plan", str(second_plan)],
+        check=True, text=True, capture_output=True, timeout=10,
+    )
+
+
+def test_session_reset_forgets_all_identities_and_refuses_live_lease(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    key = "feature-design-key"
+
+    def plan(identity: str, output: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable, str(SESSION_HELPER), "plan",
+                "--state-dir", str(state_dir),
+                "--key", key,
+                "--vendor", "claude",
+                "--model", identity,
+                "--cwd", str(tmp_path),
+                "--owner-pid", str(os.getpid()),
+                "--lease-sec", "60",
+                "--output", str(output),
+            ],
+            text=True, capture_output=True, timeout=10,
+        )
+
+    plans = [tmp_path / "one.json", tmp_path / "two.json"]
+    for index, plan_path in enumerate(plans, start=1):
+        created = plan(f"model-{index}", plan_path)
+        assert created.returncode == 0, created.stderr
+        finalized = subprocess.run(
+            [
+                sys.executable, str(SESSION_HELPER), "finalize",
+                "--plan", str(plan_path), "--success",
+                "--observed-session-id", f"11111111-1111-4111-8111-11111111111{index}",
+            ],
+            text=True, capture_output=True, timeout=10,
+        )
+        assert finalized.returncode == 0, finalized.stderr
+
+    live_plan = tmp_path / "live.json"
+    resumed = plan("model-1", live_plan)
+    assert resumed.returncode == 0, resumed.stderr
+    assert json.loads(live_plan.read_text())["mode"] == "resume"
+    blocked = subprocess.run(
+        [
+            sys.executable, str(SESSION_HELPER), "reset",
+            "--state-dir", str(state_dir), "--key", key,
+        ],
+        text=True, capture_output=True, timeout=10,
+    )
+    assert blocked.returncode != 0
+    assert "active lease" in blocked.stderr
+    subprocess.run(
+        [sys.executable, str(SESSION_HELPER), "finalize", "--plan", str(live_plan)],
+        check=True, text=True, capture_output=True, timeout=10,
+    )
+
+    reset = subprocess.run(
+        [
+            sys.executable, str(SESSION_HELPER), "reset",
+            "--state-dir", str(state_dir), "--key", key,
+        ],
+        text=True, capture_output=True, timeout=10,
+    )
+    assert reset.returncode == 0, reset.stderr
+    assert reset.stdout.strip() == "2"
+
+    fresh_plan = tmp_path / "fresh.json"
+    fresh = plan("model-1", fresh_plan)
+    assert fresh.returncode == 0, fresh.stderr
+    assert json.loads(fresh_plan.read_text())["mode"] == "new"
+    subprocess.run(
+        [sys.executable, str(SESSION_HELPER), "finalize", "--plan", str(fresh_plan)],
+        check=True, text=True, capture_output=True, timeout=10,
+    )
+
+
+def test_failed_session_turn_does_not_advance_rotation_counter(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    session_id = "11111111-1111-4111-8111-111111111111"
+
+    def plan(name: str) -> tuple[Path, dict[str, object]]:
+        output = tmp_path / f"{name}.json"
+        proc = subprocess.run(
+            [
+                sys.executable, str(SESSION_HELPER), "plan",
+                "--state-dir", str(state_dir),
+                "--key", "failure-count-key",
+                "--vendor", "openai",
+                "--model", "fake-model",
+                "--cwd", str(tmp_path),
+                "--owner-pid", str(os.getpid()),
+                "--lease-sec", "60",
+                "--max-turns", "2",
+                "--output", str(output),
+            ],
+            text=True, capture_output=True, timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return output, json.loads(output.read_text())
+
+    first_path, first = plan("first")
+    assert (first["mode"], first["turn_number"], first["auto_reset"]) == (
+        "new", 1, False,
+    )
+    subprocess.run(
+        [
+            sys.executable, str(SESSION_HELPER), "finalize",
+            "--plan", str(first_path), "--success",
+            "--observed-session-id", session_id,
+        ],
+        check=True, text=True, capture_output=True, timeout=10,
+    )
+
+    failed_path, failed = plan("failed")
+    assert (failed["mode"], failed["turn_number"]) == ("resume", 2)
+    subprocess.run(
+        [sys.executable, str(SESSION_HELPER), "finalize", "--plan", str(failed_path)],
+        check=True, text=True, capture_output=True, timeout=10,
+    )
+
+    retry_path, retry = plan("retry")
+    assert (retry["mode"], retry["turn_number"], retry["auto_reset"]) == (
+        "resume", 2, False,
+    )
+    subprocess.run(
+        [
+            sys.executable, str(SESSION_HELPER), "finalize",
+            "--plan", str(retry_path), "--success",
+            "--observed-session-id", session_id,
+        ],
+        check=True, text=True, capture_output=True, timeout=10,
+    )
+
+    rotated_path, rotated = plan("rotated")
+    assert (rotated["mode"], rotated["turn_number"], rotated["auto_reset"]) == (
+        "new", 1, True,
+    )
+    subprocess.run(
+        [sys.executable, str(SESSION_HELPER), "finalize", "--plan", str(rotated_path)],
         check=True, text=True, capture_output=True, timeout=10,
     )
 
@@ -960,9 +1157,14 @@ def test_stage_runner_enables_sessions_only_for_repeating_agents(
     if stateful:
         assert captured["session_key"] == feature_session_key(feature_active, stage)
         assert captured["resume_prompt"] == "delta prompt"
+        assert captured["session_max_turns"] == (
+            DESIGN_SESSION_MAX_TURNS if stage == "design"
+            else DEFAULT_SESSION_MAX_TURNS
+        )
     else:
         assert captured["session_key"] is None
         assert captured["resume_prompt"] is None
+        assert captured["session_max_turns"] is None
 
 
 def test_panel_reviewer_forwards_its_session_and_continuation_prompt(
@@ -999,6 +1201,7 @@ def test_panel_reviewer_forwards_its_session_and_continuation_prompt(
 
     assert result.ok
     assert captured["session_key"] == "reviewer-slot-key"
+    assert captured["session_max_turns"] == DEFAULT_SESSION_MAX_TURNS
     assert captured["resume_prompt"] == "review current revision"
 
 

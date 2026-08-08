@@ -65,6 +65,62 @@ def test_cli_pause_and_resume(git_repo, feature_active):
     assert not (feature_active / ".pause").exists()
 
 
+def test_cli_reset_session_requires_pause_and_delegates(
+    git_repo, feature_active, capsys, monkeypatch,
+):
+    import autodev.vendors.session_control as session_control
+
+    calls = []
+    monkeypatch.setattr(
+        session_control,
+        "reset_feature_session",
+        lambda active, role: calls.append((active, role)) or 2,
+    )
+    code = main([
+        "reset-session", "demo", "design", "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.ERROR
+    assert "must be paused" in capsys.readouterr().err
+    assert calls == []
+
+    (feature_active / ".pause").touch()
+    code = main([
+        "reset-session", "demo", "design", "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    assert calls == [(feature_active, "design")]
+    assert "reset 2 persistent session mapping" in capsys.readouterr().out
+
+
+def test_cli_restore_design_requires_pause_and_delegates(
+    git_repo, feature_active, capsys, monkeypatch,
+):
+    import autodev.artifacts.design_package_history as history
+
+    calls = []
+    snapshot = feature_active / "design-package-history" / "package-007"
+    monkeypatch.setattr(
+        history,
+        "restore_design_package",
+        lambda active, package: calls.append((active, package)) or (snapshot, ["design.md"]),
+    )
+    code = main([
+        "restore-design", "demo", "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.ERROR
+    assert "must be paused" in capsys.readouterr().err
+    assert calls == []
+
+    (feature_active / ".pause").touch()
+    code = main([
+        "restore-design", "demo", "--package", "package-007",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    assert calls == [(feature_active, "package-007")]
+    assert "restored package-007" in capsys.readouterr().out
+
+
 def test_cli_abort_writes_pause_sentinel(git_repo, feature_active, capsys):
     """abort must hard-stop the run, not just kill the in-flight vendor.
     Writing the .pause sentinel ensures the orchestrator's for-loop

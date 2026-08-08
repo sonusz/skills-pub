@@ -60,6 +60,8 @@ Common arguments:
 - `--id ID` to choose output directory ids; repeat once per `--vendor`
 - `--session-key KEY` to persist and resume one opaque logical conversation;
   repeat once per `--vendor` in fan-out calls
+- `--session-max-turns N` to rotate a keyed native conversation after N
+  successful turns; the next call sends the full prompt and starts at turn 1
 - `--resume-prompt TEXT` / `--resume-prompt-file FILE` to provide a smaller
   prompt that is sent only after an existing native session is found
 - `--min-success N` to set how many selected vendors must succeed
@@ -88,6 +90,13 @@ omitted, the invocation directory is the real working directory for this
 identity. Raw native arguments are not stored. If a non-empty
 `--resume-prompt` is supplied, only that continuation prompt is sent on resume.
 Otherwise the full prompt is sent again.
+
+Callers may bound conversational lifetime with `--session-max-turns N`. Turns
+1 through N share one native session; the following call atomically forgets
+that mapping and starts a new session. Only successful calls advance the
+counter. Failed or interrupted calls retain the prior count, while an explicit
+`session-state.py reset` clears it. Keyed status files expose `session_turn`,
+`session_max_turns`, and `session_auto_reset` for audit.
 
 ```bash
 VENDORS=${VENDORS:-/tmp/skills/vendors}
@@ -142,6 +151,11 @@ automatically re-exec into such a group when needed. Cleanup repeatedly scans
 the group so reparented or post-signal children cannot escape, then releases
 only the exact random lease tokens published in that invocation's session
 plans. An unverified shutdown keeps both session and output locks fail closed.
+
+The bundled `session-state.py reset --state-dir DIR --key KEY` operator command
+forgets every provider/model/cwd mapping for one logical key. It is serialized
+against new plans and refuses to reset while any matching lease is live. The
+next keyed call therefore starts a fresh provider-native conversation.
 
 Each `<output-dir>/<id>` also has an atomic coordinator lock acquired before
 any call artifact is created or truncated. Reusing that output id concurrently

@@ -196,6 +196,29 @@ tail docs/features/myfeature/active/log.jsonl
 
 `run` has three pacings: end-to-end (`autodev run`), one stage at a time
 (`autodev next`), and phase-bounded (`autodev run --until design|build`).
+
+Persistent design/build/Ralph conversations can be restarted deliberately:
+
+```bash
+autodev pause myfeature
+autodev reset-session myfeature design
+```
+
+Reset refuses an active session lease; the agent's next turn starts a fresh
+provider-native conversation.
+
+The harness also rotates conversations automatically at successful-turn
+boundaries: design keeps at most 15 turns; build, Ralph review, and each panel
+reviewer keep at most 5. Turn 16 for design and turn 6 for every other keyed
+agent start fresh with the full current artifact packet. Failures and handled
+interruptions do not advance the count.
+
+If an interrupted or mistaken invalidation removed the active design package,
+restore the latest hash-verified archive while the feature remains paused:
+
+```bash
+autodev restore-design myfeature
+```
 `--until design` is the common "design, then let me look before we
 build" checkpoint — it does not stop one stage at a time, it carries the
 whole design phase to completion (including the gate) and halts before

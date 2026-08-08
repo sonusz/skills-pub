@@ -76,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("quota-resume", "Conditionally resume a quota-paused feature (only if still "
                          "paused, time reached, quota recovered, repo unchanged)"),
         ("abort", "Kill running subprocess; write interrupted failure.json"),
+        ("reset-session", "Forget one paused feature agent's persistent session"),
+        ("restore-design", "Restore a hash-verified archived design package"),
         ("retry", "Retry failed current stage"),
         ("invalidate", "Invalidate a stage artifact (rollback)"),
         ("update", "Append PRD amendment; advance cycle"),
@@ -96,6 +98,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     inv = sub._name_parser_map["invalidate"]
     inv.add_argument("stage", help="stage artifact name to invalidate")
+
+    from autodev.vendors.session_control import PERSISTENT_AGENT_ROLES
+    reset_session = sub._name_parser_map["reset-session"]
+    reset_session.add_argument("role", choices=PERSISTENT_AGENT_ROLES)
+
+    restore_design = sub._name_parser_map["restore-design"]
+    restore_design.add_argument("--package", default="latest")
 
     upd = sub._name_parser_map["update"]
     upd.add_argument("--amendment", required=True)
@@ -722,6 +731,56 @@ def cmd_retry(args) -> int:
     return _dispatch_orch(args, "next")
 
 
+def cmd_reset_session(args) -> int:
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+    if not (active / ".pause").exists():
+        print(
+            "feature must be paused before resetting a persistent session; "
+            f"run `autodev pause {args.feature}` first",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    from autodev.vendors.session_control import reset_feature_session
+    try:
+        reset_count = reset_feature_session(active, args.role)
+    except (RuntimeError, ValueError) as exc:
+        print(f"session reset failed: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    print(
+        f"reset {reset_count} persistent session mapping(s) for "
+        f"{args.feature}/{args.role}"
+    )
+    return exit_codes.OK
+
+
+def cmd_restore_design(args) -> int:
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+    if not (active / ".pause").exists():
+        print(
+            "feature must be paused before restoring a design package; "
+            f"run `autodev pause {args.feature}` first",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    from autodev.artifacts.design_package_history import restore_design_package
+    try:
+        snapshot, restored = restore_design_package(active, args.package)
+    except (AutodevError, ValueError) as exc:
+        print(f"design restore failed: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    changed = ", ".join(restored) if restored else "no files (already current)"
+    print(f"restored {snapshot.name} for {args.feature}: {changed}")
+    return exit_codes.OK
+
+
 def cmd_invalidate(args) -> int:
     fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
     active = fp.active()
@@ -979,6 +1038,8 @@ _DISPATCH = {
     "resume": cmd_resume,
     "quota-resume": cmd_quota_resume,
     "abort": cmd_abort,
+    "reset-session": cmd_reset_session,
+    "restore-design": cmd_restore_design,
     "retry": cmd_retry,
     "invalidate": cmd_invalidate,
     "update": cmd_update,

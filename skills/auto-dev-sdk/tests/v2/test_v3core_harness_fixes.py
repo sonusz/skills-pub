@@ -18,7 +18,10 @@ import pytest
 
 from autodev.artifacts.revision_state import filename_to_producer, load_state
 from autodev.artifacts.design_packet import write_design_packet
-from autodev.artifacts.design_package_history import archive_design_package
+from autodev.artifacts.design_package_history import (
+    archive_design_package,
+    restore_design_package,
+)
 from autodev.artifacts.scope import Scope, ScopeItem, write_scope
 from autodev.artifacts.verdict import (
     PanelFinding, PanelVerdict, load_verdict, write_verdict,
@@ -498,6 +501,36 @@ def test_design_package_history_archives_distinct_package_versions(git_repo):
         text=True,
     ).stdout
     assert "+new package version" in revision_diff
+
+    expected = {
+        name: (second / name).read_bytes()
+        for name in (
+            "design.md", "scope.json", "trace.md", "test-plan.md",
+            "design-changelog.json",
+        )
+    }
+    (active / "design.md").unlink()
+    (active / "scope.json").write_text('{"stale": true}\n', encoding="utf-8")
+    (active / "design.md.tmp").write_text("partial", encoding="utf-8")
+    restored_snapshot, restored = restore_design_package(active)
+    assert restored_snapshot == second
+    assert set(restored) == {"design.md", "scope.json"}
+    assert not (active / "design.md.tmp").exists()
+    for name, content in expected.items():
+        assert (active / name).read_bytes() == content
+
+
+def test_restore_design_package_rejects_corrupt_archive(git_repo):
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    _seed_prd_and_scope(active)
+    snapshot = archive_design_package(active)
+    original = (active / "design.md").read_bytes()
+    (snapshot / "design.md").write_text("corrupt", encoding="utf-8")
+
+    with pytest.raises(Exception, match="integrity check"):
+        restore_design_package(active)
+    assert (active / "design.md").read_bytes() == original
     # Package refs use a throwaway index and never stage the user's worktree.
     assert subprocess.run(
         ["git", "diff", "--cached", "--name-only"],

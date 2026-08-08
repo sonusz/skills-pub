@@ -59,6 +59,8 @@ Output:
                                  Default: normalized vendor id, suffixed on duplicates
   --session-key KEY              Persist/resume one logical agent conversation.
                                  Repeat once per --vendor in fan-out calls.
+  --session-max-turns N          Start a fresh native session after N successful
+                                 keyed turns; applies to every selected vendor.
 
 Selection hints:
   --effort min|low|medium|high|xhigh|max
@@ -131,6 +133,7 @@ VENDORS_YOLO=0
 OUTPUT_DIR=""
 CALL_IDS=()
 SESSION_KEYS=()
+SESSION_MAX_TURNS=""
 MIN_SUCCESS=""
 TIMEOUT_SECONDS=0
 
@@ -210,6 +213,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --session-key=*)
       SESSION_KEYS+=("${1#*=}")
+      shift
+      ;;
+    --session-max-turns)
+      require_value "$1" "${2-}"
+      SESSION_MAX_TURNS="$2"
+      shift 2
+      ;;
+    --session-max-turns=*)
+      SESSION_MAX_TURNS="${1#*=}"
       shift
       ;;
     --effort)
@@ -438,6 +450,14 @@ fi
 
 if [ "${#SESSION_KEYS[@]}" -gt 0 ] && [ "${#SESSION_KEYS[@]}" -ne "${#VENDOR_IDS[@]}" ]; then
   die "when provided, --session-key must be repeated once per --vendor"
+fi
+
+case "$SESSION_MAX_TURNS" in
+  "") ;;
+  0|*[!0-9]*) die "--session-max-turns must be a positive integer" ;;
+esac
+if [ -n "$SESSION_MAX_TURNS" ] && [ "${#SESSION_KEYS[@]}" -eq 0 ]; then
+  die "--session-max-turns requires --session-key"
 fi
 
 for i in "${!VENDOR_IDS[@]}"; do
@@ -841,6 +861,7 @@ run_one_vendor() {
   local log_file="${6:-}"
   local status_file="${7:-}"
   local session_key="${8:-}"
+  local session_max_turns="${9:-}"
   local call_dir=""
   local timeout_marker=""
   local usage_file=""
@@ -952,6 +973,9 @@ run_one_vendor() {
       --lease-sec "$session_lease_sec"
       --output "$session_plan_file"
     )
+    if [ -n "$session_max_turns" ]; then
+      session_plan_args+=(--max-turns "$session_max_turns")
+    fi
     for native_arg in "${VENDORS_NATIVE_ARGS[@]}"; do
       session_plan_args+=("--transport-arg=$native_arg")
     done
@@ -1109,6 +1133,9 @@ run_one_vendor() {
         printf "session_id=%s\n" "$observed_session_id"
         printf "session=%s\n" "$session_result_file"
         printf "session_invalidated=%s\n" "$session_invalidated"
+        printf "session_turn=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name turn_number 2>/dev/null || true)"
+        printf "session_max_turns=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name max_turns 2>/dev/null || true)"
+        printf "session_auto_reset=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name auto_reset 2>/dev/null || true)"
       fi
       if [ "$code" = "124" ]; then
         printf "reason=timeout\n"
@@ -1194,6 +1221,7 @@ for i in "${!VENDOR_IDS[@]}"; do
     "$call_dir/log" \
     "$call_dir/status" \
     "$session_key" \
+    "$SESSION_MAX_TURNS" \
     > "$call_dir/log" 2>&1 &
   PIDS+=("$!")
 done

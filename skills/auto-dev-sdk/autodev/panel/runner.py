@@ -64,6 +64,7 @@ from autodev.vendors.config import (
 )
 from autodev.vendors.fallback import build_candidates, resolve_candidate
 from autodev.vendors.quota import get_remaining as get_quota_remaining
+from autodev.vendors.session_keys import DEFAULT_SESSION_MAX_TURNS
 from autodev.vendors.shared_call import SHARED_VENDORS_DIR, call_shared_vendor
 from autodev.vendors.subprocess_runner import (
     _build_idle_callback,
@@ -808,8 +809,20 @@ def _invoke_reviewer(
                 ),
                 process_label=f"panel-reviewer:{spec.vendor}",
                 session_key=session_key,
+                session_max_turns=(
+                    DEFAULT_SESSION_MAX_TURNS
+                    if session_key is not None else None
+                ),
                 resume_prompt=resume_prompt,
             )
+            if getattr(result, "session_auto_reset", False) and log_emit is not None:
+                log_emit({
+                    "event": "session-auto-reset",
+                    "role": "reviewer",
+                    "vendor": spec.vendor,
+                    "turn": getattr(result, "session_turn", None),
+                    "max_turns": getattr(result, "session_max_turns", None),
+                })
             elapsed = time.monotonic() - t0
             if result.returncode != 0:
                 detail = (

@@ -72,6 +72,16 @@ def _state_path(args: argparse.Namespace) -> Path:
     return Path(args.state_dir).expanduser().resolve() / f"{_identity_hash(args)}.json"
 
 
+def _key_sha256(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _key_guard_path(state_dir: Path, key: str) -> Path:
+    """Return a non-record path used to serialize plan/reset for one key."""
+
+    return state_dir / f".key-{_key_sha256(key)}"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -153,60 +163,103 @@ def _lease_is_live(record: dict[str, Any]) -> bool:
     return expires > time.time() or _pid_alive(record.get("lease_owner_pid"))
 
 
+def _nonnegative_int(value: Any, *, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     path = _state_path(args)
     identity = _identity_payload(args)
-    with _record_guard(path):
-        record = _read_json(path)
-        if record and _lease_is_live(record):
-            owner = record.get("lease_owner_pid", "unknown")
-            raise SystemExit(
-                f"session key is already in use by live pid {owner}: "
-                f"{_identity_hash(args)[:12]}"
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    # The key-level guard makes an operator reset atomic with respect to new
+    # identities for the same logical conversation. Record guards still
+    # serialize plan/finalize for each concrete vendor/model/cwd identity.
+    with _record_guard(_key_guard_path(state_dir, args.key)):
+        with _record_guard(path):
+            record = _read_json(path)
+            if record and _lease_is_live(record):
+                owner = record.get("lease_owner_pid", "unknown")
+                raise SystemExit(
+                    f"session key is already in use by live pid {owner}: "
+                    f"{_identity_hash(args)[:12]}"
+                )
+            stored_record = record
+
+            previous_session_id = record.get("session_id")
+            if not isinstance(previous_session_id, str) or not previous_session_id:
+                previous_session_id = None
+            elif not _valid_session_id(previous_session_id):
+                raise SystemExit("stored native session id is malformed; refusing resume")
+            max_turns = int(args.max_turns)
+            if max_turns < 0:
+                raise SystemExit("session max turns must be non-negative")
+            turn_count = _nonnegative_int(record.get("session_turn_count"))
+            if previous_session_id is None:
+                turn_count = 0
+            auto_reset = bool(
+                previous_session_id and max_turns and turn_count >= max_turns
             )
+            reset_at = _utc_now() if auto_reset else None
+            if auto_reset:
+                previous_session_id = None
+                turn_count = 0
+            mode = "resume" if previous_session_id else "new"
+            requested_session_id = previous_session_id
+            if mode == "new" and args.vendor.strip().lower() in PREASSIGNABLE_VENDORS:
+                requested_session_id = str(uuid.uuid4())
 
-        previous_session_id = record.get("session_id")
-        if not isinstance(previous_session_id, str) or not previous_session_id:
-            previous_session_id = None
-        elif not _valid_session_id(previous_session_id):
-            raise SystemExit("stored native session id is malformed; refusing resume")
-        mode = "resume" if previous_session_id else "new"
-        requested_session_id = previous_session_id
-        if mode == "new" and args.vendor.strip().lower() in PREASSIGNABLE_VENDORS:
-            requested_session_id = str(uuid.uuid4())
-
-        token = str(uuid.uuid4())
-        lease_sec = max(int(args.lease_sec), 60)
-        record = {
-            "schema_version": SCHEMA_VERSION,
-            "identity_hash": _identity_hash(args),
-            "key_sha256": hashlib.sha256(args.key.encode("utf-8")).hexdigest(),
-            "vendor": identity["vendor"],
-            "model": identity["model"],
-            "cwd": identity["cwd"],
-            "transport_sha256": identity["transport_sha256"],
-            "session_id": previous_session_id,
-            "pending_session_id": requested_session_id,
-            "pending_mode": mode,
-            "lease_token": token,
-            "lease_owner_pid": int(args.owner_pid),
-            "lease_expires_epoch": time.time() + lease_sec,
-            "updated_at": _utc_now(),
-        }
-        plan = {
-            "schema_version": SCHEMA_VERSION,
-            "record_path": str(path),
-            "identity_hash": record["identity_hash"],
-            "lease_token": token,
-            "mode": mode,
-            "session_id": requested_session_id,
-            "previous_session_id": previous_session_id,
-        }
-        # Publish the exact-token capability before the lease. If this helper
-        # is terminated between the two atomic writes, signal cleanup either
-        # has the plan needed to release our lease or finds no matching lease.
-        _atomic_write_json(Path(args.output), plan)
-        _atomic_write_json(path, record)
+            token = str(uuid.uuid4())
+            lease_sec = max(int(args.lease_sec), 60)
+            record = {
+                "schema_version": SCHEMA_VERSION,
+                "identity_hash": _identity_hash(args),
+                "key_sha256": _key_sha256(args.key),
+                "vendor": identity["vendor"],
+                "model": identity["model"],
+                "cwd": identity["cwd"],
+                "transport_sha256": identity["transport_sha256"],
+                "session_id": previous_session_id,
+                "session_turn_count": turn_count,
+                "session_max_turns": max_turns or None,
+                "pending_session_id": requested_session_id,
+                "pending_mode": mode,
+                "pending_turn_number": turn_count + 1,
+                "lease_token": token,
+                "lease_owner_pid": int(args.owner_pid),
+                "lease_expires_epoch": time.time() + lease_sec,
+                "updated_at": _utc_now(),
+            }
+            for field in ("reset_count", "last_reset_at", "auto_reset_count", "last_auto_reset_at"):
+                if field in stored_record:
+                    record[field] = stored_record[field]
+            if auto_reset:
+                record["auto_reset_count"] = (
+                    _nonnegative_int(record.get("auto_reset_count")) + 1
+                )
+                record["last_auto_reset_at"] = reset_at
+            plan = {
+                "schema_version": SCHEMA_VERSION,
+                "record_path": str(path),
+                "identity_hash": record["identity_hash"],
+                "lease_token": token,
+                "mode": mode,
+                "session_id": requested_session_id,
+                "previous_session_id": previous_session_id,
+                "turn_number": turn_count + 1,
+                "max_turns": max_turns or None,
+                "auto_reset": auto_reset,
+            }
+            # Publish the exact-token capability before the lease. If this helper
+            # is terminated between the two atomic writes, signal cleanup either
+            # has the plan needed to release our lease or finds no matching lease.
+            _atomic_write_json(Path(args.output), plan)
+            _atomic_write_json(path, record)
     return 0
 
 
@@ -238,6 +291,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
 
         if args.invalidate:
             record["session_id"] = None
+            record["session_turn_count"] = 0
         elif args.success:
             observed = args.observed_session_id.strip()
             planned = plan.get("session_id")
@@ -248,10 +302,18 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                 )
             if not _valid_session_id(chosen):
                 raise SystemExit("refusing malformed native session id")
+            turn_number = plan.get("turn_number")
+            if (
+                isinstance(turn_number, bool)
+                or not isinstance(turn_number, int)
+                or turn_number <= 0
+            ):
+                raise SystemExit("invalid session plan: missing positive turn number")
             record["session_id"] = chosen
+            record["session_turn_count"] = turn_number
 
         for field in (
-            "pending_session_id", "pending_mode", "lease_token",
+            "pending_session_id", "pending_mode", "pending_turn_number", "lease_token",
             "lease_owner_pid", "lease_expires_epoch",
         ):
             record.pop(field, None)
@@ -259,6 +321,55 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         record["last_success"] = bool(args.success)
         record["updated_at"] = _utc_now()
         _atomic_write_json(path, record)
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    """Forget every provider identity mapped from one opaque logical key."""
+
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    expected_key_hash = _key_sha256(args.key)
+    if not state_dir.is_dir():
+        print(0)
+        return 0
+
+    with _record_guard(_key_guard_path(state_dir, args.key)):
+        matching_paths = sorted(
+            path
+            for path in state_dir.glob("*.json")
+            if _read_json(path).get("key_sha256") == expected_key_hash
+        )
+        with contextlib.ExitStack() as stack:
+            for path in matching_paths:
+                stack.enter_context(_record_guard(path))
+
+            records = [(path, _read_json(path)) for path in matching_paths]
+            live = [
+                (path, record.get("lease_owner_pid", "unknown"))
+                for path, record in records
+                if _lease_is_live(record)
+            ]
+            if live:
+                owners = ", ".join(f"{path.stem[:12]}:{owner}" for path, owner in live)
+                raise SystemExit(
+                    f"session key has active lease(s) ({owners}); abort or wait before reset"
+                )
+
+            reset_at = _utc_now()
+            for path, record in records:
+                record["session_id"] = None
+                record["session_turn_count"] = 0
+                for field in (
+                    "pending_session_id", "pending_mode", "pending_turn_number", "lease_token",
+                    "lease_owner_pid", "lease_expires_epoch",
+                ):
+                    record.pop(field, None)
+                record["last_reset_at"] = reset_at
+                record["reset_count"] = int(record.get("reset_count", 0)) + 1
+                record["updated_at"] = reset_at
+                _atomic_write_json(path, record)
+
+    print(len(matching_paths))
     return 0
 
 
@@ -379,7 +490,7 @@ def _finalize_interrupted_plan(plan_path: Path) -> bool:
             return False
         pending_mode = record.get("pending_mode")
         for field in (
-            "pending_session_id", "pending_mode", "lease_token",
+            "pending_session_id", "pending_mode", "pending_turn_number", "lease_token",
             "lease_owner_pid", "lease_expires_epoch",
         ):
             record.pop(field, None)
@@ -529,6 +640,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--transport-arg", action="append", default=[])
     plan.add_argument("--owner-pid", type=int, required=True)
     plan.add_argument("--lease-sec", type=int, default=28860)
+    plan.add_argument("--max-turns", type=int, default=0)
     plan.add_argument("--output", required=True)
     plan.set_defaults(func=cmd_plan)
 
@@ -543,6 +655,11 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--invalidate", action="store_true")
     finalize.add_argument("--observed-session-id", default="")
     finalize.set_defaults(func=cmd_finalize)
+
+    reset = sub.add_parser("reset")
+    reset.add_argument("--state-dir", required=True)
+    reset.add_argument("--key", required=True)
+    reset.set_defaults(func=cmd_reset)
 
     interrupt = sub.add_parser("interrupt")
     interrupt.add_argument("--process-group", type=int, required=True)

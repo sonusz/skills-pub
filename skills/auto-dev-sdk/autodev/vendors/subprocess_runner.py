@@ -137,10 +137,15 @@ def run_stage_subprocess(
     model = model_override or chosen.model
     vendor = chosen.vendor
     session_key: str | None = None
+    session_max_turns: int | None = None
     if stage in {"design", "build", "ralph-review"}:
-        from autodev.vendors.session_keys import feature_session_key
+        from autodev.vendors.session_keys import (
+            feature_session_key,
+            session_max_turns_for_role,
+        )
 
         session_key = feature_session_key(feature_active, stage)
+        session_max_turns = session_max_turns_for_role(stage)
 
     probe_enabled = probe_config is not None
     hard_backstop_sec = (
@@ -162,6 +167,8 @@ def run_stage_subprocess(
     failure_kind: str | None = None
     failure_detail = ""
     session_mode: str | None = None
+    session_turn: int | None = None
+    session_auto_reset = False
 
     idle_callback = (
         _build_idle_callback(
@@ -193,9 +200,12 @@ def run_stage_subprocess(
             process_registry=registry_path(feature_active),
             process_label=stage,
             session_key=session_key,
+            session_max_turns=session_max_turns,
             resume_prompt=resume_prompt if session_key is not None else None,
         )
         session_mode = result.session_mode
+        session_turn = result.session_turn
+        session_auto_reset = result.session_auto_reset
         exit_code = _exit_code_from_status(result.status, result.returncode)
         stdout_path.write_text(
             result.output
@@ -272,7 +282,9 @@ def run_stage_subprocess(
         log_emit({"event": "subprocess-end", "stage": stage, "ok": ok,
                   "exit_code": exit_code, "failure_kind": failure_kind,
                   "elapsed_sec": elapsed, "reaped": subprocess_reaped,
-                  "session_mode": session_mode})
+                  "session_mode": session_mode,
+                  "session_turn": session_turn,
+                  "session_auto_reset": session_auto_reset})
 
     return StageRunResult(
         ok=ok,

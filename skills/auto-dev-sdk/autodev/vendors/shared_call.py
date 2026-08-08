@@ -52,6 +52,9 @@ class SharedVendorResult:
     session_id: str | None = None
     session_mode: str | None = None
     session_key_hash: str | None = None
+    session_turn: int | None = None
+    session_max_turns: int | None = None
+    session_auto_reset: bool = False
 
 
 @contextmanager
@@ -242,6 +245,7 @@ def call_shared_vendor(
     process_registry: Path | None = None,
     process_label: str | None = None,
     session_key: str | None = None,
+    session_max_turns: int | None = None,
     resume_prompt: str | None = None,
 ) -> SharedVendorResult:
     if not SHARED_CALL_SCRIPT.exists():
@@ -294,6 +298,12 @@ def call_shared_vendor(
             cmd.extend(["--cwd", str(cwd)])
         if session_key is not None:
             cmd.extend(["--session-key", session_key])
+            if session_max_turns is not None:
+                if session_max_turns <= 0:
+                    raise ValueError("session_max_turns must be positive")
+                cmd.extend(["--session-max-turns", str(session_max_turns)])
+        elif session_max_turns is not None:
+            raise ValueError("session_max_turns requires session_key")
         if resume_prompt_file is not None:
             cmd.extend(["--resume-prompt-file", str(resume_prompt_file)])
         if schema_file is not None:
@@ -485,4 +495,13 @@ def call_shared_vendor(
             session_id=status.get("session_id") or None,
             session_mode=status.get("session_mode") or None,
             session_key_hash=status.get("session_key_hash") or None,
+            session_turn=(
+                int(status["session_turn"])
+                if status.get("session_turn", "").isdigit() else None
+            ),
+            session_max_turns=(
+                int(status["session_max_turns"])
+                if status.get("session_max_turns", "").isdigit() else None
+            ),
+            session_auto_reset=status.get("session_auto_reset") == "true",
         )

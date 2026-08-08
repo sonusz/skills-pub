@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from autodev.errors import SchemaError
-from autodev.state.atomic import atomic_write_json
+from autodev.state.atomic import atomic_write, atomic_write_json
 from autodev.state.hashing import hash_bytes, hash_file
 
 HISTORY_DIRNAME = "design-package-history"
@@ -344,3 +344,75 @@ def archive_design_package(feature_active: Path) -> Path:
 
     ensure_design_package_refs(feature_active)
     return snapshot_dir
+
+
+def restore_design_package(
+    feature_active: Path,
+    package: str = "latest",
+) -> tuple[Path, list[str]]:
+    """Restore one hash-verified archived package into the active workspace."""
+
+    feature_active = Path(feature_active)
+    snapshots = _existing_snapshots(_history_dir(feature_active))
+    if not snapshots:
+        raise SchemaError("no archived design packages are available")
+    if package == "latest":
+        snapshot = snapshots[-1]
+    else:
+        if _snapshot_number(Path(package)) is None or Path(package).name != package:
+            raise SchemaError(f"invalid design package name: {package!r}")
+        snapshot = _history_dir(feature_active) / package
+        if snapshot not in snapshots:
+            raise SchemaError(f"design package not found: {package!r}")
+
+    manifest = _load_manifest(snapshot / "manifest.json")
+    if manifest is None or manifest.get("kind") != "design-package-snapshot":
+        raise SchemaError(f"invalid design package manifest: {snapshot / 'manifest.json'}")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise SchemaError(f"design package {snapshot.name} has no artifact inventory")
+
+    allowed = set(DESIGN_PACKAGE_FILENAMES + DESIGN_PACKAGE_SIDECARS)
+    verified: list[tuple[str, Path, str]] = []
+    inventory: list[dict[str, str]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SchemaError(f"design package {snapshot.name} has malformed artifact entry")
+        name = artifact.get("path")
+        expected_hash = artifact.get("hash")
+        if not isinstance(name, str) or name not in allowed:
+            raise SchemaError(
+                f"design package {snapshot.name} contains unexpected artifact: {name!r}"
+            )
+        if not isinstance(expected_hash, str):
+            raise SchemaError(
+                f"design package {snapshot.name} artifact {name} has no hash"
+            )
+        source = snapshot / name
+        if not source.is_file() or hash_file(source) != expected_hash:
+            raise SchemaError(
+                f"design package {snapshot.name} artifact failed integrity check: {name}"
+            )
+        verified.append((name, source, expected_hash))
+        inventory.append({"path": name, "hash": expected_hash})
+
+    missing = sorted(set(DESIGN_PACKAGE_FILENAMES).difference(name for name, _, _ in verified))
+    if missing:
+        raise SchemaError(f"design package {snapshot.name} missing artifacts: {missing}")
+    if manifest.get("package_hash") != _package_hash(inventory):
+        raise SchemaError(f"design package {snapshot.name} package hash is invalid")
+
+    restored: list[str] = []
+    for name, source, expected_hash in verified:
+        target = feature_active / name
+        if target.is_file() and hash_file(target) == expected_hash:
+            continue
+        atomic_write(target, source.read_bytes())
+        restored.append(name)
+
+    # A handled abort can leave stage-owned preseed files behind. Once the
+    # canonical package is restored, those known temporaries are stale and
+    # must not influence the next stage.
+    for name in allowed:
+        (feature_active / f"{name}.tmp").unlink(missing_ok=True)
+    return snapshot, restored

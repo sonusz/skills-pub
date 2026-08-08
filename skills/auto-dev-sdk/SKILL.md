@@ -41,6 +41,7 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Preserves each reviewer finding, clusters semantically equivalent findings
   into one ticket, and enforces the PRD's `Release threshold: P0|P1|P2`.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
+- Rotates persistent agent conversations at successful-turn boundaries: design after 15 turns; build, Ralph review, and each panel reviewer after 5. The following turn starts fresh from current artifacts; failed/interrupted calls do not count.
 - Writes bridge artifacts: `design-packet.json`, `accepted-design.json`, `implementation-index.json`, `prd-checklist.json`.
 - Blocks on missing/stale artifacts, failed gates, dirty workspace without `acknowledge-dirty`, or locks.
 - Owns bundled stage/gate prompts under `autodev/prompts/` and `autodev/panel/prompts/`; neither this skill nor the outer agent can modify them at runtime.
@@ -76,6 +77,8 @@ I may only invoke these:
 | `autodev skip-gate <f> <gate> --reason "..."` | Override a mandatory gate |
 | `autodev acknowledge-dirty <f> --reason "..."` | Override dirty-workspace block |
 | `autodev abort <f>` | Hard-stop the run: write `.pause` sentinel (so orchestrator can't dispatch next stage) + kill running vendor subprocess + write interrupted failure. Run `autodev resume` before next `run`. |
+| `autodev reset-session <f> design\|build\|ralph-review` | Forget one paused feature agent's provider-native conversation so its next turn starts fresh. Pause first; an active session lease blocks reset. |
+| `autodev restore-design <f> [--package package-NNN]` | Restore a paused feature's latest (or named) hash-verified design-package snapshot after an interrupted or mistaken invalidation. |
 | `autodev retry <f>` | Retry last failed stage |
 | `autodev invalidate <f> <stage>` | Rollback a stage artifact |
 | `autodev update <f> --amendment "..."` | Amend PRD; start new cycle |
@@ -140,7 +143,7 @@ Mirror the harness R5 contract:
 
 1. Track the latest `<feature>` arg as current feature across turns.
 2. Before each user turn in an active auto-dev session, run `autodev status <current-feature>` and surface state changes.
-3. Before any write-like verb (`skip-gate`, `acknowledge-dirty`, `abort`, `invalidate`, `update`, `close`), rerun `autodev status`.
+3. Before any write-like verb (`skip-gate`, `acknowledge-dirty`, `abort`, `reset-session`, `restore-design`, `invalidate`, `update`, `close`), rerun `autodev status`.
 4. While `run` is active and not paused/failed, treat the wakeup as a **10-minute sliding deadman**, not a fixed cadence:
    - Schedule the next `ScheduleWakeup` 10 min out from the most recent activity.
    - **Every time you receive a signal — a `<task-notification>`, a `--watch` stdout alert, or a user message — reset the wakeup to 10 min from now.** Drop the previously-scheduled wakeup; only one is active at a time.
