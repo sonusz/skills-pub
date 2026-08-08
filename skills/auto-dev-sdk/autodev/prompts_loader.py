@@ -30,6 +30,7 @@ def render_stage_prompt(
     primary_target: Path,
     extra_targets: list[Path],
     context_artifacts: list[str] | None = None,
+    invocation_bindings: dict[str, str | Path] | None = None,
     preseeded: bool = False,
     continuation: bool = False,
 ) -> str:
@@ -145,6 +146,13 @@ def render_stage_prompt(
     }
     for key, p in target_map.get(stage, []):
         ctx_lines.append(f"- {key}: `{p}`")
+
+    # Stage-specific, harness-authored pointers that do not belong to the
+    # canonical upstream/target maps.  Values stay as references in the
+    # prompt; file contents are never inlined.  Ralph uses this for the
+    # immutable previous-review link and the per-build Git-diff context.
+    for key, value in (invocation_bindings or {}).items():
+        ctx_lines.append(f"- {key}: `{value}`")
 
     # v3-core: CONTEXT_ARTIFACTS — stage-relevant feedback artifacts
     # (prior verdict for this stage, own previous output, route feedback,

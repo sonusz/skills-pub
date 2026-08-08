@@ -13,13 +13,19 @@ from pathlib import Path
 
 SESSION_KEY_VERSION = "v1"
 DESIGN_SESSION_MAX_TURNS = 15
+RALPH_REVIEW_SESSION_MAX_TURNS = 15
 DEFAULT_SESSION_MAX_TURNS = 5
 
 
 def session_max_turns_for_role(role: str) -> int:
     """Return the automatic native-session rotation limit for one agent role."""
 
-    return DESIGN_SESSION_MAX_TURNS if role.strip() == "design" else DEFAULT_SESSION_MAX_TURNS
+    normalized_role = role.strip()
+    if normalized_role == "design":
+        return DESIGN_SESSION_MAX_TURNS
+    if normalized_role == "ralph-review":
+        return RALPH_REVIEW_SESSION_MAX_TURNS
+    return DEFAULT_SESSION_MAX_TURNS
 
 
 def feature_session_key(feature_active: Path, role: str) -> str:

@@ -66,6 +66,8 @@ STAGE_OUTPUT_RETRY_MAX = 3
 # deleting downstream artifacts.
 ROUTE_FEEDBACK_FILENAME = ".route-feedback.json"
 BUILD_CHALLENGES_FILENAME = "build-challenges.md"
+RALPH_ITERATION_CONTEXT_FILENAME = "ralph-iteration-context.json"
+RALPH_PREVIOUS_REVIEW_FILENAME = "ralph-review.previous.json"
 
 # Position of each cascade artifact, used to express "stop the `run`
 # loop before the pipeline crosses into a later phase" (the --until
@@ -1286,6 +1288,130 @@ class Orchestrator:
             payload["missing_scope_ids"] = sorted(missing_ids)
         atomic_write(feedback_path, _json.dumps(payload, indent=2) + "\n")
 
+    def _prepare_ralph_iteration_context(self, active: Path) -> Path:
+        """Persist the pre-build Git ref and prior accepted Ralph output.
+
+        The same Ralph iteration can be re-entered after a quota pause,
+        subprocess failure, or process restart.  In that case the original
+        ``before_ref`` must survive so an amend/retry cannot erase the very
+        delta the reviewer needs to inspect.
+        """
+        import json
+        from datetime import datetime, timezone
+
+        from autodev.artifacts.implementation_index import _current_git_head
+        from autodev.state.atomic import atomic_write, atomic_write_json
+
+        state = ralph.load_ralph_state(active)
+        iteration = state.iter + 1
+        trace_hash = hash_file(active / "trace.md")
+        context_path = active / RALPH_ITERATION_CONTEXT_FILENAME
+        previous_path = active / RALPH_PREVIOUS_REVIEW_FILENAME
+
+        existing: dict = {}
+        if context_path.exists():
+            try:
+                candidate = json.loads(context_path.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    existing = candidate
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+
+        reuse = (
+            existing.get("schema") == 1
+            and existing.get("iteration") == iteration
+            and existing.get("trace_hash") == trace_hash
+            and isinstance(existing.get("before_ref"), str)
+        )
+        before_ref = (
+            existing["before_ref"]
+            if reuse
+            else (_current_git_head(self.cfg.repo_root) or "")
+        )
+
+        # On a new iteration, freeze the last accepted review under a
+        # different filename.  The live ralph-review.json target is replaced
+        # atomically by the upcoming reviewer turn, so handing that mutable
+        # path back would make output retries lose their real baseline.
+        if not reuse:
+            previous_path.unlink(missing_ok=True)
+            live_review = active / "ralph-review.json"
+            if state.iter > 0 and live_review.exists():
+                try:
+                    statuses = ralph.parse_review_statuses(live_review)
+                    ralph.validate_active_review_coverage(
+                        statuses, ralph.active_scope_ids(active / "scope.json")
+                    )
+                except (OSError, SchemaError):
+                    pass
+                else:
+                    atomic_write(previous_path, live_review.read_bytes())
+
+        previous_review = str(previous_path) if previous_path.exists() else None
+        previous_hash = hash_file(previous_path) if previous_path.exists() else None
+        atomic_write_json(context_path, {
+            "schema": 1,
+            "iteration": iteration,
+            "status": "build_pending",
+            "written_at": datetime.now(timezone.utc).isoformat(),
+            "repo_root": str(self.cfg.repo_root),
+            "trace_hash": trace_hash,
+            "before_ref": before_ref,
+            "after_ref": None,
+            "previous_ralph_review_path": previous_review,
+            "previous_ralph_review_hash": previous_hash,
+            "diff": None,
+        })
+        return context_path
+
+    def _finalize_ralph_iteration_context(self, context_path: Path) -> dict:
+        """Add the post-build ref and executable diff pointers."""
+        import json
+        from datetime import datetime, timezone
+
+        from autodev.artifacts.implementation_index import _current_git_head
+        from autodev.state.atomic import atomic_write_json
+
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise PreflightError(
+                f"cannot finalize {context_path.name}: {e}"
+            ) from e
+        if not isinstance(payload, dict) or payload.get("schema") != 1:
+            raise PreflightError(
+                f"cannot finalize {context_path.name}: invalid schema"
+            )
+
+        before_ref = payload.get("before_ref")
+        after_ref = _current_git_head(self.cfg.repo_root) or ""
+        refs_available = bool(before_ref and after_ref)
+        payload.update({
+            "status": "ready_for_review",
+            "written_at": datetime.now(timezone.utc).isoformat(),
+            "after_ref": after_ref,
+            "diff": {
+                "available": refs_available,
+                "patch_command": (
+                    [
+                        "git", "-C", str(self.cfg.repo_root), "diff",
+                        "--no-ext-diff", before_ref, after_ref, "--",
+                    ]
+                    if refs_available else []
+                ),
+                "changed_files_command": (
+                    [
+                        "git", "-C", str(self.cfg.repo_root), "diff",
+                        "--no-ext-diff", "--name-status",
+                        before_ref, after_ref, "--",
+                    ]
+                    if refs_available else []
+                ),
+            },
+        })
+        atomic_write_json(context_path, payload)
+        return payload
+
     def _stamp_build_sealed_ref(self, build_path: Path) -> None:
         """Augment the just-written build.json with the current git HEAD.
 
@@ -1339,6 +1465,8 @@ class Orchestrator:
             from autodev.prompts_loader import render_stage_prompt
             from autodev.workspace import snapshot
 
+            ralph_context_path = self._prepare_ralph_iteration_context(active)
+
             prompt = render_stage_prompt(
                 stage="build",
                 feature=feature,
@@ -1385,9 +1513,23 @@ class Orchestrator:
             # Stamping HEAD here makes the per-rerun WIP commit (build
             # prompt's squash-as-you-go) propagate through the cascade.
             self._stamp_build_sealed_ref(primary_target)
+            ralph_context = self._finalize_ralph_iteration_context(
+                ralph_context_path
+            )
             logger.emit(stage="build", event="stage-complete", feature=feature,
                         detail={"artifact": str(primary_target),
                                 "elapsed_sec": result.elapsed_sec})
+            logger.emit(
+                stage="build", event="ralph-diff-context-ready",
+                feature=feature, detail={
+                    "iteration": ralph_context["iteration"],
+                    "before_ref": ralph_context["before_ref"],
+                    "after_ref": ralph_context["after_ref"],
+                    "previous_review": ralph_context[
+                        "previous_ralph_review_path"
+                    ],
+                },
+            )
 
             route = self._enforce_build_blocking(active, logger, feature)
             if route is not None:
@@ -1396,12 +1538,18 @@ class Orchestrator:
                     detail=f"routed: {route.reason}",
                 )
 
-            review_result = self._run_ralph_review(feature, active, logger)
+            review_result = self._run_ralph_review(
+                feature, active, logger,
+                iteration_context_path=ralph_context_path,
+                iteration_context=ralph_context,
+            )
             if review_result["complete"]:
                 return AdvanceResult(stage_name="build", success=True)
 
     def _run_ralph_review(
-        self, feature: str, active: Path, logger: JsonlLog,
+        self, feature: str, active: Path, logger: JsonlLog, *,
+        iteration_context_path: Path,
+        iteration_context: dict,
     ) -> dict[str, bool]:
         """Dispatch the per-iteration ralph classification, retrying on a
         deficient classification list.
@@ -1433,6 +1581,19 @@ class Orchestrator:
         # A fresh iteration's first pass is not an amendment.
         feedback_path.unlink(missing_ok=True)
 
+        invocation_bindings: dict[str, str | Path] = {
+            "RALPH_ITERATION_CONTEXT_PATH": iteration_context_path,
+            "RALPH_ITERATION_CONTEXT_HASH": hash_file(iteration_context_path),
+            "BUILD_BEFORE_REF": iteration_context.get("before_ref") or "unavailable",
+            "BUILD_AFTER_REF": iteration_context.get("after_ref") or "unavailable",
+        }
+        previous_review = iteration_context.get("previous_ralph_review_path")
+        if previous_review and Path(previous_review).exists():
+            invocation_bindings["PREVIOUS_RALPH_REVIEW_PATH"] = previous_review
+            invocation_bindings["PREVIOUS_RALPH_REVIEW_HASH"] = hash_file(
+                Path(previous_review)
+            )
+
         statuses: dict[str, str] | None = None
         last_exc: SchemaError | None = None
         for attempt in range(1, STAGE_OUTPUT_RETRY_MAX + 1):
@@ -1449,6 +1610,7 @@ class Orchestrator:
                 primary_target=review_target,
                 extra_targets=[],
                 context_artifacts=context_artifacts or None,
+                invocation_bindings=invocation_bindings,
             )
             resume_prompt = render_stage_prompt(
                 stage="ralph-review",
@@ -1458,6 +1620,7 @@ class Orchestrator:
                 primary_target=review_target,
                 extra_targets=[],
                 context_artifacts=context_artifacts or None,
+                invocation_bindings=invocation_bindings,
                 continuation=True,
             )
             result = self._run_stage_subprocess_checked(
@@ -1565,6 +1728,8 @@ class Orchestrator:
             return
         ralph.clear_ralph_state(active)
         (active / "ralph-review.json").unlink(missing_ok=True)
+        (active / RALPH_PREVIOUS_REVIEW_FILENAME).unlink(missing_ok=True)
+        (active / RALPH_ITERATION_CONTEXT_FILENAME).unlink(missing_ok=True)
         logger.emit(stage="build", event="ralph-reset-on-input-change",
                     feature=feature, detail={
                         "scope_hash_changed": state.source_hash != current_scope_hash,
@@ -1778,6 +1943,7 @@ class Orchestrator:
         for downstream in (
             "build.json", "implementation-index.json", "implemented-spec.md",
             "prd-checklist.json", "ralph-review.json", "panel-close-approval.json",
+            RALPH_PREVIOUS_REVIEW_FILENAME, RALPH_ITERATION_CONTEXT_FILENAME,
         ):
             (active / downstream).unlink(missing_ok=True)
         # Also drop ralph-state since upstream changed.

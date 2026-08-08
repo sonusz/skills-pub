@@ -137,6 +137,38 @@ def test_ralph_review_prompt_uses_build_context_without_spec(tmp_path):
     assert "SPEC_PATH:" not in body
 
 
+def test_ralph_review_prompt_links_diff_context_and_previous_output(tmp_path):
+    active = tmp_path / "active"
+    _seed(active)
+    iteration_context = active / "ralph-iteration-context.json"
+    previous_review = active / "ralph-review.previous.json"
+    iteration_context.write_text('{"before_ref":"aaa","after_ref":"bbb"}\n')
+    previous_review.write_text('{"classifications":[]}\n')
+
+    body = render_stage_prompt(
+        stage="ralph-review",
+        feature="t",
+        feature_active=active,
+        repo_root=tmp_path,
+        primary_target=active / "ralph-review.json",
+        extra_targets=[],
+        invocation_bindings={
+            "RALPH_ITERATION_CONTEXT_PATH": iteration_context,
+            "BUILD_BEFORE_REF": "aaa",
+            "BUILD_AFTER_REF": "bbb",
+            "PREVIOUS_RALPH_REVIEW_PATH": previous_review,
+        },
+    )
+
+    assert f"- RALPH_ITERATION_CONTEXT_PATH: `{iteration_context}`" in body
+    assert "- BUILD_BEFORE_REF: `aaa`" in body
+    assert "- BUILD_AFTER_REF: `bbb`" in body
+    assert f"- PREVIOUS_RALPH_REVIEW_PATH: `{previous_review}`" in body
+    # Bindings are paths/pointers only; linked file bodies are not inlined.
+    assert '{"before_ref":"aaa","after_ref":"bbb"}' not in body
+    assert '{"classifications":[]}' not in body
+
+
 def test_design_prompt_body_mentions_prd():
     """Prompt-file body mentions PRD as input (not just context section)."""
     body = (

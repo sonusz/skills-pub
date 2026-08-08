@@ -20,6 +20,7 @@ from autodev.vendors import subprocess_runner
 from autodev.vendors.session_keys import (
     DEFAULT_SESSION_MAX_TURNS,
     DESIGN_SESSION_MAX_TURNS,
+    RALPH_REVIEW_SESSION_MAX_TURNS,
     feature_session_key,
     reviewer_session_key,
 )
@@ -1157,10 +1158,11 @@ def test_stage_runner_enables_sessions_only_for_repeating_agents(
     if stateful:
         assert captured["session_key"] == feature_session_key(feature_active, stage)
         assert captured["resume_prompt"] == "delta prompt"
-        assert captured["session_max_turns"] == (
-            DESIGN_SESSION_MAX_TURNS if stage == "design"
-            else DEFAULT_SESSION_MAX_TURNS
-        )
+        expected_max_turns = {
+            "design": DESIGN_SESSION_MAX_TURNS,
+            "ralph-review": RALPH_REVIEW_SESSION_MAX_TURNS,
+        }.get(stage, DEFAULT_SESSION_MAX_TURNS)
+        assert captured["session_max_turns"] == expected_max_turns
     else:
         assert captured["session_key"] is None
         assert captured["resume_prompt"] is None

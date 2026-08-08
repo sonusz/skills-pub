@@ -13,6 +13,19 @@ not another LLM. It must be valid JSON, schema below. No prose.
 - `TRACE_PATH`, `TRACE_HASH` — the trace.md you classify against
 - `FEATURE`
 - `TARGET_RALPH_REVIEW`: path to write `ralph-review.json` (.tmp)
+- `RALPH_ITERATION_CONTEXT_PATH`, `RALPH_ITERATION_CONTEXT_HASH` — a
+  harness-authored JSON file for this exact build/review iteration. Read
+  it from disk. It contains the two Git commit pointers and argv-form
+  commands for the patch and changed-file list; the diff itself is not
+  inlined into this prompt.
+- `BUILD_BEFORE_REF`, `BUILD_AFTER_REF` — the same two mechanical Git
+  pointers surfaced directly for visibility. `git diff <before> <after>`
+  remains valid when build used `git commit --amend`: amend creates a new
+  commit tree and the old object is still addressable by its captured hash.
+- `PREVIOUS_RALPH_REVIEW_PATH`, `PREVIOUS_RALPH_REVIEW_HASH` — present
+  after the first accepted iteration. This is an immutable on-disk copy
+  of the immediately preceding accepted `ralph-review.json`; its content
+  is linked, never pasted inline.
 
 You also have the Read tool for any `Code Path` values the trace
 rows cite, and for any source files you need to verify behaviors.
@@ -23,6 +36,25 @@ The orchestrator's upstream scope/PRD intent is not your concern;
 another stage will catch spec-vs-intent issues.
 
 ## Task
+
+1. Read `RALPH_ITERATION_CONTEXT_PATH`. Run its
+   `diff.changed_files_command` and inspect `diff.patch_command` before
+   broad code exploration. If `diff.available` is false or either command
+   fails, fall back to the current code tree and say so in affected rows'
+   evidence; never invent a delta.
+2. If `PREVIOUS_RALPH_REVIEW_PATH` is present, read it as the evidence
+   cache and classification baseline:
+   - Reinspect every previously non-`Fully` row, starting with files in
+     this iteration's diff.
+   - Reinspect a previously `Fully` row when the diff touches its cited
+     evidence path or a dependency needed by the requirement.
+   - For an untouched previously `Fully` row, confirm the cited path still
+     exists and preserve the prior classification/evidence. Do not spend
+     the turn rediscovering unchanged evidence from scratch.
+   The current code on disk is authoritative; prior output is a cache,
+   never proof that overrides a conflicting current tree.
+3. Produce a complete current classification list. The diff is a routing
+   aid, not a scope filter: every trace row still appears exactly once.
 
 For every row in `trace.md`, classify the behavior as one of:
 
@@ -92,6 +124,10 @@ also in CONTEXT_ARTIFACTS.
 - `evidence` cites `path:line` or `path:line-range`; must exist
 - `req_id` and `scope_id` must match trace.md content exactly
 - This artifact is overwritten each iteration
+- Do not modify production code, tests, or add request-ID comments to
+  source files. The review's `req_id` + concrete `evidence` path is the
+  durable request-to-code mapping; reviewer-authored code changes would
+  bypass the build/test/WIP-commit boundary and make that mapping stale.
 
 ## Output
 

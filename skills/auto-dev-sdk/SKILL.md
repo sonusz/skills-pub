@@ -41,7 +41,7 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Preserves each reviewer finding, clusters semantically equivalent findings
   into one ticket, and enforces the PRD's `Release threshold: P0|P1|P2`.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
-- Rotates persistent agent conversations at successful-turn boundaries: design after 15 turns; build, Ralph review, and each panel reviewer after 5. The following turn starts fresh from current artifacts; failed/interrupted calls do not count.
+- Rotates persistent agent conversations at successful-turn boundaries: design and Ralph review after 15 turns; build and each panel reviewer after 5. The following turn starts fresh from current artifacts; failed/interrupted calls do not count.
 - Writes bridge artifacts: `design-packet.json`, `accepted-design.json`, `implementation-index.json`, `prd-checklist.json`.
 - Blocks on missing/stale artifacts, failed gates, dirty workspace without `acknowledge-dirty`, or locks.
 - Owns bundled stage/gate prompts under `autodev/prompts/` and `autodev/panel/prompts/`; neither this skill nor the outer agent can modify them at runtime.
