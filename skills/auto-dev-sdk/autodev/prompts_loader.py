@@ -111,6 +111,17 @@ def render_stage_prompt(
         else:
             ctx_lines.append(f"- {name_key}: `{path}` (MISSING — stage will abort)")
 
+    # Budget account: design and build size their work against the feature's
+    # remaining budget, not only their own context window. ralph-review stays
+    # context-isolated (pure code-vs-trace classifier) and spec is code-first,
+    # so neither receives it. Rendering must survive any metering failure.
+    if stage in ("design", "build"):
+        try:
+            from autodev.budget import format_budget_lines
+            ctx_lines.extend(format_budget_lines(feature_active))
+        except Exception:
+            pass
+
     # The design stage authors scope.json's `diff_base`. Surface the declared
     # base ref (architecture.md "## Base ref") so it has one source of truth
     # rather than being the agent's guess.

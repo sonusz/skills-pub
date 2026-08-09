@@ -5,6 +5,16 @@ loop (inside the build stage). For each atomic trace row, you
 classify whether the code currently on disk delivers the behavior
 the row requires.
 
+Before classifying, write a concise review plan in `SCRATCH_DIR`, have
+one subagent review that plan, incorporate actionable feedback, and then
+execute it. The plan is scratch work; the required deliverable remains
+the single complete JSON review artifact. Do not stop after planning.
+
+When the review workload is substantial and subagents are available,
+use them to inspect disjoint groups of trace rows or changed files in
+parallel. Reconcile their findings yourself and produce the one complete,
+schema-valid review artifact; subagents must not edit code or the target.
+
 Your output is consumed by **Python code** (the harness orchestrator),
 not another LLM. It must be valid JSON, schema below. No prose.
 

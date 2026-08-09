@@ -209,7 +209,51 @@ def run_panel_gate(
         integrity.discard(guard)
         raise
 
-    changes = integrity.detect_after(guard, canonical_files)
+    # These files are written by the harness inside the guarded interval, not
+    # by reviewers. A design review owns both its design and trace group
+    # verdict/cache pairs. Keep the exception narrow: canonical inputs remain
+    # hash-protected, and every other tracked-file delta is still rejected.
+    output_gates = (
+        ["design-review", "trace-review"]
+        if gate == "design-review"
+        else [gate]
+    )
+    expected_panel_writes = [
+        feature_active / name
+        for output_gate in output_gates
+        for name in (
+            f"panel-{output_gate}.json",
+            f"panel-{output_gate}.reviewers.json",
+        )
+    ]
+    if gate == "design-review":
+        # The budget-police rotation state is written by the runner inside
+        # the guarded interval (select_budget_police); once the file is
+        # committed by a WIP commit, every later round would otherwise be
+        # flagged as a tracked-file delta and taint the review. The
+        # exemption is conditional: only when THIS process recorded a
+        # rotation-state write for THIS round's packet. In rounds where
+        # the harness never wrote the file (cache-pin resume, no-police
+        # round), a delta to it keeps tainting the round. Defending the
+        # file against a sandbox-escaped reviewer racing the harness's own
+        # write is deliberately out of scope (operator decision).
+        try:
+            from autodev.budget import police_state_write_round
+            from autodev.state.hashing import hash_file as _hash_primary
+            if (
+                police_state_write_round(feature_active)
+                == _hash_primary(primary_artifact)
+            ):
+                expected_panel_writes.append(
+                    feature_active / "budget-police.json"
+                )
+        except Exception:
+            pass
+    changes = integrity.detect_after(
+        guard,
+        canonical_files,
+        expected_tracked_writes=expected_panel_writes,
+    )
     if changes:
         # Round is tainted: drop its verdict + reviewer cache so resume
         # re-runs fresh, then pause. The restore point is preserved (NOT

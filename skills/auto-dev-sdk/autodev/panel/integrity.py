@@ -128,9 +128,20 @@ def snapshot_before(
     return state
 
 
-def detect_after(state: GuardState, canonical_files: list[Path]) -> list[str]:
+def detect_after(
+    state: GuardState,
+    canonical_files: list[Path],
+    *,
+    expected_tracked_writes: list[Path] | None = None,
+) -> list[str]:
     """Return human-readable descriptions of any change to the review surface
-    or tracked files since ``snapshot_before``. Empty list == clean."""
+    or tracked files since ``snapshot_before``. Empty list == clean.
+
+    ``expected_tracked_writes`` names harness-owned output artifacts that the
+    panel runner itself creates or refreshes during the guarded interval.
+    They are excluded only from the repo-hygiene diff; a canonical review
+    input is still protected by its content hash even if it is also listed.
+    """
     changes: list[str] = []
 
     # (1) Review surface — content hashes. Catches modification of tracked OR
@@ -156,6 +167,9 @@ def detect_after(state: GuardState, canonical_files: list[Path]) -> list[str]:
     # Pre-existing modifications are excluded via the status baseline, so only
     # changes introduced during this round surface.
     if state.git_ref is not None:
+        expected = {
+            str(Path(p).resolve()) for p in (expected_tracked_writes or [])
+        }
         st = _git(state.repo_root, "status", "--porcelain")
         if st.returncode == 0:
             for line in st.stdout.splitlines():
@@ -169,6 +183,8 @@ def detect_after(state: GuardState, canonical_files: list[Path]) -> list[str]:
                 abspath = str((state.repo_root / path).resolve())
                 if abspath in {str(Path(p).resolve()) for p in canonical_files}:
                     continue  # canonical handled by (1)
+                if abspath in expected:
+                    continue  # declared harness-owned panel output
                 changes.append(f"{path} (tracked file modified during review)")
 
     return changes

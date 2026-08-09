@@ -128,6 +128,46 @@ def test_guard_detects_tracked_source_modification(tmp_path):
     assert any("src.py" in c and "tracked file modified" in c for c in changes)
 
 
+def test_guard_ignores_declared_tracked_panel_outputs(tmp_path):
+    """A rerun replaces deleted tracked verdicts inside the guarded round.
+
+    That is a harness write, not reviewer mutation, and must not poison every
+    design revision's panel retry.
+    """
+    _init_git_repo(tmp_path)
+    art = tmp_path / "design.md"
+    art.write_text("v1", encoding="utf-8")
+    panel = tmp_path / "panel-design-review.json"
+    panel.write_text('{"old": true}', encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+
+    panel.unlink()
+    state = integrity.snapshot_before(tmp_path, "design-review", [art])
+    panel.write_text('{"new": true}', encoding="utf-8")
+
+    assert any(
+        "panel-design-review.json" in c
+        for c in integrity.detect_after(state, [art])
+    )
+    assert integrity.detect_after(
+        state, [art], expected_tracked_writes=[panel],
+    ) == []
+
+
+def test_guard_never_exempts_canonical_input_hashes(tmp_path):
+    _init_git_repo(tmp_path)
+    art = tmp_path / "design.md"
+    art.write_text("v1", encoding="utf-8")
+    state = integrity.snapshot_before(tmp_path, "design-review", [art])
+    art.write_text("reviewer mutation", encoding="utf-8")
+
+    changes = integrity.detect_after(
+        state, [art], expected_tracked_writes=[art],
+    )
+    assert any("modified during review" in c for c in changes)
+
+
 def test_report_includes_git_rollback_command(tmp_path):
     _init_git_repo(tmp_path)
     art = tmp_path / "design.md"

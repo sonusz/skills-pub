@@ -186,3 +186,35 @@ def test_build_prompt_body_mentions_prd():
     ).read_text(encoding="utf-8")
     assert "PRD_PATH" in body
     assert "PRD_HASH" in body
+    assert "as one work queue" in body
+    assert "do not impose an arbitrary one-scope" in body
+    assert "do not defer" in body
+    assert "subagents are available" in body
+    assert "bounded, non-overlapping\n  assignments" in body
+    assert "have one\nsubagent review that plan" in body
+    assert "do not\nstop after planning" in body
+    assert "Mandatory iteration sizing" in body
+    assert "If the whole runnable queue can fit" in body
+    assert "largest coherent objective" in body
+    assert "it need not\n  complete an entire scope" in body
+    assert "verifiable forward status\n  delta for at least one scope" in body
+    assert "Missing toward Partial" in body
+    assert "Partial toward\n  Fully" in body
+    assert "It may\n  advance one scope or several scopes" in body
+    assert "you MUST use\n  them concurrently" in body
+    assert "plan-review subagent does not count" in body
+    assert "fully completed context-sized\nobjective" in body
+    assert "does not\nrequire the affected scope to reach Fully" in body
+    assert "Work outside the objective remains in the queue" in body
+
+
+def test_ralph_prompt_allows_parallel_subagent_review():
+    body = (
+        Path(__file__).resolve().parent.parent.parent
+        / "autodev" / "prompts" / "stage-ralph-review.md"
+    ).read_text(encoding="utf-8")
+    assert "subagents are available" in body
+    assert "disjoint groups of trace rows" in body
+    assert "one complete" in body
+    assert "one subagent review that plan" in body
+    assert "Do not stop after planning" in body
