@@ -106,6 +106,184 @@ def test_detect_out_of_scope_write(git_repo):
     assert not any("inside.json" in e for e in escapes)
 
 
+def test_protected_path_wins_over_broad_allowed_scope(git_repo):
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    protected = active / "prd.md"
+    protected.write_text("original")
+    product = git_repo / "service.py"
+    product.write_text("before")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo)
+
+    protected.write_text("mutated")
+    product.write_text("after")
+    after = snapshot(git_repo)
+
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[git_repo],
+        protected_scope=[protected],
+        repo_root=git_repo,
+    )
+
+    assert any("prd.md" in entry for entry in escapes)
+    assert not any("service.py" in entry for entry in escapes)
+
+
+def test_explicitly_protected_harness_file_is_not_ignored(git_repo):
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    verdict = active / "panel-design-review.json"
+    verdict.write_text('{"verdict":"pass"}\n')
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo)
+
+    verdict.write_text('{"verdict":"needs_revision"}\n')
+    after = snapshot(git_repo)
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[active],
+        protected_scope=[verdict],
+        repo_root=git_repo,
+    )
+
+    assert any("panel-design-review.json" in entry for entry in escapes)
+
+
+def test_protected_content_change_is_caught_after_agent_commits(git_repo):
+    protected = git_repo / "docs" / "features" / "demo" / "active" / "prd.md"
+    protected.parent.mkdir(parents=True)
+    protected.write_text("original")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo, watched_paths=[protected])
+
+    protected.write_text("mutated")
+    subprocess.run(["git", "add", str(protected)], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "agent commit"], cwd=git_repo, check=True,
+    )
+    after = snapshot(git_repo, watched_paths=[protected])
+
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[git_repo],
+        protected_scope=[protected],
+        repo_root=git_repo,
+    )
+
+    assert any("prd.md" in entry for entry in escapes)
+
+
+def test_committed_out_of_scope_change_is_caught(git_repo):
+    allowed = git_repo / "docs" / "features" / "demo" / "active"
+    allowed.mkdir(parents=True)
+    outside = git_repo / "service.py"
+    outside.write_text("original")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo)
+
+    outside.write_text("mutated")
+    subprocess.run(["git", "add", str(outside)], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "agent commit"], cwd=git_repo, check=True,
+    )
+    after = snapshot(git_repo)
+
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[allowed],
+        repo_root=git_repo,
+    )
+
+    assert any("service.py" in entry for entry in escapes)
+
+
+def test_direct_protected_fingerprint_does_not_depend_on_git_status(git_repo):
+    protected = git_repo / "prd.md"
+    protected.write_text("original")
+    subprocess.run(["git", "add", "prd.md"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo, watched_paths=[protected])
+
+    subprocess.run(
+        ["git", "update-index", "--assume-unchanged", "prd.md"],
+        cwd=git_repo,
+        check=True,
+    )
+    protected.write_text("hidden mutation")
+    after = snapshot(git_repo, watched_paths=[protected])
+    assert not any("prd.md" in entry for entry in after.lines())
+
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[git_repo],
+        protected_scope=[protected],
+        repo_root=git_repo,
+    )
+
+    assert any("prd.md" in entry for entry in escapes)
+
+
+def test_index_only_transition_does_not_fake_protected_content_change(git_repo):
+    protected = git_repo / "prd.md"
+    protected.write_text("unchanged")
+    before = snapshot(git_repo, watched_paths=[protected])
+
+    subprocess.run(["git", "add", "prd.md"], cwd=git_repo, check=True)
+    after = snapshot(git_repo, watched_paths=[protected])
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[git_repo],
+        protected_scope=[protected],
+        repo_root=git_repo,
+    )
+
+    assert escapes == []
+
+
+def test_protected_permission_change_is_caught(git_repo):
+    protected = git_repo / "prd.md"
+    protected.write_text("immutable")
+    subprocess.run(["git", "add", "prd.md"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo, watched_paths=[protected])
+
+    protected.chmod(protected.stat().st_mode | 0o111)
+    after = snapshot(git_repo, watched_paths=[protected])
+    escapes = detect_out_of_scope_writes(
+        before,
+        after,
+        allowed_scope=[git_repo],
+        protected_scope=[protected],
+        repo_root=git_repo,
+    )
+
+    assert any("prd.md" in entry for entry in escapes)
+
+
 def test_detect_out_of_scope_write_to_another_active_feature(git_repo):
     feature_active = git_repo / "docs" / "features" / "demo" / "active"
     feature_active.mkdir(parents=True)

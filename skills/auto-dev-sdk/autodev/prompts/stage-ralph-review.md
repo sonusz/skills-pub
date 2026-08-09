@@ -36,6 +36,10 @@ not another LLM. It must be valid JSON, schema below. No prose.
   after the first accepted iteration. This is an immutable on-disk copy
   of the immediately preceding accepted `ralph-review.json`; its content
   is linked, never pasted inline.
+- `WRITABLE_PATHS`: the review target plus `SCRATCH_DIR`; the complete
+  write surface for this reviewer.
+- `PROTECTED_PATHS`: immutable trace and iteration inputs. They remain
+  read-only even if a parent path is writable.
 
 You also have the Read tool for any `Code Path` values the trace
 rows cite, and for any source files you need to verify behaviors.
@@ -134,6 +138,8 @@ also in CONTEXT_ARTIFACTS.
 - `evidence` cites `path:line` or `path:line-range`; must exist
 - `req_id` and `scope_id` must match trace.md content exactly
 - This artifact is overwritten each iteration
+- Stay inside `WRITABLE_PATHS`. Treat every other path as read-only;
+  never chmod, rename, delete, or replace anything in `PROTECTED_PATHS`.
 - Do not modify production code, tests, or add request-ID comments to
   source files. The review's `req_id` + concrete `evidence` path is the
   durable request-to-code mapping; reviewer-authored code changes would

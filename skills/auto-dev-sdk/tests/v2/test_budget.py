@@ -363,7 +363,7 @@ class TestBudgetPoliceSuffix:
         events: list[dict] = []
         suffix = self._resolve(feature_active, log_emit=events.append)
         assert suffix is not None and set(suffix) == {"claude"}
-        assert "BUDGET POLICE" in suffix["claude"]
+        assert "minimality review" in suffix["claude"]
         assert [(e["event"], e["source"]) for e in events] == [
             ("budget-police-selected", "rotation"),
         ]
@@ -458,7 +458,10 @@ class TestPoliceBanner:
                  {"elapsed_sec": 3600.0}),
         ])
         banner = police_banner(feature_active)
-        assert "BUDGET POLICE" in banner
+        assert "minimality review" in banner
         assert "[budget]" in banner
         assert "BUDGET_SPENT" in banner
-        assert "Zero `[budget]` findings is a valid" in banner
+        assert "Zero findings is then the correct report" in banner
+        # Dedicated seat (the sufficiency/minimality dual), not a side duty.
+        assert "this round you do only that" in banner
+        assert "in addition to" not in banner

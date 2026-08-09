@@ -31,6 +31,8 @@ def render_stage_prompt(
     extra_targets: list[Path],
     context_artifacts: list[str] | None = None,
     invocation_bindings: dict[str, str | Path] | None = None,
+    writable_paths: list[Path] | None = None,
+    protected_paths: list[Path] | None = None,
     preseeded: bool = False,
     continuation: bool = False,
 ) -> str:
@@ -73,6 +75,28 @@ def render_stage_prompt(
         f"- PROMPT_FILE: `{prompt_file}`",
         f"- PROMPT_HASH: `{hash_file(prompt_file)}`",
     ]
+
+    # The harness enforces this contract after the subprocess returns. Put
+    # the exact same paths in both initial and continuation prompts so an
+    # agent never has to infer write scope from its cwd or stale session
+    # memory. Files are exact matches; directories include descendants.
+    effective_writable = writable_paths or [
+        primary_target, *extra_targets, feature_active / "scratch",
+    ]
+    effective_protected = protected_paths or []
+    ctx_lines.extend([
+        "- WRITABLE_PATHS:",
+        *[f"  - `{Path(path).resolve()}`" for path in effective_writable],
+        "- PROTECTED_PATHS:",
+        *(
+            [f"  - `{Path(path).resolve()}`" for path in effective_protected]
+            or ["  - `(none beyond paths outside WRITABLE_PATHS)`"]
+        ),
+        "- FILESYSTEM_RULE: Write only inside WRITABLE_PATHS. Everything "
+        "else is read-only for this stage. PROTECTED_PATHS stay read-only "
+        "even when nested under a broader writable directory. Do not chmod, "
+        "chown, remount, rename, delete, or replace a protected path.",
+    ])
 
     # Per-stage upstream artifacts + hashes. Spec is deliberately
     # code-first: it receives only the harness-authored implementation

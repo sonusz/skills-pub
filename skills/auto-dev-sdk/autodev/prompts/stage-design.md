@@ -49,6 +49,10 @@ user wants" (PRD) and "what must be built + how it must be verified"
 - `TARGET_CHANGELOG`: path to write design-changelog.json (same tmp
   pattern). Append-only history of design rounds — see "Maintaining
   design-changelog.json" below.
+- `WRITABLE_PATHS`: exact files/directories this stage may write. The
+  five TARGET paths and `SCRATCH_DIR` are the complete write surface.
+- `PROTECTED_PATHS`: immutable inputs called out explicitly by the
+  harness. They remain read-only even if a broader parent is writable.
 - `DIFF_BASE`: branch or commit to diff against during build
   validation.
 - `CONTEXT_ARTIFACTS`: list of paths to on-disk artifacts relevant to
@@ -637,4 +641,6 @@ Before writing the four `.tmp` files:
 - Exit 0 on success; non-zero on fatal error (failure to read
   PRD, etc.).
 - Stdout: free-form logging. Not parsed by orchestrator.
+- Stay inside `WRITABLE_PATHS`. Treat every other path as read-only;
+  never chmod, rename, delete, or replace anything in `PROTECTED_PATHS`.
 - Never modify the PRD. Never commit or push.

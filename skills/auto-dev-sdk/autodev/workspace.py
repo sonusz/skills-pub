@@ -102,15 +102,25 @@ def _path_fingerprint(repo_root: Path, relative_path: str) -> str:
         return "missing"
     if stat.S_ISLNK(info.st_mode):
         try:
-            return f"symlink:{os.readlink(path)}"
+            return (
+                f"symlink:mode={info.st_mode}:uid={info.st_uid}:gid={info.st_gid}:"
+                f"target={os.readlink(path)}"
+            )
         except OSError:
             return "symlink:unreadable"
     if stat.S_ISREG(info.st_mode):
         try:
-            return hash_file(path)
+            return (
+                f"file:mode={info.st_mode}:uid={info.st_uid}:gid={info.st_gid}:"
+                f"size={info.st_size}:mtime_ns={info.st_mtime_ns}:"
+                f"hash={hash_file(path)}"
+            )
         except OSError:
             return "file:unreadable"
-    return f"mode:{info.st_mode}:size:{info.st_size}:mtime_ns:{info.st_mtime_ns}"
+    return (
+        f"other:mode={info.st_mode}:uid={info.st_uid}:gid={info.st_gid}:"
+        f"size={info.st_size}:mtime_ns={info.st_mtime_ns}"
+    )
 
 
 def _snapshot_fingerprints(repo_root: Path, raw: str) -> dict[str, str]:
@@ -134,6 +144,8 @@ class WorkspaceState:
     is_dirty: bool
     raw: str
     path_fingerprints: dict[str, str] = field(default_factory=dict)
+    head: str | None = None
+    watched_fingerprints: dict[str, str] = field(default_factory=dict)
 
     def lines(self) -> list[str]:
         return [l for l in self.raw.splitlines() if l.strip()]
@@ -175,8 +187,31 @@ def ensure_git_repo(path: Path) -> None:
         )
 
 
-def snapshot(cwd: Path) -> WorkspaceState:
-    """Take a `git status --porcelain` snapshot. is_dirty filters harness-internal."""
+def _repo_relative_key(repo_root: Path, path: Path) -> str:
+    """Return a stable logical key without resolving the final symlink."""
+    root = Path(repo_root).absolute()
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = candidate.absolute()
+    try:
+        return candidate.relative_to(root).as_posix()
+    except ValueError:
+        return str(candidate)
+
+
+def snapshot(
+    cwd: Path,
+    *,
+    watched_paths: list[Path] | None = None,
+) -> WorkspaceState:
+    """Take a git/worktree snapshot, optionally pinning path contents.
+
+    ``git status`` alone cannot see a protected-file edit that an agent
+    commits before returning, and it treats an unchanged untracked file as a
+    change when another command merely stages it. Watched fingerprints are
+    independent of index/HEAD state and close both gaps.
+    """
     if not is_git_repo(cwd):
         return WorkspaceState(is_git=False, is_dirty=False, raw="")
     rc, out = _run_git(
@@ -184,11 +219,20 @@ def snapshot(cwd: Path) -> WorkspaceState:
     )
     if rc != 0:
         raise PreflightError(f"git status failed (rc={rc})")
+    head_rc, head_out = _run_git(["rev-parse", "--verify", "HEAD"], Path(cwd))
+    watched = {
+        _repo_relative_key(Path(cwd), path): _path_fingerprint(
+            Path(cwd), _repo_relative_key(Path(cwd), path),
+        )
+        for path in (watched_paths or [])
+    }
     state = WorkspaceState(
         is_git=True,
         is_dirty=False,
         raw=out,
         path_fingerprints=_snapshot_fingerprints(Path(cwd), out),
+        head=head_out.strip() if head_rc == 0 and head_out.strip() else None,
+        watched_fingerprints=watched,
     )
     state.is_dirty = bool(state.user_visible_lines())
     return state
@@ -209,33 +253,132 @@ def diff_snapshots(before: WorkspaceState, after: WorkspaceState) -> list[str]:
     return sorted(changed)
 
 
+def _committed_path_entries(
+    before: WorkspaceState,
+    after: WorkspaceState,
+    repo_root: Path,
+) -> list[str]:
+    """Return porcelain-shaped entries changed between stage boundary HEADs."""
+    if not before.head or not after.head or before.head == after.head:
+        return []
+    rc, raw = _run_git(
+        [
+            "diff", "--name-status", "-z", "--find-renames",
+            before.head, after.head, "--",
+        ],
+        Path(repo_root),
+    )
+    if rc != 0:
+        raise PreflightError(
+            "failed to compare pre/post-stage Git trees for write containment"
+        )
+    tokens = raw.split("\0")
+    entries: list[str] = []
+    index = 0
+    while index < len(tokens) and tokens[index]:
+        status_code = tokens[index]
+        index += 1
+        if status_code[:1] in {"R", "C"}:
+            if index + 1 >= len(tokens):
+                break
+            old_path, new_path = tokens[index], tokens[index + 1]
+            index += 2
+            entries.append(
+                f"{status_code[:2].ljust(2)} {old_path} -> {new_path}"
+            )
+            continue
+        if index >= len(tokens):
+            break
+        path = tokens[index]
+        index += 1
+        entries.append(f"{status_code[:2].ljust(2)} {path}")
+    return entries
+
+
 def detect_out_of_scope_writes(
     before: WorkspaceState,
     after: WorkspaceState,
     *,
     allowed_scope: list[Path],
     repo_root: Path,
+    protected_scope: list[Path] | None = None,
 ) -> list[str]:
-    """Return porcelain entries whose path isn't under any allowed_scope path.
+    """Return writes outside ``allowed_scope`` or inside ``protected_scope``.
 
-    Harness-internal paths are excluded — they're expected to appear
-    (.lock/, log.jsonl, etc.) and not considered user-visible escapes.
+    Protected paths take precedence over broader allowed paths. This matters
+    for build, whose writable surface is the repository root but whose PRD and
+    accepted design packet remain immutable inputs. Harness-internal paths are
+    otherwise excluded — they're expected to appear (.lock/, log.jsonl, etc.)
+    and are not considered user-visible escapes.
     """
-    new_entries = diff_snapshots(before, after)
+    worktree_entries = set(diff_snapshots(before, after))
+    committed_entries = set(_committed_path_entries(before, after, repo_root))
+    protected_content_entries: set[str] = set()
+    for protected in protected_scope or []:
+        key = _repo_relative_key(repo_root, protected)
+        if (
+            key in before.watched_fingerprints
+            and key in after.watched_fingerprints
+            and before.watched_fingerprints[key]
+            != after.watched_fingerprints[key]
+        ):
+            # Synthetic porcelain-shaped entry: direct protected-path
+            # fingerprints must remain effective even when Git status is
+            # hidden by ignore/assume-unchanged flags.
+            protected_content_entries.add(f"P  {key}")
+    new_entries = sorted(
+        worktree_entries | committed_entries | protected_content_entries
+    )
     escapes: list[str] = []
     allowed_resolved = [Path(p).resolve() for p in allowed_scope]
+    protected_resolved = [Path(p).resolve() for p in (protected_scope or [])]
     for entry in new_entries:
-        if _line_is_harness_internal(entry):
-            continue
         path_strs = _parse_porcelain_paths(entry)
         if not path_strs:
             continue
+        resolved_paths = [
+            (Path(repo_root) / path_str).resolve() for path_str in path_strs
+        ]
+        matching_protected = [
+            protected
+            for path in resolved_paths
+            for protected in protected_resolved
+            if _is_under(path, protected)
+        ]
+        if matching_protected:
+            watched_keys = [
+                _repo_relative_key(repo_root, protected)
+                for protected in matching_protected
+            ]
+            has_direct_baseline = all(
+                key in before.watched_fingerprints
+                and key in after.watched_fingerprints
+                for key in watched_keys
+            )
+            content_changed = any(
+                before.watched_fingerprints.get(key)
+                != after.watched_fingerprints.get(key)
+                for key in watched_keys
+            )
+            # A committed tree change is a mutation even when file bytes are
+            # unchanged (for example, accidentally adding an immutable,
+            # previously-untracked PRD). Without a direct baseline, retain
+            # the conservative legacy status behavior.
+            if (
+                entry in committed_entries
+                or content_changed
+                or not has_direct_baseline
+            ):
+                escapes.append(entry)
+            continue
+        if _line_is_harness_internal(entry):
+            continue
         if any(
             not any(
-                _is_under((Path(repo_root) / path_str).resolve(), allowed)
+                _is_under(path, allowed)
                 for allowed in allowed_resolved
             )
-            for path_str in path_strs
+            for path in resolved_paths
         ):
             escapes.append(entry)
     return escapes

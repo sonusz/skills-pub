@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from autodev.orchestrator import _protect_context_inputs, _stage_write_contract
 from autodev.prompts_loader import render_stage_prompt
 
 
@@ -169,6 +170,101 @@ def test_ralph_review_prompt_links_diff_context_and_previous_output(tmp_path):
     assert '{"classifications":[]}' not in body
 
 
+def test_stage_write_contract_is_stage_specific(tmp_path):
+    active = tmp_path / "docs" / "features" / "t" / "active"
+    active.mkdir(parents=True)
+
+    design_targets = [
+        active / "design.md",
+        active / "scope.json",
+        active / "trace.md",
+        active / "test-plan.md",
+        active / "design-changelog.json",
+    ]
+    writable, protected = _stage_write_contract(
+        repo_root=tmp_path,
+        active=active,
+        stage="design",
+        primary_target=design_targets[0],
+        extra_targets=design_targets[1:],
+    )
+    assert set(writable) == {*design_targets, active / "scratch"}
+    assert active not in writable
+    assert active / "prd.md" in protected
+
+    build_writable, build_protected = _stage_write_contract(
+        repo_root=tmp_path,
+        active=active,
+        stage="build",
+        primary_target=active / "build.json",
+        extra_targets=[],
+    )
+    assert build_writable == [tmp_path]
+    assert active / "prd.md" in build_protected
+    assert active / "design.md" in build_protected
+    assert active / "build.json" not in build_protected
+
+    review_writable, review_protected = _stage_write_contract(
+        repo_root=tmp_path,
+        active=active,
+        stage="ralph-review",
+        primary_target=active / "ralph-review.json",
+        extra_targets=[],
+    )
+    assert review_writable == [active / "ralph-review.json", active / "scratch"]
+    assert active / "trace.md" in review_protected
+
+
+def test_build_context_inputs_are_dynamically_protected(tmp_path):
+    active = tmp_path / "docs" / "features" / "t" / "active"
+    own_output = active / "build.json"
+    close_verdict = active / "panel-close-approval.json"
+    ralph_review = active / "ralph-review.json"
+    ralph_state = active / "ralph-state.json"
+
+    protected = _protect_context_inputs(
+        [active / "prd.md"],
+        context_artifacts=[
+            str(own_output),
+            str(close_verdict),
+            str(ralph_review),
+            str(ralph_state),
+        ],
+        owned_outputs=[own_output],
+    )
+
+    assert own_output not in protected
+    assert close_verdict in protected
+    assert ralph_review in protected
+    assert ralph_state in protected
+
+
+def test_rendered_initial_and_resume_prompts_repeat_write_contract(tmp_path):
+    active = tmp_path / "active"
+    _seed(active)
+    target = active / "build.json"
+    writable = [tmp_path]
+    protected = [active / "prd.md", active / "design.md"]
+
+    for continuation in (False, True):
+        body = render_stage_prompt(
+            stage="build",
+            feature="t",
+            feature_active=active,
+            repo_root=tmp_path,
+            primary_target=target,
+            extra_targets=[],
+            writable_paths=writable,
+            protected_paths=protected,
+            continuation=continuation,
+        )
+        assert "- WRITABLE_PATHS:" in body
+        assert f"  - `{tmp_path.resolve()}`" in body
+        assert "- PROTECTED_PATHS:" in body
+        assert f"  - `{(active / 'prd.md').resolve()}`" in body
+        assert "PROTECTED_PATHS stay read-only" in body
+
+
 def test_design_prompt_body_mentions_prd():
     """Prompt-file body mentions PRD as input (not just context section)."""
     body = (
@@ -177,6 +273,8 @@ def test_design_prompt_body_mentions_prd():
     ).read_text(encoding="utf-8")
     assert "PRD_PATH" in body
     assert "PRD_HASH" in body
+    assert "WRITABLE_PATHS" in body
+    assert "PROTECTED_PATHS" in body
 
 
 def test_build_prompt_body_mentions_prd():
@@ -186,6 +284,8 @@ def test_build_prompt_body_mentions_prd():
     ).read_text(encoding="utf-8")
     assert "PRD_PATH" in body
     assert "PRD_HASH" in body
+    assert "WRITABLE_PATHS" in body
+    assert "PROTECTED_PATHS" in body
     assert "as one work queue" in body
     assert "do not impose an arbitrary one-scope" in body
     assert "do not defer" in body
@@ -206,6 +306,7 @@ def test_build_prompt_body_mentions_prd():
     assert "fully completed context-sized\nobjective" in body
     assert "does not\nrequire the affected scope to reach Fully" in body
     assert "Work outside the objective remains in the queue" in body
+    assert "Never use `git add -A`, `git add .`" in body
 
 
 def test_ralph_prompt_allows_parallel_subagent_review():
@@ -218,3 +319,5 @@ def test_ralph_prompt_allows_parallel_subagent_review():
     assert "one complete" in body
     assert "one subagent review that plan" in body
     assert "Do not stop after planning" in body
+    assert "WRITABLE_PATHS" in body
+    assert "PROTECTED_PATHS" in body

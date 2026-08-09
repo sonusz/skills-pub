@@ -14,8 +14,11 @@ Three responsibilities, all feature-scoped (one active/ dir):
    error degrades to no lines.
 3. **Budget police** (`select_budget_police` / `police_banner`): one
    reviewer per design-review round, chosen by fixed-order rotation over
-   the configured vendors, carries an additional duty: challenge scope
-   items whose cost is disproportionate to the PRD clause they serve.
+   the configured vendors, is REPURPOSED for that round: instead of the
+   standard coverage review, its sole task is challenging scope items
+   whose cost is disproportionate to the PRD clause they serve. A
+   dedicated seat, not a side duty — a gap-finder auditing cost "on the
+   side" spends its context on coverage and produces token deletions.
    Rotation state persists in `budget-police.json`. Selection is keyed
    by the review-round key (design-packet hash) so a resumed round
    re-selects the same vendor; the pointer only advances when a new
@@ -336,27 +339,42 @@ def select_budget_police(
 
 
 def police_banner(feature_active: Path) -> str:
-    """Role addendum appended to the selected reviewer's prompt."""
+    """The minimality-review role body for the selected reviewer.
+
+    This REPLACES the coverage-review body in that vendor's prompt (the
+    runner keeps only the orchestrator context and file manifest from the
+    shared prompt) — a dedicated seat reads no coverage instructions.
+    """
     budget_lines = "\n".join(format_budget_lines(feature_active)) or (
         "- BUDGET_SPENT: no spend recorded yet for this feature."
     )
     return (
-        "\n\n---\n\n## Additional role this round: BUDGET POLICE\n\n"
-        "This round you additionally audit the design packet for cost "
-        "proportionality. The feature's budget account:\n\n"
+        "## Your role this round: minimality review\n\n"
+        "This panel verifies that the design is a correct plan for the "
+        "PRD. A plan can be wrong in two directions: insufficient (a PRD "
+        "clause is satisfied by nothing in the plan) or non-minimal "
+        "(something in the plan is required by no clause, or costs more "
+        "than its clause needs). The other reviewers check sufficiency. "
+        "You check minimality — this round you do only that.\n\n"
+        "An item belongs in the plan iff (a) some PRD clause fails "
+        "without it, and (b) no cheaper mechanism satisfies that clause "
+        "equally. Your proof obligation mirrors the coverage reviewers': "
+        "they must show a clause fails without an addition; you must "
+        "show a clause still holds without an item, or holds with a "
+        "cheaper one. What non-minimality costs here in practice:\n\n"
         f"{budget_lines}\n\n"
-        "Duty (in addition to, not replacing, your normal review):\n\n"
-        "1. Identify scope items or mechanisms whose implementation and "
-        "verification cost is disproportionate to the PRD clause they "
-        "serve. For each, name the clause, show the thinner alternative "
-        "(or deferral to a follow-up feature) that still satisfies the "
-        "clause, and estimate what the current form costs relative to it.\n"
-        "2. Phrase each such point as a normal finding whose summary "
-        "starts with `[budget]`, targeting the scope item id. Use "
-        "severity `opinion` unless the item both endangers the budget "
-        "targets AND has a clause-satisfying thinner alternative — then "
-        "`risk` is warranted.\n"
-        "3. Zero `[budget]` findings is a valid, good outcome — state "
-        "explicitly that the proportionality audit found nothing. Do NOT "
-        "invent deletions to justify the role.\n"
+        "Go through scope.json item by item, with design.md for the "
+        "mechanism and prd.md for the clauses:\n\n"
+        "1. For each item you challenge, name the clause it claims to "
+        "serve, then either show no clause requires it, or name the "
+        "cheaper mechanism (or deferral to a follow-up feature) that "
+        "satisfies the same clause, with a rough cost comparison.\n"
+        "2. Report each as a finding whose summary starts with "
+        "`[budget]`, targeting the scope item id. Severity `opinion`; "
+        "`risk` when the item endangers the budget targets and a "
+        "clause-satisfying cheaper alternative exists. No findings of "
+        "any other kind.\n"
+        "3. A design can already be minimal. Zero findings is then the "
+        "correct report — state it explicitly. Do not manufacture "
+        "cuts.\n"
     )

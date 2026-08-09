@@ -66,14 +66,17 @@ def _write_fake_vendor(path: Path) -> Path:
                 return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
             def bump(active: Path, stage: str) -> int:
-                counter = active / f".{stage}.count"
+                counter = active / "scratch" / f".{stage}.count"
+                counter.parent.mkdir(parents=True, exist_ok=True)
                 n = int(counter.read_text() or "0") if counter.exists() else 0
                 n += 1
                 counter.write_text(str(n), encoding="utf-8")
                 return n
 
             def log_prompt(active: Path, stage: str, n: int, prompt: str) -> None:
-                (active / f".{stage}.{n}.prompt").write_text(prompt, encoding="utf-8")
+                scratch = active / "scratch"
+                scratch.mkdir(parents=True, exist_ok=True)
+                (scratch / f".{stage}.{n}.prompt").write_text(prompt, encoding="utf-8")
 
             def render_ralph_review(statuses: dict[str, str], scope_hash: str) -> str:
                 # v3-core: ralph-review.json (strict JSON schema)
@@ -332,7 +335,7 @@ def _seed_feature(active: Path, *, ids: list[str]) -> None:
 
 
 def _count(active: Path, stage: str) -> int:
-    p = active / f".{stage}.count"
+    p = active / "scratch" / f".{stage}.count"
     return int(p.read_text()) if p.exists() else 0
 
 
@@ -365,7 +368,9 @@ def test_build_loops_until_all_active_items_fully(git_repo, feature_active, monk
     assert (feature_active / "ralph-review.json").exists()
     assert (feature_active / "review.json").read_text(encoding="utf-8") == "close approval decoy\n"
 
-    prompt = (feature_active / ".ralph-review.1.prompt").read_text(encoding="utf-8")
+    prompt = (
+        feature_active / "scratch" / ".ralph-review.1.prompt"
+    ).read_text(encoding="utf-8")
     # v3-core update: ralph-review is context-isolated (trace+code only).
     # No PRD/scope/build.json/spec in its inputs.
     assert "TRACE_PATH:" in prompt
@@ -380,7 +385,7 @@ def test_build_loops_until_all_active_items_fully(git_repo, feature_active, monk
     previous_path = feature_active / "ralph-review.previous.json"
     first_review_prompt = prompt
     second_review_prompt = (
-        feature_active / ".ralph-review.2.prompt"
+        feature_active / "scratch" / ".ralph-review.2.prompt"
     ).read_text(encoding="utf-8")
     assert str(context_path) in first_review_prompt
     assert "- BUILD_BEFORE_REF:" in first_review_prompt
@@ -399,8 +404,12 @@ def test_build_loops_until_all_active_items_fully(git_repo, feature_active, monk
     assert context["previous_ralph_review_path"] == str(previous_path)
     assert context["diff"]["available"] is True
 
-    first_build_prompt = (feature_active / ".build.1.prompt").read_text(encoding="utf-8")
-    second_build_prompt = (feature_active / ".build.2.prompt").read_text(encoding="utf-8")
+    first_build_prompt = (
+        feature_active / "scratch" / ".build.1.prompt"
+    ).read_text(encoding="utf-8")
+    second_build_prompt = (
+        feature_active / "scratch" / ".build.2.prompt"
+    ).read_text(encoding="utf-8")
     assert str(feature_active / "ralph-review.json") not in first_build_prompt
     assert str(feature_active / "ralph-review.json") in second_build_prompt
     assert str(feature_active / "ralph-state.json") in second_build_prompt
@@ -441,7 +450,7 @@ def test_ralph_diff_context_preserves_amended_commit_delta(
     )
     assert "src/amended.py" in patch_result.stdout
     review_prompt = (
-        feature_active / ".ralph-review.1.prompt"
+        feature_active / "scratch" / ".ralph-review.1.prompt"
     ).read_text(encoding="utf-8")
     assert f"- BUILD_BEFORE_REF: `{before}`" in review_prompt
     assert f"- BUILD_AFTER_REF: `{after}`" in review_prompt
@@ -506,7 +515,9 @@ def test_malformed_ralph_review_retries_then_amends_and_succeeds(
 
     # The retry prompt must hand the agent the prior review + the
     # structured rejection so it amends rather than reclassifies blind.
-    retry_prompt = (feature_active / ".ralph-review.2.prompt").read_text(encoding="utf-8")
+    retry_prompt = (
+        feature_active / "scratch" / ".ralph-review.2.prompt"
+    ).read_text(encoding="utf-8")
     assert "CONTEXT_ARTIFACTS" in retry_prompt
     assert str(feature_active / "ralph-review.json") in retry_prompt
     assert str(feature_active / "ralph-review-output-rejection.json") in retry_prompt
@@ -549,7 +560,7 @@ def test_output_retry_keeps_previous_accepted_review_file(
     previous_path = feature_active / "ralph-review.previous.json"
     assert json.loads(previous_path.read_text(encoding="utf-8")) == prior
     retry_prompt = (
-        feature_active / ".ralph-review.2.prompt"
+        feature_active / "scratch" / ".ralph-review.2.prompt"
     ).read_text(encoding="utf-8")
     assert f"- PREVIOUS_RALPH_REVIEW_PATH: `{previous_path}`" in retry_prompt
     assert str(feature_active / "ralph-review-output-rejection.json") in retry_prompt

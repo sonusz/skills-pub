@@ -196,7 +196,8 @@ EOF
     tgt_trace="${AUTODEV_FAKE_TARGET_TRACE:?need trace target}"
     tgt_tp="${AUTODEV_FAKE_TARGET_TEST_PLAN:?need test-plan target}"
     tgt_changelog="${AUTODEV_FAKE_TARGET_CHANGELOG:-$(dirname "$tgt_design")/design-changelog.json}"
-    cnt="$(dirname "$tgt_design")/.fake.design.attempt"
+    cnt="$(dirname "$tgt_design")/scratch/.fake.design.attempt"
+    mkdir -p "$(dirname "$cnt")"
     n=0; [ -f "$cnt" ] && n=$(cat "$cnt"); n=$((n + 1)); echo "$n" > "$cnt"
     cat > "${tgt_design}.tmp" <<EOF
 <!-- source: $src_path -->

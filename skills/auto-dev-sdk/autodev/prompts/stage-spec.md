@@ -11,6 +11,10 @@ You run after build. Production code and test evidence exist.
 - `FEATURE`
 - `TARGET_SPEC`: path to write `implemented-spec.md` (writes .tmp)
 - `TARGET_README`: path to write README.md for the feature folder (.tmp)
+- `WRITABLE_PATHS`: the feature output directory used for the two
+  targets and optional implemented-spec envelope files.
+- `PROTECTED_PATHS`: immutable implementation-index and intent/dev
+  artifacts. They remain read-only inside the writable feature folder.
 
 ## Isolation contract
 
@@ -160,5 +164,7 @@ Before writing `<TARGET_SPEC>.tmp`:
 - If envelope mode: sub-files at
   `<feature-root>/implemented-spec-<n>-<topic>.md.tmp`.
 - Exit 0 on success.
+- Stay inside `WRITABLE_PATHS`; never chmod, rename, delete, or replace
+  anything in `PROTECTED_PATHS`.
 - Never modify PRD, design artifacts, scope, trace, test plan, build.json,
   or implementation-index.json.

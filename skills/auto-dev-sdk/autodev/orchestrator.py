@@ -114,6 +114,99 @@ CODING_STAGE_ARTIFACT = {
     "spec": "implemented-spec.md",
 }
 
+# Semantic inputs that remain immutable while a stage runs. The write
+# allowlist catches everything outside a narrow stage workspace; this second
+# list matters for stages with a deliberately broad writable directory (build
+# needs the repository, spec may emit implemented-spec envelope files).
+_STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
+    "design": (
+        "prd.md",
+        "panel-design-review.json",
+        "panel-trace-review.json",
+        "panel-close-approval.json",
+        "build.json",
+    ),
+    "build": (
+        "prd.md",
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "design-changelog.json",
+        "design-packet.json",
+        "accepted-design.json",
+        "panel-design-review.json",
+        "panel-trace-review.json",
+    ),
+    "ralph-review": (
+        "trace.md",
+        "ralph-iteration-context.json",
+        "ralph-review.previous.json",
+    ),
+    "spec": (
+        "implementation-index.json",
+        "prd.md",
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "build.json",
+    ),
+}
+
+
+def _stage_write_contract(
+    *,
+    repo_root: Path,
+    active: Path,
+    stage: str,
+    primary_target: Path,
+    extra_targets: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    """Return the writable and protected paths shown to and enforced on a stage.
+
+    Design and Ralph have fixed output sets, so grant only their concrete
+    targets plus scratch. Build must discover and change product files, so it
+    gets the repository with its reviewed inputs carved out as protected.
+    Spec may create optional ``implemented-spec-*.md`` envelope files, so it
+    gets the feature directory with its intent/evidence inputs protected.
+    """
+    owned = [primary_target, *extra_targets]
+    scratch = active / "scratch"
+    if stage == "build":
+        writable = [repo_root]
+    elif stage == "spec":
+        writable = [active]
+    else:
+        writable = [*owned, scratch]
+
+    owned_resolved = {path.resolve() for path in owned}
+    protected = [
+        active / name
+        for name in _STAGE_PROTECTED_NAMES.get(stage, ())
+        if (active / name).resolve() not in owned_resolved
+    ]
+    return writable, protected
+
+
+def _protect_context_inputs(
+    protected: list[Path],
+    *,
+    context_artifacts: list[str],
+    owned_outputs: list[Path],
+) -> list[Path]:
+    """Add every concrete context input while keeping owned outputs writable."""
+    owned = {path.resolve() for path in owned_outputs}
+    merged: list[Path] = []
+    seen: set[Path] = set()
+    for path in [*protected, *(Path(raw) for raw in context_artifacts)]:
+        resolved = path.resolve()
+        if resolved in owned or resolved in seen:
+            continue
+        seen.add(resolved)
+        merged.append(path)
+    return merged
+
 
 @dataclass
 class OrchestratorConfig:
@@ -825,12 +918,15 @@ class Orchestrator:
         extra_targets = [active / n for n in extra_names]
         stage_spec = self.cfg.vendors.resolve(stage)
 
-        # Determine allowed write paths (harness-owned; see R2a).
-        # scope/plan/spec/review → feature-root only.
-        # build → feature-root + repo src subtree (v2 default = whole repo root).
-        allowed_write_paths = [active]
-        if stage == "build":
-            allowed_write_paths.append(self.cfg.repo_root)
+        # One harness-owned contract drives both the prompt and the post-stage
+        # drift check. Agents no longer have to infer write scope from cwd.
+        allowed_write_paths, protected_write_paths = _stage_write_contract(
+            repo_root=self.cfg.repo_root,
+            active=active,
+            stage=stage,
+            primary_target=primary_target,
+            extra_targets=extra_targets,
+        )
 
         # On a design rerun the prior package is on disk; pre-fill the
         # subagent's .tmp working copies (see _run_stage_subprocess_checked)
@@ -862,6 +958,8 @@ class Orchestrator:
                 primary_target=primary_target,
                 extra_targets=extra_targets,
                 context_artifacts=merged,
+                writable_paths=allowed_write_paths,
+                protected_paths=protected_write_paths,
                 preseeded=preseeded,
                 continuation=continuation,
             )
@@ -882,6 +980,7 @@ class Orchestrator:
                 primary_target=primary_target,
                 extra_targets=extra_targets,
                 allowed_write_paths=allowed_write_paths,
+                protected_write_paths=protected_write_paths,
             )
             archive_path = None
             if stage == "design":
@@ -904,6 +1003,7 @@ class Orchestrator:
             stage_spec=stage_spec,
             primary_target=primary_target,
             allowed_write_paths=allowed_write_paths,
+            protected_write_paths=protected_write_paths,
         )
 
     def _context_artifacts_for_stage(
@@ -1034,6 +1134,7 @@ class Orchestrator:
         extra_targets: list[Path],
         allowed_write_paths: list[Path],
         pre_snap,
+        protected_write_paths: list[Path] | None = None,
     ):
         from autodev.artifacts.failure import FailureReport, write_failure
         from autodev.vendors.subprocess_runner import run_stage_subprocess
@@ -1130,16 +1231,23 @@ class Orchestrator:
                     f"(cascade would loop forever)",
                 )
 
-        post_snap = snapshot(self.cfg.repo_root)
+        post_snap = snapshot(
+            self.cfg.repo_root,
+            watched_paths=protected_write_paths,
+        )
         escapes = detect_out_of_scope_writes(
             pre_snap, post_snap,
             allowed_scope=allowed_write_paths,
             repo_root=self.cfg.repo_root,
+            protected_scope=protected_write_paths,
         )
         if escapes:
             fr = FailureReport(
                 stage=stage, kind="detected_out_of_scope_write",
-                detail=f"{len(escapes)} file(s) touched outside allowed paths: {escapes[:5]}",
+                detail=(
+                    f"{len(escapes)} file(s) touched outside writable paths "
+                    f"or inside protected paths: {escapes[:5]}"
+                ),
                 subprocess_exit=result.exit_code,
                 stderr_tail="",
                 ts=datetime.now(timezone.utc).isoformat(),
@@ -1147,7 +1255,7 @@ class Orchestrator:
             )
             write_failure(active / f"{stage}-failure.json", fr)
             raise PreflightError(
-                f"stage {stage} wrote outside allowed scope: {escapes}"
+                f"stage {stage} violated its write contract: {escapes}"
             )
         return result
 
@@ -1163,6 +1271,7 @@ class Orchestrator:
         primary_target: Path,
         extra_targets: list[Path],
         allowed_write_paths: list[Path],
+        protected_write_paths: list[Path] | None = None,
     ):
         """Dispatch a coding stage, retrying on a deficient deliverable.
 
@@ -1201,7 +1310,10 @@ class Orchestrator:
                 extra_context.append(str(feedback_path))
             prompt = render_prompt(extra_context)
             resume_prompt = render_prompt(extra_context, True)
-            pre_snap = snapshot(self.cfg.repo_root)
+            pre_snap = snapshot(
+                self.cfg.repo_root,
+                watched_paths=protected_write_paths,
+            )
             try:
                 result = self._run_stage_subprocess_checked(
                     feature=feature,
@@ -1215,6 +1327,7 @@ class Orchestrator:
                     extra_targets=extra_targets,
                     allowed_write_paths=allowed_write_paths,
                     pre_snap=pre_snap,
+                    protected_write_paths=protected_write_paths,
                 )
                 # Success — drop any rejection note from earlier attempts so
                 # a later dispatch does not mistake it for live feedback.
@@ -1449,6 +1562,7 @@ class Orchestrator:
         stage_spec,
         primary_target: Path,
         allowed_write_paths: list[Path],
+        protected_write_paths: list[Path] | None = None,
     ) -> AdvanceResult:
         self._reset_ralph_state_if_inputs_changed(active, logger, feature)
         while True:
@@ -1467,6 +1581,14 @@ class Orchestrator:
 
             ralph_context_path = self._prepare_ralph_iteration_context(active)
 
+            build_context = self._context_artifacts_for_stage(
+                active, "build", primary_target, [],
+            )
+            iteration_protected = _protect_context_inputs(
+                protected_write_paths or [],
+                context_artifacts=build_context,
+                owned_outputs=[primary_target],
+            )
             prompt = render_stage_prompt(
                 stage="build",
                 feature=feature,
@@ -1474,9 +1596,9 @@ class Orchestrator:
                 repo_root=self.cfg.repo_root,
                 primary_target=primary_target,
                 extra_targets=[],
-                context_artifacts=self._context_artifacts_for_stage(
-                    active, "build", primary_target, [],
-                ),
+                context_artifacts=build_context,
+                writable_paths=allowed_write_paths,
+                protected_paths=iteration_protected,
             )
             resume_prompt = render_stage_prompt(
                 stage="build",
@@ -1485,12 +1607,15 @@ class Orchestrator:
                 repo_root=self.cfg.repo_root,
                 primary_target=primary_target,
                 extra_targets=[],
-                context_artifacts=self._context_artifacts_for_stage(
-                    active, "build", primary_target, [],
-                ),
+                context_artifacts=build_context,
+                writable_paths=allowed_write_paths,
+                protected_paths=iteration_protected,
                 continuation=True,
             )
-            pre_snap = snapshot(self.cfg.repo_root)
+            pre_snap = snapshot(
+                self.cfg.repo_root,
+                watched_paths=iteration_protected,
+            )
             result = self._run_stage_subprocess_checked(
                 feature=feature,
                 active=active,
@@ -1503,6 +1628,7 @@ class Orchestrator:
                 extra_targets=[],
                 allowed_write_paths=allowed_write_paths,
                 pre_snap=pre_snap,
+                protected_write_paths=iteration_protected,
             )
             # Stamp current git HEAD into build.json. Without this, a
             # rerun whose LLM-produced build.json is byte-identical to
@@ -1576,6 +1702,13 @@ class Orchestrator:
 
         review_target = active / "ralph-review.json"
         review_spec = self.cfg.vendors.resolve("review")
+        review_writable, review_protected = _stage_write_contract(
+            repo_root=self.cfg.repo_root,
+            active=active,
+            stage="ralph-review",
+            primary_target=review_target,
+            extra_targets=[],
+        )
         active_ids = ralph.active_scope_ids(active / "scope.json")
         feedback_path = active / "ralph-review-output-rejection.json"
         # A fresh iteration's first pass is not an amendment.
@@ -1611,6 +1744,8 @@ class Orchestrator:
                 extra_targets=[],
                 context_artifacts=context_artifacts or None,
                 invocation_bindings=invocation_bindings,
+                writable_paths=review_writable,
+                protected_paths=review_protected,
             )
             resume_prompt = render_stage_prompt(
                 stage="ralph-review",
@@ -1621,6 +1756,8 @@ class Orchestrator:
                 extra_targets=[],
                 context_artifacts=context_artifacts or None,
                 invocation_bindings=invocation_bindings,
+                writable_paths=review_writable,
+                protected_paths=review_protected,
                 continuation=True,
             )
             result = self._run_stage_subprocess_checked(
@@ -1633,8 +1770,12 @@ class Orchestrator:
                 resume_prompt=resume_prompt,
                 primary_target=review_target,
                 extra_targets=[],
-                allowed_write_paths=[active],
-                pre_snap=snapshot(self.cfg.repo_root),
+                allowed_write_paths=review_writable,
+                pre_snap=snapshot(
+                    self.cfg.repo_root,
+                    watched_paths=review_protected,
+                ),
+                protected_write_paths=review_protected,
             )
             logger.emit(stage="ralph-review", event="stage-complete", feature=feature,
                         detail={"artifact": str(review_target),

@@ -1075,7 +1075,11 @@ def _budget_police_suffix(
     gate_label: str,
     log_emit: Callable[[dict], None] | None,
 ) -> dict[str, str] | None:
-    """Resolve this round's budget-police assignment (prompt suffix).
+    """Resolve this round's budget-police assignment.
+
+    Returns ``{vendor: minimality-role body}`` or None. The caller turns
+    it into that vendor's dedicated prompt (role body + shared context),
+    replacing the coverage prompt entirely.
 
     The rotation state file (budget-police.json) is the single source of
     truth: a round-key match resumes the same vendor with its frozen
@@ -1163,21 +1167,22 @@ def _dispatch_reviewer_slots(
     vendor_cwd: Path,
     probe_config: ProbeConfig | None,
     log_emit: Callable[[dict], None] | None,
-    per_vendor_prompt_suffix: dict[str, str] | None = None,
+    per_vendor_prompts: dict[str, tuple[str, str]] | None = None,
 ) -> None:
     """Dispatch unsettled slots in parallel; each slot owns its retry.
 
-    ``per_vendor_prompt_suffix`` appends a role addendum (e.g. the
-    budget-police banner) to one vendor's prompt AND resume prompt. It is
-    deliberately excluded from the reviewer-cache metadata hash: the
-    round's cache identity is the shared base prompt, and police
-    selection is round-key-stable, so a resumed round re-issues the same
-    per-vendor role.
+    ``per_vendor_prompts`` maps a vendor to its own ``(prompt,
+    resume_prompt)`` pair, REPLACING the shared prompts for that vendor
+    (the budget-police seat gets a dedicated minimality-review prompt,
+    not the coverage prompt plus an addendum). It is deliberately
+    excluded from the reviewer-cache metadata hash: the round's cache
+    identity is the shared base prompt, and police selection is
+    round-key-stable, so a resumed round re-issues the same role.
     """
     to_run = _missing_reviewers(panel_config.reviewers, reviewer_results)
     if not to_run:
         return
-    suffixes = per_vendor_prompt_suffix or {}
+    overrides = per_vendor_prompts or {}
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=max(len(to_run), 1),
         thread_name_prefix=f"panel-{gate_label}",
@@ -1186,7 +1191,7 @@ def _dispatch_reviewer_slots(
             pool.submit(
                 _invoke_reviewer_with_retry,
                 spec,
-                reviewer_prompt + suffixes.get(spec.vendor, ""),
+                overrides.get(spec.vendor, (reviewer_prompt, ""))[0],
                 panel_config.reviewer_probe_interval_sec,
                 prior_failure=prior_failures.get(spec.vendor),
                 cwd=vendor_cwd,
@@ -1199,9 +1204,9 @@ def _dispatch_reviewer_slots(
                     reviewer_specs=panel_config.reviewers,
                     spec=spec,
                 ),
-                resume_prompt=(
-                    reviewer_resume_prompt + suffixes.get(spec.vendor, "")
-                ),
+                resume_prompt=overrides.get(
+                    spec.vendor, ("", reviewer_resume_prompt),
+                )[1],
             )
             for spec in to_run
         ]
@@ -2001,14 +2006,17 @@ def _run_one_group_pipeline(
         metadata=metadata,
     )
 
-    # Budget-police seat: one design-review reviewer per round carries a
-    # proportionality-audit addendum. The trace-review group and the
-    # close-approval gate are untouched — scope proportionality is judged
-    # where scope.json is on the review surface.
-    per_vendor_suffix: dict[str, str] | None = None
+    # Budget-police seat: one design-review reviewer per round is
+    # repurposed as the minimality reviewer. Its prompt keeps the shared
+    # orchestrator context + file manifest but replaces the coverage
+    # review body with the minimality role — a dedicated seat, not a
+    # side duty. The trace-review group and the close-approval gate are
+    # untouched — scope proportionality is judged where scope.json is on
+    # the review surface.
+    per_vendor_prompts: dict[str, tuple[str, str]] | None = None
     if group_spec["name"] == "design-review":
         round_key = str(metadata["source_hash"])
-        per_vendor_suffix = _budget_police_suffix(
+        assignment = _budget_police_suffix(
             feature_active=feature_active,
             panel_config=cfg,
             reviewer_results=reviewer_results,
@@ -2016,6 +2024,22 @@ def _run_one_group_pipeline(
             gate_label=group_spec["name"],
             log_emit=log_emit,
         )
+        if assignment:
+            (police_vendor, police_body), = assignment.items()
+            marker = "\n\n---\n\n## Orchestrator context"
+            base = group_spec["reviewer_prompt"]
+            cut = base.find(marker)
+            context_part = base[cut:] if cut >= 0 else ""
+            # Initial prompt: minimality body + shared context/manifest.
+            # Resume prompt: the role-agnostic continuation preamble
+            # ("keep the role established by the initial turn") plus the
+            # frozen banner, so the resumed session re-sees the same
+            # account it was dispatched with.
+            per_vendor_prompts = {police_vendor: (
+                police_body + context_part,
+                group_spec["reviewer_resume_prompt"]
+                + "\n\n---\n\n" + police_body,
+            )}
         if log_emit is not None and _missing_reviewers(
             cfg.reviewers, reviewer_results,
         ):
@@ -2044,7 +2068,7 @@ def _run_one_group_pipeline(
         vendor_cwd=vendor_cwd,
         probe_config=probe_config,
         log_emit=log_emit,
-        per_vendor_prompt_suffix=per_vendor_suffix,
+        per_vendor_prompts=per_vendor_prompts,
     )
 
     # Sort by configured vendor order for stable audit output.

@@ -126,9 +126,11 @@ complete.
   commands for hypothesis / signal / strategy, that's a scope
   gap — write a blocking deviation, do NOT invent the commands
   on top of an unsanctioned scope.
-- `ALLOWED_WRITE_PATHS`: comma-separated list of paths you may write.
-  feature-root is always allowed; `implement` stage also gets a
-  repo-src subtree. Writing outside these paths fails the stage.
+- `WRITABLE_PATHS`: exact files/directories this stage may write.
+- `PROTECTED_PATHS`: immutable PRD and accepted-design inputs. These
+  remain read-only even when nested under the writable repo root.
+  Writing outside `WRITABLE_PATHS` or touching `PROTECTED_PATHS` fails
+  the stage.
 
 ## Task
 
@@ -221,14 +223,19 @@ complete.
 
 ## Discipline
 
-- Stay inside `ALLOWED_WRITE_PATHS`. Writing outside fails the stage
-  via orchestrator's post-stage `git status` drift detection.
+- Stay inside `WRITABLE_PATHS` and never chmod, rename, delete, or
+  replace anything in `PROTECTED_PATHS`. Violations fail the stage via
+  orchestrator's post-stage `git status` drift detection.
 - Never modify PRD, scope.json, trace.md, test-plan.md.
 - **Commit strategy (phase-5 / g-22 squash-as-you-go)**: after each
-  scope item lands green, commit WIP. First completed item in this
-  session → `git commit -m "WIP: <feature> iter N"`. Each subsequent
-  item in the SAME session → `git add -A && git commit --amend
-  --no-edit` (fold into the per-session WIP commit; atomic at git
+  scope item lands green, stage only the production/test files changed
+  for this iteration, using an explicit path list (`git add -- path1
+  path2 ...`). Never use `git add -A`, `git add .`, or stage any
+  `PROTECTED_PATHS`, harness artifacts, or pre-existing user changes.
+  First completed item in this session → `git commit -m "WIP:
+  <feature> iter N"`. Each subsequent item in the SAME session → stage
+  that item's explicit files and `git commit --amend --no-edit` (fold
+  into the per-session WIP commit; atomic at git
   ref level so a mid-amend subprocess kill leaves either the old or
   new commit, never partial). Do NOT push. Do NOT amend a prior
   session's commit. N = ralph iteration count, available from the
