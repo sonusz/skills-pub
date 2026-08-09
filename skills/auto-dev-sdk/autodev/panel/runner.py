@@ -383,18 +383,12 @@ def _load_reviewer_cache(
     gate_label: str,
     reviewer_specs: tuple[PanelReviewerSpec, ...],
     metadata: dict,
-) -> tuple[list[ReviewerResult], dict[str, dict], dict]:
+) -> tuple[list[ReviewerResult], dict[str, dict]]:
     """Load reusable successful reviewer slots for this exact panel input.
 
     Failures and quota skips remain audit-only and are retried on the next run.
     In particular, a quota skip cannot stay settled after ``quota-resume`` has
     confirmed recovery.
-
-    The third element carries round-scoped extras from a matching cache —
-    the ``quota_skipped`` audit map and the pinned ``budget_police``
-    assignment — so the budget-police seat can honor a prior selection and
-    pass over vendors that already quota-skipped this round. Empty when no
-    cache matches.
     """
     path = _reviewer_cache_path(feature_active, gate_label)
     payload: dict = {}
@@ -411,13 +405,7 @@ def _load_reviewer_cache(
             metadata=metadata,
         )
     if not payload or not _cache_matches(payload, metadata):
-        return [], {}, {}
-
-    extras: dict = {}
-    for key in ("quota_skipped", "budget_police"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            extras[key] = value
+        return [], {}
 
     specs_by_vendor = {spec.vendor: spec for spec in reviewer_specs}
     results: list[ReviewerResult] = []
@@ -445,7 +433,7 @@ def _load_reviewer_cache(
             )
 
     failures = payload.get("failures", {})
-    return results, failures if isinstance(failures, dict) else {}, extras
+    return results, failures if isinstance(failures, dict) else {}
 
 
 def _legacy_cache_payload_from_verdict(
@@ -510,7 +498,6 @@ def _write_reviewer_cache(
     metadata: dict,
     reviewer_results: list[ReviewerResult],
     prior_failures: dict[str, dict],
-    budget_police: dict | None = None,
 ) -> None:
     specs_by_vendor = {spec.vendor: spec for spec in reviewer_specs}
     reviewers: dict[str, dict] = {}
@@ -559,20 +546,14 @@ def _write_reviewer_cache(
             and vendor not in quota_skipped
         ):
             failures[vendor] = failure
-    payload = {
-        **metadata,
-        "reviewers": reviewers,
-        "quota_skipped": quota_skipped,
-        "failures": failures,
-    }
-    if budget_police is not None:
-        # Pin the round's budget-police assignment inside the cache itself:
-        # cache identity and role assignment must not diverge if the
-        # separately mutable budget-police.json is lost mid-round.
-        payload["budget_police"] = budget_police
     atomic_write_json(
         _reviewer_cache_path(feature_active, gate_label),
-        payload,
+        {
+            **metadata,
+            "reviewers": reviewers,
+            "quota_skipped": quota_skipped,
+            "failures": failures,
+        },
     )
 
 
@@ -1090,39 +1071,21 @@ def _budget_police_suffix(
     feature_active: Path,
     panel_config: PanelConfig,
     reviewer_results: list[ReviewerResult],
-    cache_extras: dict,
     round_key: str,
     gate_label: str,
     log_emit: Callable[[dict], None] | None,
-) -> tuple[dict[str, str] | None, dict | None]:
-    """Resolve this round's budget-police assignment.
+) -> dict[str, str] | None:
+    """Resolve this round's budget-police assignment (prompt suffix).
 
-    Returns ``(per_vendor_prompt_suffix, police_record)``. The record is
-    persisted into the reviewer cache so the assignment survives loss of
-    the rotation-state file mid-round.
-
-    Rules, in order:
-    - A pin stored in this round's reviewer cache wins outright. If the
-      pinned vendor still has an unsettled slot AND has not positively
-      quota-skipped this round, it gets the pinned banner again; otherwise
-      the seat stays spent — nothing is re-sent, the role is never handed
-      to another vendor mid-round.
-    - Otherwise select by fixed-order rotation, passing over vendors that
-      cannot receive the banner this dispatch: already-settled slots,
-      vendors the current cache shows quota-skipped, and vendors the
-      PREVIOUS round's cache shows quota-skipped (advisory cross-round
-      outage signal — a fresh round has no matching cache of its own).
-    - The banner text is frozen into both the pin record and the rotation
-      state so every dispatch attempt of a round — including resumes
-      after the harness's own taint recovery deleted the reviewer
-      cache — shows the reviewer session the same budget account.
-    - The banner is built BEFORE the selection persists the advanced
-      rotation pointer, so a banner failure cannot consume a turn; the
-      audit log_emit is fail-soft and fires whenever a banner is actually
-      attached to a dispatched slot, with a source of `rotation`,
-      `state-pin`, or `cache-pin` naming which mechanism assigned it.
-    - Any unexpected failure degrades to "no police this round" — the
-      panel itself must never be blocked by the budget seat.
+    The rotation state file (budget-police.json) is the single source of
+    truth: a round-key match resumes the same vendor with its frozen
+    banner; a new round selects by fixed-order rotation, passing over
+    vendors with settled slots and vendors the last written reviewer
+    cache shows quota-skipped. The banner is built before the rotation
+    pointer persists, and log_emit is fail-soft. Any unexpected failure
+    degrades to "no police this round" — the panel itself must never be
+    blocked by the budget seat. This harness runs supervised in a trusted
+    environment; the seat mechanism does not defend its own state files.
     """
     try:
         from autodev.budget import police_banner, select_budget_police
@@ -1132,54 +1095,11 @@ def _budget_police_suffix(
             spec.vendor
             for spec in _missing_reviewers(panel_config.reviewers, reviewer_results)
         }
-        cached_skips = set((cache_extras.get("quota_skipped") or {}).keys())
-
-        def _emit_selected(vendor: str, source: str) -> None:
-            if log_emit is None:
-                return
-            try:
-                log_emit({
-                    "event": "budget-police-selected",
-                    "stage": "gate",
-                    "gate": gate_label,
-                    "vendor": vendor,
-                    "source": source,
-                })
-            except Exception:
-                pass
-
-        pin = cache_extras.get("budget_police") or {}
-        if pin.get("round_key") == round_key and isinstance(pin.get("vendor"), str):
-            vendor = pin["vendor"]
-            eligible = (
-                vendor in to_run
-                and vendor in ordered
-                and vendor not in cached_skips
-            )
-            banner = pin.get("banner")
-            if not isinstance(banner, str) or not banner:
-                # Full-log read; only pay for it when the banner will
-                # actually be dispatched.
-                banner = police_banner(feature_active) if eligible else None
-            record = {
-                "vendor": vendor, "round_key": round_key, "banner": banner,
-            }
-            if eligible:
-                _emit_selected(vendor, "cache-pin")
-                return {vendor: banner}, record
-            return None, record
-
-        # No cache pin. Cross-round outage knowledge: a fresh round's cache
-        # never matches its metadata yet, so cache_extras is empty exactly
-        # when a sustained quota outage matters most. Peek the previous
-        # round's raw cache for its quota_skipped map as advisory
-        # unavailability — stale by at most one round, and fairness
-        # restores on the next rotation cycle.
-        stale_skips = _peek_prior_quota_skips(feature_active, gate_label)
-        unavailable = (set(ordered) - to_run) | cached_skips | stale_skips
+        skips = _peek_prior_quota_skips(feature_active, gate_label)
+        unavailable = (set(ordered) - to_run) | skips
         if not (set(ordered) - unavailable):
             # Nobody can carry the seat; skip the banner build entirely.
-            return None, None
+            return None
         selection = select_budget_police(
             feature_active,
             ordered,
@@ -1188,28 +1108,28 @@ def _budget_police_suffix(
             banner_factory=lambda: police_banner(feature_active),
         )
         if selection is None:
-            return None, None
-        banner = selection.banner
-        if not banner and selection.vendor in to_run:
-            # Rotation-state pin from before banners were frozen; build
-            # once so the record carries it from here on.
-            banner = police_banner(feature_active)
-        record = {
-            "vendor": selection.vendor,
-            "round_key": round_key,
-            "banner": banner,
-        }
-        if selection.vendor not in to_run or not banner:
-            # Rotation-state pin resumed onto a settled vendor; its turn is
-            # already spent — do not re-log or hand the role elsewhere.
-            return None, record
-        _emit_selected(
-            selection.vendor,
-            "rotation" if selection.newly_selected else "state-pin",
-        )
-        return {selection.vendor: banner}, record
+            return None
+        if selection.vendor not in to_run or selection.vendor in skips:
+            # Resumed onto a vendor whose slot is settled or quota-dead;
+            # its turn is already spent — the role never moves mid-round.
+            return None
+        banner = selection.banner or police_banner(feature_active)
+        if log_emit is not None:
+            try:
+                log_emit({
+                    "event": "budget-police-selected",
+                    "stage": "gate",
+                    "gate": gate_label,
+                    "vendor": selection.vendor,
+                    "source": (
+                        "rotation" if selection.newly_selected else "state-pin"
+                    ),
+                })
+            except Exception:
+                pass
+        return {selection.vendor: banner}
     except Exception:
-        return None, None
+        return None
 
 
 def _peek_prior_quota_skips(feature_active: Path, gate_label: str) -> set[str]:
@@ -2074,7 +1994,7 @@ def _run_one_group_pipeline(
         reviewer_prompt=group_spec["reviewer_prompt"],
         consulted_docs=group_spec["consulted_docs"],
     )
-    reviewer_results, prior_failures, cache_extras = _load_reviewer_cache(
+    reviewer_results, prior_failures = _load_reviewer_cache(
         feature_active=feature_active,
         gate_label=group_spec["name"],
         reviewer_specs=cfg.reviewers,
@@ -2086,27 +2006,16 @@ def _run_one_group_pipeline(
     # close-approval gate are untouched — scope proportionality is judged
     # where scope.json is on the review surface.
     per_vendor_suffix: dict[str, str] | None = None
-    police_record: dict | None = None
     if group_spec["name"] == "design-review":
-        # round_key MUST be the hash already pinned into the cache
-        # metadata — a second hash_file read could diverge if the packet
-        # is rewritten in between, silently defeating pin precedence.
         round_key = str(metadata["source_hash"])
-        per_vendor_suffix, police_record = _budget_police_suffix(
+        per_vendor_suffix = _budget_police_suffix(
             feature_active=feature_active,
             panel_config=cfg,
             reviewer_results=reviewer_results,
-            cache_extras=cache_extras,
             round_key=round_key,
             gate_label=group_spec["name"],
             log_emit=log_emit,
         )
-        if police_record is None:
-            # A failed derivation must not erase a pin the cache already
-            # carries — the pin exists precisely to survive state loss.
-            prior_pin = cache_extras.get("budget_police")
-            if isinstance(prior_pin, dict):
-                police_record = prior_pin
         if log_emit is not None and _missing_reviewers(
             cfg.reviewers, reviewer_results,
         ):
@@ -2152,7 +2061,6 @@ def _run_one_group_pipeline(
         metadata=metadata,
         reviewer_results=reviewer_results,
         prior_failures=prior_failures,
-        budget_police=police_record,
     )
     _require_panel_quorum(
         gate_label=group_spec["name"],
@@ -2349,7 +2257,7 @@ def run_panel_gate_internal(
         reviewer_prompt=reviewer_prompt,
         consulted_docs=consulted_docs,
     )
-    reviewer_results, prior_failures, _cache_extras = _load_reviewer_cache(
+    reviewer_results, prior_failures = _load_reviewer_cache(
         feature_active=feature_active,
         gate_label=gate,
         reviewer_specs=cfg.reviewers,

@@ -310,7 +310,7 @@ class TestPoliceRotation:
 
 
 class TestBudgetPoliceSuffix:
-    """Runner-side seat resolution: pin precedence, eligibility, audit."""
+    """Runner-side seat resolution: rotation, resume, eligibility, audit."""
 
     @staticmethod
     def _config() -> "PanelConfig":
@@ -334,13 +334,22 @@ class TestBudgetPoliceSuffix:
             elapsed_sec=1.0,
         )
 
+    @staticmethod
+    def _write_raw_cache(feature_active: Path, quota_skipped: list[str]) -> None:
+        (feature_active / "panel-design-review.reviewers.json").write_text(
+            json.dumps({
+                "gate": "design-review",
+                "quota_skipped": {v: {"vendor": v} for v in quota_skipped},
+            }),
+            encoding="utf-8",
+        )
+
     def _resolve(self, feature_active: Path, **kwargs):
         from autodev.panel.runner import _budget_police_suffix
         defaults = dict(
             feature_active=feature_active,
             panel_config=self._config(),
             reviewer_results=[],
-            cache_extras={},
             round_key="rk-1",
             gate_label="design-review",
             log_emit=None,
@@ -348,102 +357,77 @@ class TestBudgetPoliceSuffix:
         defaults.update(kwargs)
         return _budget_police_suffix(**defaults)
 
-    def test_fresh_round_banners_first_vendor_and_records_pin(
+    def test_fresh_round_banners_first_vendor(
         self, feature_active: Path,
     ) -> None:
         events: list[dict] = []
-        suffix, record = self._resolve(
-            feature_active, log_emit=events.append,
-        )
+        suffix = self._resolve(feature_active, log_emit=events.append)
         assert suffix is not None and set(suffix) == {"claude"}
         assert "BUDGET POLICE" in suffix["claude"]
-        assert record is not None
-        assert record["vendor"] == "claude"
-        assert record["round_key"] == "rk-1"
-        # The banner is frozen into the pin so resumed sessions see the
-        # same account as the original dispatch.
-        assert record["banner"] == suffix["claude"]
         assert [(e["event"], e["source"]) for e in events] == [
             ("budget-police-selected", "rotation"),
         ]
 
-    def test_cache_pin_wins_over_rotation_state(
+    def test_state_pin_resumes_with_frozen_banner(
         self, feature_active: Path,
     ) -> None:
-        # budget-police.json lost mid-round; the reviewer-cache pin must
-        # keep the role with the original vendor AND reuse its frozen
-        # banner instead of regenerating a drifted account.
+        # A resumed round must reuse the banner frozen at selection time —
+        # not regenerate a drifted one — and audit as state-pin.
+        first = self._resolve(feature_active)
+        assert first is not None
+        frozen = first["claude"]
+        # Log grows between attempts; a regenerated banner would differ.
+        _write_log(feature_active, [
+            _row("2026-08-06T00:00:00+00:00", "subprocess-end", "build",
+                 {"elapsed_sec": 3600.0}),
+        ])
         events: list[dict] = []
-        suffix, record = self._resolve(
-            feature_active,
-            cache_extras={
-                "budget_police": {
-                    "vendor": "grok", "round_key": "rk-1",
-                    "banner": "FROZEN-BANNER",
-                },
-            },
-            log_emit=events.append,
-        )
-        assert suffix == {"grok": "FROZEN-BANNER"}
-        assert record is not None and record["vendor"] == "grok"
-        assert record["banner"] == "FROZEN-BANNER"
+        suffix = self._resolve(feature_active, log_emit=events.append)
+        assert suffix == {"claude": frozen}
         assert [(e["event"], e["source"]) for e in events] == [
-            ("budget-police-selected", "cache-pin"),
+            ("budget-police-selected", "state-pin"),
         ]
 
-    def test_pinned_settled_vendor_gets_no_second_banner(
+    def test_resumed_settled_vendor_gets_no_second_banner(
         self, feature_active: Path,
     ) -> None:
+        assert self._resolve(feature_active) is not None
         events: list[dict] = []
-        suffix, record = self._resolve(
+        suffix = self._resolve(
             feature_active,
-            reviewer_results=[self._settled("grok")],
-            cache_extras={
-                "budget_police": {"vendor": "grok", "round_key": "rk-1"},
-            },
+            reviewer_results=[self._settled("claude")],
             log_emit=events.append,
         )
         assert suffix is None
-        assert record is not None and record["vendor"] == "grok"
         assert events == []
 
-    def test_pinned_quota_skipped_vendor_is_not_rebannered(
+    def test_resumed_quota_skipped_vendor_is_not_rebannered(
         self, feature_active: Path,
     ) -> None:
-        # The pinned vendor positively quota-skipped this round: its slot
-        # is retried (so it is in to_run), but the seat stays spent — the
-        # banner must not be re-attached, and the role must not move.
+        # The round's vendor quota-skipped: its slot is retried (so it is
+        # unsettled), but the seat stays spent — the role never moves.
+        assert self._resolve(feature_active) is not None
+        self._write_raw_cache(feature_active, ["claude"])
         events: list[dict] = []
-        suffix, record = self._resolve(
-            feature_active,
-            cache_extras={
-                "budget_police": {"vendor": "grok", "round_key": "rk-1"},
-                "quota_skipped": {"grok": {"vendor": "grok"}},
-            },
-            log_emit=events.append,
-        )
+        suffix = self._resolve(feature_active, log_emit=events.append)
         assert suffix is None
-        assert record is not None and record["vendor"] == "grok"
         assert events == []
-        # No second rotation slot may have been charged.
-        assert not (feature_active / POLICE_STATE_FILENAME).exists()
 
     def test_settled_and_quota_skipped_vendors_passed_over(
         self, feature_active: Path,
     ) -> None:
-        suffix, record = self._resolve(
+        self._write_raw_cache(feature_active, ["codex"])
+        suffix = self._resolve(
             feature_active,
             reviewer_results=[self._settled("claude")],
-            cache_extras={"quota_skipped": {"codex": {"vendor": "codex"}}},
         )
         assert suffix is not None and set(suffix) == {"grok"}
-        assert record is not None and record["vendor"] == "grok"
 
     def test_all_slots_settled_selects_nobody(
         self, feature_active: Path,
     ) -> None:
         events: list[dict] = []
-        suffix, record = self._resolve(
+        suffix = self._resolve(
             feature_active,
             reviewer_results=[
                 self._settled("claude"), self._settled("codex"),
@@ -452,58 +436,8 @@ class TestBudgetPoliceSuffix:
             log_emit=events.append,
         )
         assert suffix is None
-        assert record is None
         assert events == []
         assert not (feature_active / POLICE_STATE_FILENAME).exists()
-
-    def test_state_pin_survives_cache_loss_with_frozen_banner(
-        self, feature_active: Path,
-    ) -> None:
-        # Taint recovery deletes the reviewer cache (and its pin) but
-        # leaves budget-police.json. The resumed round must reuse the
-        # banner frozen in the rotation state — not regenerate a drifted
-        # one — and audit the re-attach as state-pin, not rotation.
-        first_suffix, first_record = self._resolve(feature_active)
-        assert first_suffix is not None and set(first_suffix) == {"claude"}
-        frozen = first_record["banner"]
-        # Log grows between attempts; a regenerated banner would differ.
-        _write_log(feature_active, [
-            _row("2026-08-06T00:00:00+00:00", "subprocess-end", "build",
-                 {"elapsed_sec": 3600.0}),
-        ])
-        events: list[dict] = []
-        suffix, record = self._resolve(
-            feature_active, cache_extras={}, log_emit=events.append,
-        )
-        assert suffix == {"claude": frozen}
-        assert record["banner"] == frozen
-        assert [(e["event"], e["source"]) for e in events] == [
-            ("budget-police-selected", "state-pin"),
-        ]
-
-    def test_prior_round_quota_outage_is_passed_over(
-        self, feature_active: Path,
-    ) -> None:
-        # A fresh round has no matching cache, so the previous round's
-        # raw cache is the only cross-round outage signal.
-        (feature_active / "panel-design-review.reviewers.json").write_text(
-            json.dumps({
-                "gate": "stale-round",
-                "quota_skipped": {"claude": {"vendor": "claude"}},
-            }),
-            encoding="utf-8",
-        )
-        suffix, record = self._resolve(feature_active)
-        assert suffix is not None and set(suffix) == {"codex"}
-        assert record is not None and record["vendor"] == "codex"
-
-    def test_state_write_registry_records_round(
-        self, feature_active: Path,
-    ) -> None:
-        from autodev.budget import police_state_write_round
-        assert police_state_write_round(feature_active) is None
-        self._resolve(feature_active)
-        assert police_state_write_round(feature_active) == "rk-1"
 
     def test_log_emit_failure_does_not_lose_banner(
         self, feature_active: Path,
@@ -511,10 +445,8 @@ class TestBudgetPoliceSuffix:
         def _boom(_: dict) -> None:
             raise OSError("log append failed")
 
-        suffix, record = self._resolve(feature_active, log_emit=_boom)
+        suffix = self._resolve(feature_active, log_emit=_boom)
         assert suffix is not None and set(suffix) == {"claude"}
-        assert record is not None and record["vendor"] == "claude"
-        assert record["round_key"] == "rk-1"
 
 
 class TestPoliceBanner:

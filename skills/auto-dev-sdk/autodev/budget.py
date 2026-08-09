@@ -269,20 +269,6 @@ class PoliceSelection:
     newly_selected: bool
 
 
-# feature_active (resolved) -> round_key of the last budget-police.json
-# write THIS process performed. The panel integrity guard consults it so
-# the file is exempted from taint detection only in rounds where the
-# harness itself wrote it. Deliberately simple: defending the bookkeeping
-# file against a sandbox-escaped reviewer racing the write is outside
-# this mechanism's threat model (operator decision, 2026-08-08).
-_LAST_STATE_WRITE: dict[str, str] = {}
-
-
-def police_state_write_round(feature_active: Path) -> str | None:
-    """round_key of this process's last rotation-state write, or None."""
-    return _LAST_STATE_WRITE.get(str(Path(feature_active).resolve()))
-
-
 def select_budget_police(
     feature_active: Path,
     ordered_vendors: list[str],
@@ -344,7 +330,6 @@ def select_budget_police(
         "last_banner": banner,
         "history": history[-50:],
     })
-    _LAST_STATE_WRITE[str(Path(feature_active).resolve())] = round_key
     return PoliceSelection(
         vendor=selected, banner=banner, newly_selected=True,
     )
