@@ -1,4 +1,4 @@
-"""Feature budget accounting — metering, prompt injection, budget police.
+"""Feature budget accounting — metering, prompt injection, shrink rounds.
 
 Three responsibilities, all feature-scoped (one active/ dir):
 
@@ -12,19 +12,13 @@ Three responsibilities, all feature-scoped (one active/ dir):
    sizes its work against the feature's remaining budget, not only its
    own context window. Injection must never break prompt rendering: any
    error degrades to no lines.
-3. **Budget police** (`select_budget_police` / `police_banner`): one
-   reviewer per design-review round, chosen by fixed-order rotation over
-   the configured vendors, is REPURPOSED for that round: instead of the
-   standard coverage review, its sole task is challenging scope items
-   whose cost is disproportionate to the PRD clause they serve. A
-   dedicated seat, not a side duty — a gap-finder auditing cost "on the
-   side" spends its context on coverage and produces token deletions.
-   Rotation state persists in `budget-police.json`. Selection is keyed
-   by the review-round key (design-packet hash) so a resumed round
-   re-selects the same vendor; the pointer only advances when a new
-   round key appears. Vendors currently quota-skipped are passed over;
-   fairness is restored on the next natural cycle (no owed-turn debt —
-   simpler, and fair among the vendors actually present).
+3. **Shrink rounds** (`minimality_review_body`): design-review rounds
+   run on a five-round cycle — three coverage rounds, then two shrink
+   rounds in which the WHOLE panel reviews minimality instead of
+   coverage (round four proposes cuts, the design rerun applies them,
+   round five reviews the result). The cadence needs no state of its
+   own: the round ordinal falls out of the `panel-review-round` events
+   already in log.jsonl.
 """
 from __future__ import annotations
 
@@ -32,12 +26,8 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
-
-from autodev.state.atomic import atomic_write_json
 
 BUDGET_TARGETS_FILENAME = "budget.json"
-POLICE_STATE_FILENAME = "budget-police.json"
 
 # Targets an operator may set in budget.json. Anything else is ignored.
 _KNOWN_TARGETS = (
@@ -51,6 +41,9 @@ class BudgetSpent:
     iterations: int = 0
     design_review_rounds: int = 0
     wall_hours: float = 0.0
+    # Distinct design-review packet hashes seen so far; the shrink-round
+    # cadence derives the current round's ordinal from this set.
+    review_round_keys: set[str] = field(default_factory=set)
 
     @property
     def vendor_hours_total(self) -> float:
@@ -146,6 +139,7 @@ def compute_spent(feature_active: Path) -> BudgetSpent:
     except OSError:
         return spent
     spent.design_review_rounds = len(review_round_keys)
+    spent.review_round_keys = review_round_keys
     if first_ts is not None and last_ts is not None and last_ts > first_ts:
         spent.wall_hours = (last_ts - first_ts).total_seconds() / 3600.0
     return spent
@@ -247,134 +241,55 @@ def format_budget_lines(feature_active: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Budget police rotation
+# Shrink rounds
 
 
-def _load_police_state(feature_active: Path) -> dict:
-    path = Path(feature_active) / POLICE_STATE_FILENAME
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
+def minimality_review_body(feature_active: Path) -> str:
+    """The shrink-round role body for the whole design-review panel.
 
-
-@dataclass
-class PoliceSelection:
-    vendor: str
-    # The banner frozen at selection time, so every dispatch attempt of
-    # the round shows the reviewer session the same budget account.
-    banner: str | None
-    # True when this call advanced the pointer and persisted state; False
-    # when an existing round pin was returned (resume).
-    newly_selected: bool
-
-
-def select_budget_police(
-    feature_active: Path,
-    ordered_vendors: list[str],
-    *,
-    round_key: str,
-    unavailable: set[str] | None = None,
-    banner_factory: Callable[[], str] | None = None,
-) -> PoliceSelection | None:
-    """Pick this round's budget-police vendor by fixed-order rotation.
-
-    Same ``round_key`` → same vendor with its frozen banner
-    (resume-stable, nothing re-persisted). A new round key scans from the
-    persisted pointer, skipping ``unavailable`` vendors, builds the
-    banner via ``banner_factory`` BEFORE persisting (a banner failure
-    must not consume a turn), then advances the pointer past the
-    selected vendor. All vendors unavailable → None (nothing persisted).
-    """
-    if not ordered_vendors:
-        return None
-    unavailable = unavailable or set()
-    state = _load_police_state(feature_active)
-    if state.get("last_round_key") == round_key:
-        last_vendor = state.get("last_vendor")
-        if isinstance(last_vendor, str) and last_vendor in ordered_vendors:
-            frozen = state.get("last_banner")
-            return PoliceSelection(
-                vendor=last_vendor,
-                banner=frozen if isinstance(frozen, str) and frozen else None,
-                newly_selected=False,
-            )
-        # The round already consumed a rotation slot but its vendor is no
-        # longer configured (vendors.yml edited mid-round). Re-selecting
-        # would charge a second slot to the same round — decline instead.
-        return None
-    pointer = state.get("pointer")
-    if not isinstance(pointer, int) or not 0 <= pointer < len(ordered_vendors):
-        pointer = 0
-    selected: str | None = None
-    selected_index = pointer
-    for offset in range(len(ordered_vendors)):
-        index = (pointer + offset) % len(ordered_vendors)
-        vendor = ordered_vendors[index]
-        if vendor in unavailable:
-            continue
-        selected = vendor
-        selected_index = index
-        break
-    if selected is None:
-        return None
-    banner = banner_factory() if banner_factory is not None else None
-    history = state.get("history")
-    if not isinstance(history, list):
-        history = []
-    history.append({"round_key": round_key, "vendor": selected})
-    atomic_write_json(Path(feature_active) / POLICE_STATE_FILENAME, {
-        "pointer": (selected_index + 1) % len(ordered_vendors),
-        "last_round_key": round_key,
-        "last_vendor": selected,
-        "last_banner": banner,
-        "history": history[-50:],
-    })
-    return PoliceSelection(
-        vendor=selected, banner=banner, newly_selected=True,
-    )
-
-
-def police_banner(feature_active: Path) -> str:
-    """The minimality-review role body for the selected reviewer.
-
-    This REPLACES the coverage-review body in that vendor's prompt (the
-    runner keeps only the orchestrator context and file manifest from the
-    shared prompt) — a dedicated seat reads no coverage instructions.
+    On shrink rounds this REPLACES the coverage-review body in every
+    reviewer's prompt (the runner keeps only the orchestrator context and
+    file manifest from the shared prompt) — the round reads no coverage
+    instructions.
     """
     budget_lines = "\n".join(format_budget_lines(feature_active)) or (
         "- BUDGET_SPENT: no spend recorded yet for this feature."
     )
     return (
-        "## Your role this round: minimality review\n\n"
+        "## Shrink round: minimality review\n\n"
         "This panel verifies that the design is a correct plan for the "
         "PRD. A plan can be wrong in two directions: insufficient (a PRD "
         "clause is satisfied by nothing in the plan) or non-minimal "
         "(something in the plan is required by no clause, or costs more "
-        "than its clause needs). The other reviewers check sufficiency. "
-        "You check minimality — this round you do only that.\n\n"
+        "than its clause needs). The preceding rounds reviewed "
+        "sufficiency; this round the whole panel reviews minimality, and "
+        "only that. Sufficiency of whatever survives is re-checked in "
+        "the rounds that follow.\n\n"
         "An item belongs in the plan iff (a) some PRD clause fails "
         "without it, and (b) no cheaper mechanism satisfies that clause "
-        "equally. Your proof obligation mirrors the coverage reviewers': "
+        "equally. Your proof obligation mirrors a coverage reviewer's: "
         "they must show a clause fails without an addition; you must "
         "show a clause still holds without an item, or holds with a "
         "cheaper one. What non-minimality costs here in practice:\n\n"
         f"{budget_lines}\n\n"
         "Go through scope.json item by item, with design.md for the "
         "mechanism and prd.md for the clauses:\n\n"
-        "1. For each item you challenge, name the clause it claims to "
+        "1. Prime suspects first: items whose `prd_ref` cites only "
+        "amendment text (correction rounds and the like), never an "
+        "original `R<n>` clause — review-driven additions accrete "
+        "there. If the only clause requiring an item is such an "
+        "amendment, say so in the finding: rolling the clause back is "
+        "the operator's call, not yours.\n"
+        "2. For each item you challenge, name the clause it claims to "
         "serve, then either show no clause requires it, or name the "
         "cheaper mechanism (or deferral to a follow-up feature) that "
         "satisfies the same clause, with a rough cost comparison.\n"
-        "2. Report each as a finding whose summary starts with "
+        "3. Report each as a finding whose summary starts with "
         "`[budget]`, targeting the scope item id. Severity `opinion`; "
         "`risk` when the item endangers the budget targets and a "
         "clause-satisfying cheaper alternative exists. No findings of "
         "any other kind.\n"
-        "3. A design can already be minimal. Zero findings is then the "
+        "4. A design can already be minimal. Zero findings is then the "
         "correct report — state it explicitly. Do not manufacture "
         "cuts.\n"
     )

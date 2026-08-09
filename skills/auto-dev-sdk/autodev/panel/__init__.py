@@ -226,16 +226,6 @@ def run_panel_gate(
             f"panel-{output_gate}.reviewers.json",
         )
     ]
-    if gate == "design-review":
-        # The budget-police rotation state is written by the runner inside
-        # the guarded interval (select_budget_police); once the file is
-        # committed by a WIP commit, every later round would otherwise be
-        # flagged as a tracked-file delta and taint the review. The
-        # exemption is unconditional: this harness runs supervised in a
-        # trusted environment, and defending its own bookkeeping file
-        # against hypothetical reviewer tampering is deliberately out of
-        # scope (operator decision, 2026-08-08).
-        expected_panel_writes.append(feature_active / "budget-police.json")
     changes = integrity.detect_after(
         guard,
         canonical_files,

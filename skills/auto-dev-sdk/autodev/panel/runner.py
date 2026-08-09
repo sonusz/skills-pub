@@ -1066,93 +1066,65 @@ def _reviewer_session_key_for_spec(
     raise ValueError(f"reviewer spec is not present in panel config: {spec!r}")
 
 
-def _budget_police_suffix(
+# Shrink-round cadence: every five design-review rounds, the first three
+# review coverage and the last two review minimality (round four proposes
+# cuts, the design rerun applies them, round five reviews the result).
+SHRINK_CYCLE_ROUNDS = 5
+SHRINK_ROUNDS_PER_CYCLE = 2
+
+
+def _shrink_round_prompts(
     *,
     feature_active: Path,
     panel_config: PanelConfig,
-    reviewer_results: list[ReviewerResult],
     round_key: str,
+    base_prompt: str,
+    base_resume_prompt: str,
     gate_label: str,
     log_emit: Callable[[dict], None] | None,
-) -> dict[str, str] | None:
-    """Resolve this round's budget-police assignment.
+) -> dict[str, tuple[str, str]] | None:
+    """Decide whether this round is a shrink round; build its prompts.
 
-    Returns ``{vendor: minimality-role body}`` or None. The caller turns
-    it into that vendor's dedicated prompt (role body + shared context),
-    replacing the coverage prompt entirely.
-
-    The rotation state file (budget-police.json) is the single source of
-    truth: a round-key match resumes the same vendor with its frozen
-    banner; a new round selects by fixed-order rotation, passing over
-    vendors with settled slots and vendors the last written reviewer
-    cache shows quota-skipped. The banner is built before the rotation
-    pointer persists, and log_emit is fail-soft. Any unexpected failure
-    degrades to "no police this round" — the panel itself must never be
-    blocked by the budget seat. This harness runs supervised in a trusted
-    environment; the seat mechanism does not defend its own state files.
+    The round ordinal is the number of DISTINCT prior design-review
+    round keys in log.jsonl, excluding the current key — stable across
+    resumed attempts of the same round, with no state file. On a shrink
+    round every reviewer's prompt replaces the coverage body with the
+    minimality body, keeping the shared orchestrator context and file
+    manifest; the resume prompt keeps the role-agnostic continuation
+    preamble plus the body. Any failure degrades to a coverage round —
+    the panel must never be blocked by the shrink mechanism.
     """
     try:
-        from autodev.budget import police_banner, select_budget_police
+        from autodev.budget import compute_spent, minimality_review_body
 
-        ordered = [spec.vendor for spec in panel_config.reviewers]
-        to_run = {
-            spec.vendor
-            for spec in _missing_reviewers(panel_config.reviewers, reviewer_results)
-        }
-        skips = _peek_prior_quota_skips(feature_active, gate_label)
-        unavailable = (set(ordered) - to_run) | skips
-        if not (set(ordered) - unavailable):
-            # Nobody can carry the seat; skip the banner build entirely.
+        prior_rounds = compute_spent(feature_active).review_round_keys
+        ordinal = len(prior_rounds - {round_key})
+        position = ordinal % SHRINK_CYCLE_ROUNDS
+        if position < SHRINK_CYCLE_ROUNDS - SHRINK_ROUNDS_PER_CYCLE:
             return None
-        selection = select_budget_police(
-            feature_active,
-            ordered,
-            round_key=round_key,
-            unavailable=unavailable,
-            banner_factory=lambda: police_banner(feature_active),
-        )
-        if selection is None:
-            return None
-        if selection.vendor not in to_run or selection.vendor in skips:
-            # Resumed onto a vendor whose slot is settled or quota-dead;
-            # its turn is already spent — the role never moves mid-round.
-            return None
-        banner = selection.banner or police_banner(feature_active)
         if log_emit is not None:
             try:
                 log_emit({
-                    "event": "budget-police-selected",
+                    "event": "shrink-round",
                     "stage": "gate",
                     "gate": gate_label,
-                    "vendor": selection.vendor,
-                    "source": (
-                        "rotation" if selection.newly_selected else "state-pin"
-                    ),
+                    "round_key": round_key,
+                    "ordinal": ordinal,
                 })
             except Exception:
                 pass
-        return {selection.vendor: banner}
+        body = minimality_review_body(feature_active)
+        marker = "\n\n---\n\n## Orchestrator context"
+        cut = base_prompt.find(marker)
+        context_part = base_prompt[cut:] if cut >= 0 else ""
+        initial = body + context_part
+        resume = base_resume_prompt + "\n\n---\n\n" + body
+        return {
+            spec.vendor: (initial, resume)
+            for spec in panel_config.reviewers
+        }
     except Exception:
         return None
-
-
-def _peek_prior_quota_skips(feature_active: Path, gate_label: str) -> set[str]:
-    """Vendors the last written reviewer cache shows quota-skipped.
-
-    Read raw, without a metadata match: on a NEW round the previous
-    round's cache never matches, yet its skips are the only cross-round
-    signal that a vendor is in sustained quota outage.
-    """
-    try:
-        payload = json.loads(
-            _reviewer_cache_path(feature_active, gate_label).read_text(
-                encoding="utf-8",
-            )
-        )
-    except Exception:
-        return set()
-    skips = payload.get("quota_skipped") if isinstance(payload, dict) else None
-    return set(skips.keys()) if isinstance(skips, dict) else set()
 
 
 def _dispatch_reviewer_slots(
@@ -1173,11 +1145,12 @@ def _dispatch_reviewer_slots(
 
     ``per_vendor_prompts`` maps a vendor to its own ``(prompt,
     resume_prompt)`` pair, REPLACING the shared prompts for that vendor
-    (the budget-police seat gets a dedicated minimality-review prompt,
-    not the coverage prompt plus an addendum). It is deliberately
-    excluded from the reviewer-cache metadata hash: the round's cache
-    identity is the shared base prompt, and police selection is
-    round-key-stable, so a resumed round re-issues the same role.
+    (shrink rounds hand every reviewer a dedicated minimality-review
+    prompt, not the coverage prompt plus an addendum). It is
+    deliberately excluded from the reviewer-cache metadata hash: the
+    round's cache identity is the shared base prompt, and the shrink
+    cadence is round-key-stable, so a resumed round re-issues the same
+    role.
     """
     to_run = _missing_reviewers(panel_config.reviewers, reviewer_results)
     if not to_run:
@@ -2006,40 +1979,23 @@ def _run_one_group_pipeline(
         metadata=metadata,
     )
 
-    # Budget-police seat: one design-review reviewer per round is
-    # repurposed as the minimality reviewer. Its prompt keeps the shared
-    # orchestrator context + file manifest but replaces the coverage
-    # review body with the minimality role — a dedicated seat, not a
-    # side duty. The trace-review group and the close-approval gate are
-    # untouched — scope proportionality is judged where scope.json is on
-    # the review surface.
+    # Shrink-round cadence: three coverage rounds, then two rounds where
+    # the whole design-review panel reviews minimality instead. The
+    # trace-review group and the close-approval gate are untouched —
+    # scope proportionality is judged where scope.json is on the review
+    # surface.
     per_vendor_prompts: dict[str, tuple[str, str]] | None = None
     if group_spec["name"] == "design-review":
         round_key = str(metadata["source_hash"])
-        assignment = _budget_police_suffix(
+        per_vendor_prompts = _shrink_round_prompts(
             feature_active=feature_active,
             panel_config=cfg,
-            reviewer_results=reviewer_results,
             round_key=round_key,
+            base_prompt=group_spec["reviewer_prompt"],
+            base_resume_prompt=group_spec["reviewer_resume_prompt"],
             gate_label=group_spec["name"],
             log_emit=log_emit,
         )
-        if assignment:
-            (police_vendor, police_body), = assignment.items()
-            marker = "\n\n---\n\n## Orchestrator context"
-            base = group_spec["reviewer_prompt"]
-            cut = base.find(marker)
-            context_part = base[cut:] if cut >= 0 else ""
-            # Initial prompt: minimality body + shared context/manifest.
-            # Resume prompt: the role-agnostic continuation preamble
-            # ("keep the role established by the initial turn") plus the
-            # frozen banner, so the resumed session re-sees the same
-            # account it was dispatched with.
-            per_vendor_prompts = {police_vendor: (
-                police_body + context_part,
-                group_spec["reviewer_resume_prompt"]
-                + "\n\n---\n\n" + police_body,
-            )}
         if log_emit is not None and _missing_reviewers(
             cfg.reviewers, reviewer_results,
         ):

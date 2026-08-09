@@ -1,4 +1,4 @@
-"""Budget accounting: metering from log.jsonl, prompt lines, police rotation."""
+"""Budget accounting: metering from log.jsonl, prompt lines, shrink rounds."""
 from __future__ import annotations
 
 import json
@@ -8,12 +8,10 @@ import pytest
 
 from autodev.budget import (
     BUDGET_TARGETS_FILENAME,
-    POLICE_STATE_FILENAME,
     compute_spent,
     format_budget_lines,
     load_targets,
-    police_banner,
-    select_budget_police,
+    minimality_review_body,
 )
 
 
@@ -29,14 +27,6 @@ def _row(ts: str, event: str, stage: str = "build", detail: dict | None = None) 
         "ts": ts, "schema": 2, "stage": stage, "event": event,
         "feature": "f", "detail": detail or {},
     }
-
-
-def _pick(feature_active, vendors, *, round_key, unavailable=None):
-    """Unwrap PoliceSelection to its vendor for rotation-order tests."""
-    sel = select_budget_police(
-        feature_active, vendors, round_key=round_key, unavailable=unavailable,
-    )
-    return sel.vendor if sel is not None else None
 
 
 @pytest.fixture()
@@ -213,107 +203,11 @@ class TestTargetsAndLines:
         assert "BUDGET_RULE" in joined
 
 
-class TestPoliceRotation:
-    VENDORS = ["claude", "codex", "agy", "grok"]
-
-    def test_same_round_key_is_stable(self, feature_active: Path) -> None:
-        first = _pick(
-            feature_active, self.VENDORS, round_key="r1",
-        )
-        again = _pick(
-            feature_active, self.VENDORS, round_key="r1",
-        )
-        assert first == again == "claude"
-
-    def test_new_round_advances_in_fixed_order(
-        self, feature_active: Path,
-    ) -> None:
-        picks = [
-            _pick(feature_active, self.VENDORS, round_key=k)
-            for k in ("r1", "r2", "r3", "r4", "r5")
-        ]
-        assert picks == ["claude", "codex", "agy", "grok", "claude"]
-
-    def test_unavailable_vendor_is_passed_over(
-        self, feature_active: Path,
-    ) -> None:
-        first = _pick(
-            feature_active, self.VENDORS, round_key="r1",
-            unavailable={"claude", "codex"},
-        )
-        assert first == "agy"
-        # Pointer advanced past the selected vendor, not past the skipped.
-        second = _pick(
-            feature_active, self.VENDORS, round_key="r2",
-        )
-        assert second == "grok"
-
-    def test_all_unavailable_selects_none_and_persists_nothing(
-        self, feature_active: Path,
-    ) -> None:
-        pick = _pick(
-            feature_active, self.VENDORS, round_key="r1",
-            unavailable=set(self.VENDORS),
-        )
-        assert pick is None
-        assert not (feature_active / POLICE_STATE_FILENAME).exists()
-
-    def test_corrupt_state_recovers(self, feature_active: Path) -> None:
-        (feature_active / POLICE_STATE_FILENAME).write_text(
-            "{broken", encoding="utf-8",
-        )
-        assert _pick(
-            feature_active, self.VENDORS, round_key="r1",
-        ) == "claude"
-
-    def test_resume_pins_vendor_even_when_now_unavailable(
-        self, feature_active: Path,
-    ) -> None:
-        # Production sequence: select on empty unavailable, the vendor
-        # quota-skips, the round resumes with it marked unavailable. The
-        # round pin must win — reassignment mid-round would double-audit.
-        first = _pick(
-            feature_active, self.VENDORS, round_key="r1",
-        )
-        assert first == "claude"
-        resumed = _pick(
-            feature_active, self.VENDORS, round_key="r1",
-            unavailable={"claude"},
-        )
-        assert resumed == "claude"
-        # The pin must not have consumed a second rotation slot.
-        state = json.loads(
-            (feature_active / POLICE_STATE_FILENAME).read_text(encoding="utf-8"),
-        )
-        assert len(state["history"]) == 1
-
-    def test_vendor_removed_mid_round_consumes_no_second_slot(
-        self, feature_active: Path,
-    ) -> None:
-        assert _pick(
-            feature_active, self.VENDORS, round_key="r1",
-        ) == "claude"
-        # claude removed from vendors.yml; same round resumes: no police,
-        # no second slot charged to this round.
-        shrunk = ["codex", "agy", "grok"]
-        assert _pick(
-            feature_active, shrunk, round_key="r1",
-        ) is None
-        state = json.loads(
-            (feature_active / POLICE_STATE_FILENAME).read_text(encoding="utf-8"),
-        )
-        assert len(state["history"]) == 1
-        # The next round proceeds normally from the stored pointer.
-        assert _pick(
-            feature_active, self.VENDORS, round_key="r2",
-        ) == "codex"
-
-
-class TestBudgetPoliceSuffix:
-    """Runner-side seat resolution: rotation, resume, eligibility, audit."""
+class TestShrinkRound:
+    """Cadence: three coverage rounds, then two whole-panel shrink rounds."""
 
     @staticmethod
-    def _config() -> "PanelConfig":
+    def _config():
         from autodev.vendors.config import (
             PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
         )
@@ -327,129 +221,79 @@ class TestBudgetPoliceSuffix:
         )
 
     @staticmethod
-    def _settled(vendor: str) -> "ReviewerResult":
-        from autodev.panel.runner import ReviewerResult
-        return ReviewerResult(
-            vendor=vendor, model="fake", ok=True, output="reviewed",
-            elapsed_sec=1.0,
-        )
+    def _log_prior_rounds(feature_active: Path, keys: list[str]) -> None:
+        _write_log(feature_active, [
+            _row(f"2026-08-06T0{i}:00:00+00:00", "panel-review-round", "gate",
+                 {"gate": "design-review", "round_key": key})
+            for i, key in enumerate(keys)
+        ])
 
-    @staticmethod
-    def _write_raw_cache(feature_active: Path, quota_skipped: list[str]) -> None:
-        (feature_active / "panel-design-review.reviewers.json").write_text(
-            json.dumps({
-                "gate": "design-review",
-                "quota_skipped": {v: {"vendor": v} for v in quota_skipped},
-            }),
-            encoding="utf-8",
-        )
-
-    def _resolve(self, feature_active: Path, **kwargs):
-        from autodev.panel.runner import _budget_police_suffix
+    def _resolve(self, feature_active: Path, *, round_key="rk-cur", **kwargs):
+        from autodev.panel.runner import _shrink_round_prompts
         defaults = dict(
             feature_active=feature_active,
             panel_config=self._config(),
-            reviewer_results=[],
-            round_key="rk-1",
+            round_key=round_key,
+            base_prompt=(
+                "COVERAGE BODY\n\n---\n\n## Orchestrator context\n\n- X"
+            ),
+            base_resume_prompt="CONTINUATION PREAMBLE",
             gate_label="design-review",
             log_emit=None,
         )
         defaults.update(kwargs)
-        return _budget_police_suffix(**defaults)
+        return _shrink_round_prompts(**defaults)
 
-    def test_fresh_round_banners_first_vendor(
-        self, feature_active: Path,
-    ) -> None:
-        events: list[dict] = []
-        suffix = self._resolve(feature_active, log_emit=events.append)
-        assert suffix is not None and set(suffix) == {"claude"}
-        assert "minimality review" in suffix["claude"]
-        assert [(e["event"], e["source"]) for e in events] == [
-            ("budget-police-selected", "rotation"),
-        ]
+    def test_first_three_rounds_are_coverage(self, feature_active: Path) -> None:
+        for n in (0, 1, 2):
+            self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(n)])
+            assert self._resolve(feature_active) is None
 
-    def test_state_pin_resumes_with_frozen_banner(
-        self, feature_active: Path,
-    ) -> None:
-        # A resumed round must reuse the banner frozen at selection time —
-        # not regenerate a drifted one — and audit as state-pin.
-        first = self._resolve(feature_active)
-        assert first is not None
-        frozen = first["claude"]
-        # Log grows between attempts; a regenerated banner would differ.
-        _write_log(feature_active, [
-            _row("2026-08-06T00:00:00+00:00", "subprocess-end", "build",
-                 {"elapsed_sec": 3600.0}),
-        ])
-        events: list[dict] = []
-        suffix = self._resolve(feature_active, log_emit=events.append)
-        assert suffix == {"claude": frozen}
-        assert [(e["event"], e["source"]) for e in events] == [
-            ("budget-police-selected", "state-pin"),
-        ]
+    def test_rounds_four_and_five_are_shrink(self, feature_active: Path) -> None:
+        for n in (3, 4):
+            self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(n)])
+            prompts = self._resolve(feature_active)
+            assert prompts is not None
+            assert set(prompts) == {"claude", "codex", "grok"}
+            initial, resume = prompts["claude"]
+            # Coverage body replaced; shared context kept.
+            assert "minimality review" in initial
+            assert "COVERAGE BODY" not in initial
+            assert "## Orchestrator context" in initial
+            # Resume keeps the role-agnostic preamble plus the body.
+            assert resume.startswith("CONTINUATION PREAMBLE")
+            assert "minimality review" in resume
 
-    def test_resumed_settled_vendor_gets_no_second_banner(
-        self, feature_active: Path,
-    ) -> None:
+    def test_cycle_repeats(self, feature_active: Path) -> None:
+        self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(5)])
+        assert self._resolve(feature_active) is None
+        self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(8)])
         assert self._resolve(feature_active) is not None
-        events: list[dict] = []
-        suffix = self._resolve(
-            feature_active,
-            reviewer_results=[self._settled("claude")],
-            log_emit=events.append,
+
+    def test_resume_of_same_round_is_stable(self, feature_active: Path) -> None:
+        # The current round's own event may already be in the log from a
+        # prior attempt; the ordinal must not shift.
+        self._log_prior_rounds(
+            feature_active, ["rk-0", "rk-1", "rk-2", "rk-cur"],
         )
-        assert suffix is None
+        assert self._resolve(feature_active, round_key="rk-cur") is not None
+        self._log_prior_rounds(feature_active, ["rk-0", "rk-1", "rk-cur"])
+        assert self._resolve(feature_active, round_key="rk-cur") is None
+
+    def test_shrink_round_emits_audit_event(self, feature_active: Path) -> None:
+        events: list[dict] = []
+        self._log_prior_rounds(feature_active, ["rk-0", "rk-1", "rk-2"])
+        self._resolve(feature_active, log_emit=events.append)
+        assert [(e["event"], e["ordinal"]) for e in events] == [
+            ("shrink-round", 3),
+        ]
+        events.clear()
+        self._log_prior_rounds(feature_active, ["rk-0"])
+        self._resolve(feature_active, log_emit=events.append)
         assert events == []
 
-    def test_resumed_quota_skipped_vendor_is_not_rebannered(
-        self, feature_active: Path,
-    ) -> None:
-        # The round's vendor quota-skipped: its slot is retried (so it is
-        # unsettled), but the seat stays spent — the role never moves.
-        assert self._resolve(feature_active) is not None
-        self._write_raw_cache(feature_active, ["claude"])
-        events: list[dict] = []
-        suffix = self._resolve(feature_active, log_emit=events.append)
-        assert suffix is None
-        assert events == []
 
-    def test_settled_and_quota_skipped_vendors_passed_over(
-        self, feature_active: Path,
-    ) -> None:
-        self._write_raw_cache(feature_active, ["codex"])
-        suffix = self._resolve(
-            feature_active,
-            reviewer_results=[self._settled("claude")],
-        )
-        assert suffix is not None and set(suffix) == {"grok"}
-
-    def test_all_slots_settled_selects_nobody(
-        self, feature_active: Path,
-    ) -> None:
-        events: list[dict] = []
-        suffix = self._resolve(
-            feature_active,
-            reviewer_results=[
-                self._settled("claude"), self._settled("codex"),
-                self._settled("grok"),
-            ],
-            log_emit=events.append,
-        )
-        assert suffix is None
-        assert events == []
-        assert not (feature_active / POLICE_STATE_FILENAME).exists()
-
-    def test_log_emit_failure_does_not_lose_banner(
-        self, feature_active: Path,
-    ) -> None:
-        def _boom(_: dict) -> None:
-            raise OSError("log append failed")
-
-        suffix = self._resolve(feature_active, log_emit=_boom)
-        assert suffix is not None and set(suffix) == {"claude"}
-
-
-class TestPoliceBanner:
+class TestMinimalityBody:
     def test_banner_contains_duty_and_account(
         self, feature_active: Path,
     ) -> None:
@@ -457,11 +301,13 @@ class TestPoliceBanner:
             _row("2026-08-06T00:00:00+00:00", "subprocess-end", "build",
                  {"elapsed_sec": 3600.0}),
         ])
-        banner = police_banner(feature_active)
-        assert "minimality review" in banner
-        assert "[budget]" in banner
-        assert "BUDGET_SPENT" in banner
-        assert "Zero findings is then the correct report" in banner
-        # Dedicated seat (the sufficiency/minimality dual), not a side duty.
-        assert "this round you do only that" in banner
-        assert "in addition to" not in banner
+        body = minimality_review_body(feature_active)
+        assert "Shrink round: minimality review" in body
+        assert "[budget]" in body
+        assert "BUDGET_SPENT" in body
+        assert "Zero findings is then the correct report" in body
+        # Derived-requirements audit: amendment-only prd_refs are the
+        # prime suspects, and rolling a clause back is the operator's call.
+        assert "cites only amendment text" in body
+        assert "operator's call" in body
+        assert "in addition to" not in body
