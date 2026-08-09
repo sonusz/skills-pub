@@ -280,15 +280,32 @@ When this list grows, lift the canonical wording into a shared
 `auto-dev-sdk/references/implementation-discipline.md` and
 reference it from each PRD's Constraints section.
 
-### 7. Validate format
+### 7. Validate semantic intent with a fresh subagent
 
-Before invoking `autodev prd <feature> --from-file <path>`:
+Before import, test whether the PRD communicates the user's intent without
+conversation context:
 
-- Run `autodev prd-lint --file <path>` (or import then re-lint).
-- Confirm 0 errors. The lint catches missing sections, malformed
-  R blocks, duplicate IDs.
+1. Give a fresh subagent only the PRD and its source references. Do not include
+   the intended interpretation, suspected ambiguity, or prior conclusions.
+2. Ask it to restate each requirement in plain language and flag multiple
+   plausible readings, contradictions, unbounded scope, and accidental
+   retention or deletion.
+3. Compare its reading with the user's confirmed intent. A material mismatch
+   means the PRD is unclear even if the subagent calls it acceptable.
+4. Surface the mismatch to the user, make the smallest user-approved wording
+   change, and repeat with a fresh independent pass until the readings align.
 
-### 8. Promote
+This is a semantic test, not an approval authority. The subagent must not add,
+remove, or relax requirements, and its verdict never replaces user approval.
+
+### 8. Validate format
+
+`autodev prd <feature> --from-file <path>` validates the source before writing
+it. After a successful import and before `autodev run`, run
+`autodev prd-lint <feature>` and confirm 0 errors. The lint catches missing
+sections, malformed R blocks, and duplicate IDs.
+
+### 9. Promote
 
 After import:
 

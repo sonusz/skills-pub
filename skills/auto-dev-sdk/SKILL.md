@@ -24,6 +24,8 @@ description: >
 
 Thin dispatcher only. I do not write feature code, edit source files, create artifacts, mutate `.lock/`, `.gates/`, `overrides.json`, or `panel-*.json`, or inject panel prompts. All state mutation goes through `autodev`. Reads are allowed: `autodev status`, `autodev explain`, `cat` artifacts, `tail log.jsonl`.
 
+The sole outer-layer helper exception is the mandatory, read-only PRD semantic-intent check below. That subagent may read the PRD and its source references, but may not edit files or invoke the pipeline.
+
 If asked to code directly in a repo covered by this skill, decline and ask the user to confirm leaving the pipeline.
 
 ## What the CLI does
@@ -50,10 +52,16 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 
 Before invoking `autodev prd <feature> --from-file ...`, check whether the user has a rigorous PRD ready:
 
-- If they hand over a structured `prd.md` aligned with the v2 schema (`## Problem / Users / Architectural principles / Requirements / Constraints / Success Criteria / Out of Scope`), proceed straight to import.
+- If they hand over a structured `prd.md` aligned with the v2 schema (`## Problem / Users / Architectural principles / Requirements / Constraints / Success Criteria / Out of Scope`), skip drafting and continue to the mandatory semantic-intent check below before import.
 - If they only have an idea, a screenshot, a PDF, a reference document, or a draft `prd.md` that has not passed `autodev prd-lint`, drive PRD authoring first by following [references/prd-authoring.md](references/prd-authoring.md). That guide bundles the canonical schema, the interrogation checklist that surfaces gaps (concurrency floor / ceiling, failure modes, recovery, operator surface, implementation discipline, library reuse, platform compat), the bullet-classification rubric, the lessons-learned carryover, and a worked example. Do NOT invent a PRD silently; walk the checklist with the user so gaps surface explicitly.
 
-Trigger the pre-flight when the user says "write a PRD", "draft requirements", "spec out a new feature", or hands over an unstructured idea and asks to start auto-dev. Skip the pre-flight for `update`, `close`, `pause`, `resume`, `abort`, `retry`, `invalidate`, `skip-gate`, `acknowledge-dirty` — those operate on features that already have a PRD.
+### Mandatory semantic-intent check
+
+Before `autodev prd`, spawn a fresh read-only subagent. Give it only the PRD and its source references; ask it to restate the requirements and flag plausible alternate readings. Do not supply the intended interpretation or prior conclusions.
+
+Compare its independent reading with the user's confirmed intent. If they differ materially, surface the mismatch, make only the smallest user-approved clarification, and repeat with a fresh pass until they align. Do not proceed merely because the subagent says the PRD is acceptable, and do not let it invent requirements or replace user approval. Apply the same check after a material PRD amendment and before resuming the pipeline; clarify an active PRD only through `autodev update`.
+
+Trigger the pre-flight when the user says "write a PRD", "draft requirements", "spec out a new feature", or hands over an unstructured idea and asks to start auto-dev. For `update`, skip only the cold-start authoring steps; a material amendment still requires the semantic-intent check before resume. Skip the full pre-flight for `close`, `pause`, `resume`, `abort`, `retry`, `invalidate`, `skip-gate`, and `acknowledge-dirty`.
 
 ## CLI install check
 
@@ -84,6 +92,7 @@ I may only invoke these:
 | `autodev update <f> --amendment "..."` | Amend PRD; start new cycle |
 | `autodev close <f> <reason> [--yes]` | Close feature |
 | `autodev explain <f>` | Human-readable state |
+| `autodev prd-lint <f>` | Validate the imported PRD against the v2 schema |
 
 I **do not**:
 - Skip `autodev next` by creating downstream artifacts by hand.
