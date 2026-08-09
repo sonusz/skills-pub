@@ -346,17 +346,26 @@ def _reviewer_cache_metadata(
     prompt_file_for_audit: Path,
     reviewer_prompt: str,
     consulted_docs: list[dict],
+    round_type: str = "coverage",
+    source_hash: str | None = None,
 ) -> dict:
+    # round_type separates cache identities of a coverage round and a
+    # budget round over the SAME packet — the coverage/budget alternation
+    # runs both on one unchanged packet, and a budget round must never be
+    # served the coverage round's cached reviews. source_hash may be
+    # passed in to reuse a hash already computed for the round decision
+    # (a second read could diverge if the packet were rewritten between).
     return {
         "kind": "panel-reviewer-cache",
         "schema_version": REVIEWER_CACHE_SCHEMA_VERSION,
         "gate": gate_label,
         "source": str(primary_artifact),
-        "source_hash": hash_file(primary_artifact),
+        "source_hash": source_hash or hash_file(primary_artifact),
         "prompt_file": str(prompt_file_for_audit),
         "prompt_hash": hash_file(prompt_file_for_audit),
         "reviewer_prompt_hash": _hash_text(reviewer_prompt),
         "consulted_docs": consulted_docs,
+        "round_type": round_type,
     }
 
 
@@ -374,7 +383,13 @@ def _cache_matches(payload: dict, metadata: dict) -> bool:
     ):
         if payload.get(key) != metadata.get(key):
             return False
-    return True
+    # Compared with a default: every cache written before round types
+    # existed was a coverage round, and strict equality would discard all
+    # pre-upgrade caches of in-flight rounds (a full reviewer re-run each).
+    return (
+        payload.get("round_type", "coverage")
+        == metadata.get("round_type", "coverage")
+    )
 
 
 def _load_reviewer_cache(
@@ -1066,14 +1081,7 @@ def _reviewer_session_key_for_spec(
     raise ValueError(f"reviewer spec is not present in panel config: {spec!r}")
 
 
-# Shrink-round cadence: every five design-review rounds, the first three
-# review coverage and the last two review minimality (round four proposes
-# cuts, the design rerun applies them, round five reviews the result).
-SHRINK_CYCLE_ROUNDS = 5
-SHRINK_ROUNDS_PER_CYCLE = 2
-
-
-def _shrink_round_prompts(
+def _design_round_plan(
     *,
     feature_active: Path,
     panel_config: PanelConfig,
@@ -1082,34 +1090,33 @@ def _shrink_round_prompts(
     base_resume_prompt: str,
     gate_label: str,
     log_emit: Callable[[dict], None] | None,
-) -> dict[str, tuple[str, str]] | None:
-    """Decide whether this round is a shrink round; build its prompts.
+) -> tuple[str, dict[str, tuple[str, str]] | None]:
+    """Resolve this design-review round's type and prompt overrides.
 
-    The round ordinal is the number of DISTINCT prior design-review
-    round keys in log.jsonl, excluding the current key — stable across
-    resumed attempts of the same round, with no state file. On a shrink
-    round every reviewer's prompt replaces the coverage body with the
+    Coverage and budget (minimality) rounds strictly alternate; the gate
+    completes only when both types have passed on the same packet (see
+    autodev.budget.design_phase — replayed from log events, no state
+    file). "complete" should not reach dispatch (freshness checks accept
+    the gate first); it degrades to a coverage round. On a budget round
+    every reviewer's prompt replaces the coverage body with the
     minimality body, keeping the shared orchestrator context and file
     manifest; the resume prompt keeps the role-agnostic continuation
     preamble plus the body. Any failure degrades to a coverage round —
-    the panel must never be blocked by the shrink mechanism.
+    the panel must never be blocked by this mechanism.
     """
     try:
-        from autodev.budget import compute_spent, minimality_review_body
+        from autodev.budget import design_phase, minimality_review_body
 
-        prior_rounds = compute_spent(feature_active).review_round_keys
-        ordinal = len(prior_rounds - {round_key})
-        position = ordinal % SHRINK_CYCLE_ROUNDS
-        if position < SHRINK_CYCLE_ROUNDS - SHRINK_ROUNDS_PER_CYCLE:
-            return None
+        round_type = design_phase(feature_active, round_key)
+        if round_type != "budget":
+            return "coverage", None
         if log_emit is not None:
             try:
                 log_emit({
-                    "event": "shrink-round",
+                    "event": "budget-round",
                     "stage": "gate",
                     "gate": gate_label,
                     "round_key": round_key,
-                    "ordinal": ordinal,
                 })
             except Exception:
                 pass
@@ -1119,12 +1126,12 @@ def _shrink_round_prompts(
         context_part = base_prompt[cut:] if cut >= 0 else ""
         initial = body + context_part
         resume = base_resume_prompt + "\n\n---\n\n" + body
-        return {
+        return "budget", {
             spec.vendor: (initial, resume)
             for spec in panel_config.reviewers
         }
     except Exception:
-        return None
+        return "coverage", None
 
 
 def _dispatch_reviewer_slots(
@@ -1717,6 +1724,7 @@ def _synthesize_and_build_verdict(
     vendor_cwd: Path,
     probe_config: ProbeConfig | None,
     log_emit: Callable[[dict], None] | None,
+    round_type: str = "coverage",
 ) -> tuple[PanelVerdict, Path, str | None]:
     """Run the synthesizer for a single reviewer group and build the
     PanelVerdict. Returns (verdict, output_path, synth_infra_error_or_None).
@@ -1942,6 +1950,7 @@ def _synthesize_and_build_verdict(
         issue_clusters=issue_clusters,
         release_threshold=release_threshold,  # type: ignore[arg-type]
         decision_overridden_by_policy=decision_overridden_by_policy,
+        round_type=round_type,
     )
     out_path = feature_active / f"panel-{gate_label}.json"
     return v, out_path, synth_infra_error
@@ -1965,29 +1974,17 @@ def _run_one_group_pipeline(
     can decide error-handling policy across groups).
     """
     cfg = panel_config
-    metadata = _reviewer_cache_metadata(
-        gate_label=group_spec["name"],
-        primary_artifact=primary_artifact,
-        prompt_file_for_audit=group_spec["prompt_file_for_audit"],
-        reviewer_prompt=group_spec["reviewer_prompt"],
-        consulted_docs=group_spec["consulted_docs"],
-    )
-    reviewer_results, prior_failures = _load_reviewer_cache(
-        feature_active=feature_active,
-        gate_label=group_spec["name"],
-        reviewer_specs=cfg.reviewers,
-        metadata=metadata,
-    )
-
-    # Shrink-round cadence: three coverage rounds, then two rounds where
-    # the whole design-review panel reviews minimality instead. The
-    # trace-review group and the close-approval gate are untouched —
-    # scope proportionality is judged where scope.json is on the review
-    # surface.
+    # Coverage/budget alternation: the design-review group's round type is
+    # decided BEFORE the cache identity is built (round_type is part of
+    # it — a budget round over the same packet must not be served the
+    # coverage round's cached reviews). The trace-review group and the
+    # close-approval gate always review as "coverage" — scope minimality
+    # is judged where scope.json is on the review surface.
+    round_key = hash_file(primary_artifact)
+    round_type = "coverage"
     per_vendor_prompts: dict[str, tuple[str, str]] | None = None
     if group_spec["name"] == "design-review":
-        round_key = str(metadata["source_hash"])
-        per_vendor_prompts = _shrink_round_prompts(
+        round_type, per_vendor_prompts = _design_round_plan(
             feature_active=feature_active,
             panel_config=cfg,
             round_key=round_key,
@@ -1996,6 +1993,23 @@ def _run_one_group_pipeline(
             gate_label=group_spec["name"],
             log_emit=log_emit,
         )
+    metadata = _reviewer_cache_metadata(
+        gate_label=group_spec["name"],
+        primary_artifact=primary_artifact,
+        prompt_file_for_audit=group_spec["prompt_file_for_audit"],
+        reviewer_prompt=group_spec["reviewer_prompt"],
+        consulted_docs=group_spec["consulted_docs"],
+        round_type=round_type,
+        source_hash=round_key,
+    )
+    reviewer_results, prior_failures = _load_reviewer_cache(
+        feature_active=feature_active,
+        gate_label=group_spec["name"],
+        reviewer_specs=cfg.reviewers,
+        metadata=metadata,
+    )
+
+    if group_spec["name"] == "design-review":
         if log_emit is not None and _missing_reviewers(
             cfg.reviewers, reviewer_results,
         ):
@@ -2009,6 +2023,7 @@ def _run_one_group_pipeline(
                     "stage": "gate",
                     "gate": group_spec["name"],
                     "round_key": round_key,
+                    "round_type": round_type,
                 })
             except Exception:
                 pass
@@ -2052,6 +2067,7 @@ def _run_one_group_pipeline(
     # Healthy → synthesize immediately (no barrier waiting for other group).
     return _synthesize_and_build_verdict(
         gate_label=group_spec["name"],
+        round_type=round_type,
         reviewer_results=reviewer_results,
         primary_artifact=primary_artifact,
         prompt_file_for_audit=group_spec["prompt_file_for_audit"],

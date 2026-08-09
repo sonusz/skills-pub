@@ -616,6 +616,193 @@ class Orchestrator:
             logger.emit(stage="orchestrator", event="paused", feature=feature)
             raise GatePending("pause", "run `autodev resume` to continue")
 
+        if v.effectively_blocks():
+                logger.emit(
+                    stage="orchestrator", event="blocking-verdict-enforced",
+                    feature=feature,
+                    detail={"gate": v.gate, "verdict": v.verdict,
+                            "finding_count": len(v.findings)},
+                )
+                # Mechanism 2 (rigor-tier): fingerprint bookkeeping +
+                # stall diagnosis BEFORE the revision loop — a diagnosed
+                # round consumes no L[gate] and never dispatches a rerun.
+                diag = self._check_diagnosis(active, v.gate, v, logger, feature)
+                if diag is not None:
+                    raise GatePending(v.gate, diag.halt_reason)
+                decision = handle_panel_verdict(active, v.gate, v)
+                # When merging, override feedback_paths so the rerun
+                # agent reads BOTH verdict files.
+                if (
+                    merged_feedback_paths is not None
+                    and decision.kind == DecisionKind.LOCAL_REVISE
+                ):
+                    decision.feedback_paths = list(merged_feedback_paths)
+                logger.emit(stage="gate", event="revision-loop-triggered",
+                            feature=feature, detail={
+                                "gate": v.gate,
+                                "decision": decision.kind.value,
+                                "stage_to_rerun": decision.stage_to_rerun,
+                                "would_rerun": decision.would_rerun,
+                                "feedback_paths": decision.feedback_paths,
+                                "reason": decision.reason,
+                                "source": "pending-blocking-verdict",
+                            })
+                if decision.kind == DecisionKind.LOCAL_REVISE:
+                    return decision
+                if decision.kind == DecisionKind.HALT_FOR_HUMAN:
+                    logger.emit(stage="gate", event="revision-loop-halt",
+                                feature=feature, detail={
+                                    "gate": v.gate, "reason": decision.reason,
+                                    "source": "pending-blocking-verdict",
+                                })
+                    raise GatePending(v.gate, decision.reason)
+                raise GatePending(
+                    v.gate,
+                    f"blocking panel verdict on disk (verdict={v.verdict}, "
+                    f"{len(v.findings)} findings) — resolve before advancing"
+                )
+        return None
+
+    def _check_dirty_blocks(self, active: Path) -> None:
+        state = snapshot(self.cfg.repo_root)
+        if not state.is_dirty:
+            return
+        o = ov.load(active)
+        if o.has_active_dirty_ack():
+            return
+        raise DirtyWorkspace(
+            "workspace dirty — run `autodev acknowledge-dirty` "
+            "with a reason or clean via `git restore --worktree . && git clean -fd`"
+        )
+
+    def _advance_one(self, feature: str, active: Path, logger: JsonlLog) -> AdvanceResult:
+        if self._check_pause_sentinel(active):
+            logger.emit(stage="orchestrator", event="paused", feature=feature)
+            raise GatePending("pause", "run `autodev resume` to continue")
+
+        # v3-core: defense-in-depth for stale-verdict-skips-enforcement.
+        # Even if cascade considers a panel verdict fresh, a blocking
+        # verdict on disk must halt the pipeline. Cascade layer-1a
+        # catches most of these by invalidating on consulted-doc hash
+        # changes; this layer catches the rest.
+        pending_decision = self._enforce_pending_blocking_verdicts(
+            active, logger, feature,
+        )
+        if pending_decision is not None:
+            self._check_dirty_blocks(active)
+            if pending_decision.stage_to_rerun is not None:
+                return self._advance_coding(
+                    feature, active, pending_decision.stage_to_rerun, logger,
+                )
+            return AdvanceResult(
+                stage_name=f"panel-{pending_decision.gate}",
+                success=True,
+                detail=pending_decision.reason,
+            )
+
+        next_name = self._next_stage_name(active)
+        if next_name == "done":
+            logger.emit(stage="orchestrator", event="pipeline-done", feature=feature)
+            return AdvanceResult(stage_name="done", success=True)
+
+        self._check_dirty_blocks(active)
+
+        # Gate branches
+        if next_name in ARTIFACT_TO_GATE:
+            gate = ARTIFACT_TO_GATE[next_name]
+            return self._advance_gate(feature, active, gate, logger)
+
+        # Harness-authored design-loop artifacts
+        if next_name == "design_packet":
+            path = write_design_packet(active)
+            logger.emit(stage="design-packet", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="design_packet", success=True)
+        if next_name == "accepted_design":
+            path = write_accepted_design(
+                active,
+                active / "panel-design-review.json",
+                active / "panel-trace-review.json",
+            )
+            logger.emit(stage="accepted-design", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="accepted_design", success=True)
+        if next_name == "implementation_index":
+            path = write_implementation_index(active, repo_root=self.cfg.repo_root)
+            logger.emit(stage="implementation-index", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="implementation_index", success=True)
+        if next_name == "prd_checklist":
+            path = write_prd_checklist(active)
+            logger.emit(stage="prd-checklist", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="prd_checklist", success=True)
+
+        # Coding stage branches
+        if next_name in ("design", "scope", "trace", "test_plan"):
+            return self._advance_coding(feature, active, "design", logger)
+        if next_name in CODING_STAGES:
+            return self._advance_coding(feature, active, next_name, logger)
+
+        raise PreflightError(f"orchestrator does not know how to advance to {next_name!r}")
+
+    def _advance_gate(
+        self, feature: str, active: Path, gate: str, logger: JsonlLog,
+    ) -> AdvanceResult:
+        overrides = ov.load(active)
+        if overrides.has_active_skip_gate(gate):
+            logger.emit(stage="gate", event="skipped-by-override", feature=feature,
+                        detail={"gate": gate})
+            # Write a synthetic "skipped" verdict for cascade freshness.
+            self._write_skip_verdict(feature, active, gate, overrides)
+            return AdvanceResult(stage_name=f"panel-{gate}", success=True,
+                                 detail="skipped by override")
+
+        primary = self._gate_primary_artifact(active, gate)
+
+        current_hash = hash_file(primary)
+        existing = verdict_exists_and_valid(
+            feature_active=active, gate=gate, current_source_hash=current_hash,
+        )
+        if existing is None:
+            logger.emit(stage="gate", event="panel-start", feature=feature,
+                        detail={"gate": gate})
+            v = run_panel_gate(
+                gate=gate,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                feature=feature,
+                primary_artifact=primary,
+                panel_config=self.cfg.vendors.panel,
+                probe_config=self.cfg.vendors.probe,
+                log_emit=lambda d: logger.emit(
+                    stage=d.get("stage", "gate"),
+                    event=d.get("event", "panel"),
+                    feature=feature,
+                    detail=d,
+                ),
+            )
+        else:
+            v = existing
+        logger.emit(stage="gate", event="panel-done", feature=feature,
+                    detail={"gate": gate, "verdict": v.verdict,
+                            "invariant": v.has_invariant_violation()})
+
+        # Pause checkpoint: honor a `.pause` set WHILE the panel was
+        # running. The verdict is now durably on disk (run_panel_gate
+        # wrote it), but we have not yet called handle_panel_verdict —
+        # which bumps and persists L[gate] — nor dispatched a producer
+        # rerun. Halting here means a pause set mid-panel takes effect
+        # the moment the panel finishes, before the design agent revises,
+        # instead of one round later (the only earlier checks are at
+        # loop-top and _advance_one entry, both of which precede the
+        # panel run). On resume, _enforce_pending_blocking_verdicts
+        # re-reads this fresh verdict and dispatches the revision exactly
+        # once, so L[gate] is bumped exactly once — no double-count.
+        if self._check_pause_sentinel(active):
+            logger.emit(stage="orchestrator", event="paused", feature=feature)
+            raise GatePending("pause", "run `autodev resume` to continue")
+
         # For design-review, merge in the parallel trace-review verdict
         # so blocking findings from either group route through one
         # revision-loop decision.
@@ -624,6 +811,30 @@ class Orchestrator:
             v_merged, merged_feedback_paths = self._merge_trace_into_design(active, v)
             if v_merged is not None:
                 v = v_merged
+            # Coverage/budget alternation bookkeeping: one outcome event
+            # per (packet, round type), consumed by
+            # autodev.budget.design_phase to decide the next round type
+            # and gate completion. Emitted on the MERGED verdict (trace
+            # findings count toward pass/fail), and deliberately BEFORE
+            # the pause checkpoint below: a first-round pause must not
+            # leave the feature with zero outcome events, which the
+            # legacy escape in design_gate_satisfied would read as
+            # pre-alternation and accept the gate without a budget
+            # round. Re-emission on a cached revisit is harmless — the
+            # replay dedups first-wins.
+            if v.skip_reason is None:
+                try:
+                    logger.emit(
+                        stage="gate", event="design-round-outcome",
+                        feature=feature, detail={
+                            "gate": gate,
+                            "round_key": v.source_hash,
+                            "round_type": getattr(v, "round_type", "coverage"),
+                            "passed": not v.effectively_blocks(),
+                        },
+                    )
+                except Exception:
+                    pass
 
         if v.effectively_blocks():
             # Mechanism 2 (rigor-tier): fingerprint bookkeeping + stall
@@ -796,6 +1007,7 @@ class Orchestrator:
             release_threshold=v_design.release_threshold,
             decision_overridden_by_rigor=v_design.decision_overridden_by_rigor,
             decision_overridden_by_policy=v_design.decision_overridden_by_policy,
+            round_type=v_design.round_type,
         )
         return merged, ["panel-design-review.json", "panel-trace-review.json"]
 

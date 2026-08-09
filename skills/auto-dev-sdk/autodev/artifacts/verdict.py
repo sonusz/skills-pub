@@ -262,6 +262,12 @@ class PanelVerdict:
     # behavior: invariant violations and risks block; opinions do not.
     release_threshold: Priority = "P1"
     decision_overridden_by_policy: dict[str, Any] | None = None
+    # Which review the round performed: "coverage" (sufficiency — the
+    # default, and the only type for gates other than design-review) or
+    # "budget" (minimality). The design-review gate completes only when
+    # both types have passed on the same packet; the alternation is
+    # replayed from design-round-outcome log events.
+    round_type: str = "coverage"
 
     def has_invariant_violation(self) -> bool:
         return any(f.severity == "invariant_violation" for f in self.findings)
@@ -353,6 +359,8 @@ class PanelVerdict:
             d["decision_overridden_by_policy"] = dict(
                 self.decision_overridden_by_policy
             )
+        if self.round_type != "coverage":
+            d["round_type"] = self.round_type
         return d
 
 
@@ -534,6 +542,7 @@ def load_verdict(path: Path) -> PanelVerdict:
         ],
         release_threshold=raw.get("release_threshold", "P1"),
         decision_overridden_by_policy=raw.get("decision_overridden_by_policy"),
+        round_type=raw.get("round_type", "coverage"),
         decision=(
             ReviewDecision(
                 node=raw["decision"]["node"],

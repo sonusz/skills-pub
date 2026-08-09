@@ -12,13 +12,17 @@ Three responsibilities, all feature-scoped (one active/ dir):
    sizes its work against the feature's remaining budget, not only its
    own context window. Injection must never break prompt rendering: any
    error degrades to no lines.
-3. **Shrink rounds** (`minimality_review_body`): design-review rounds
-   run on a five-round cycle — three coverage rounds, then two shrink
-   rounds in which the WHOLE panel reviews minimality instead of
-   coverage (round four proposes cuts, the design rerun applies them,
-   round five reviews the result). The cadence needs no state of its
-   own: the round ordinal falls out of the `panel-review-round` events
-   already in log.jsonl.
+3. **Coverage/budget alternation** (`design_phase` +
+   `minimality_review_body`): design-review rounds alternate between two
+   types — coverage (sufficiency: is anything required missing?) and
+   budget (minimality: is anything present unrequired?), the whole panel
+   playing one role per round. The gate completes only when BOTH types
+   have passed on the same packet; a recorded pass is final (nothing is
+   re-reviewed or re-synthesized to "confirm" it). A pass leaves the
+   packet unchanged, so the next round runs the other type on the same
+   packet; a failure routes a design revision and the alternation
+   continues on the revised packet. State is replayed from
+   `design-round-outcome` events in log.jsonl — no state file.
 """
 from __future__ import annotations
 
@@ -41,9 +45,10 @@ class BudgetSpent:
     iterations: int = 0
     design_review_rounds: int = 0
     wall_hours: float = 0.0
-    # Distinct design-review packet hashes seen so far; the shrink-round
-    # cadence derives the current round's ordinal from this set.
-    review_round_keys: set[str] = field(default_factory=set)
+    # Distinct (packet hash, round type) design-review dispatches seen so
+    # far. Both alternation round types run on one unchanged packet, so
+    # the hash alone would under-count rounds by up to 2x.
+    review_round_keys: set[tuple[str, str]] = field(default_factory=set)
 
     @property
     def vendor_hours_total(self) -> float:
@@ -79,7 +84,7 @@ def compute_spent(feature_active: Path) -> BudgetSpent:
         return spent
     first_ts: datetime | None = None
     last_ts: datetime | None = None
-    review_round_keys: set[str] = set()
+    review_round_keys: set[tuple[str, str]] = set()
     def _consume(row: dict) -> None:
         nonlocal first_ts, last_ts
         ts = _parse_ts(row.get("ts", ""))
@@ -126,7 +131,10 @@ def compute_spent(feature_active: Path) -> BudgetSpent:
             # quota skips.
             key = detail.get("round_key")
             if isinstance(key, str) and key:
-                review_round_keys.add(key)
+                round_type = detail.get("round_type")
+                if round_type not in ("coverage", "budget"):
+                    round_type = "coverage"
+                review_round_keys.add((key, round_type))
 
     try:
         # Streamed, not read_text().splitlines(): feature logs grow to
@@ -241,7 +249,86 @@ def format_budget_lines(feature_active: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Shrink rounds
+# Coverage/budget alternation
+
+
+def _design_round_outcomes(feature_active: Path) -> list[tuple[str, str, bool]]:
+    """Deduped (round_key, round_type, passed) design-review outcomes.
+
+    First occurrence of a (round_key, round_type) pair wins: the
+    orchestrator may re-emit an outcome when it revisits a cached
+    verdict, and a fold over duplicates must stay idempotent.
+    """
+    log_path = Path(feature_active) / "log.jsonl"
+    outcomes: list[tuple[str, str, bool]] = []
+    seen: set[tuple[str, str]] = set()
+    if not log_path.exists():
+        return outcomes
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                row = _safe_row(line)
+                if row is None or row.get("event") != "design-round-outcome":
+                    continue
+                detail = row.get("detail") or {}
+                if not isinstance(detail, dict):
+                    continue
+                key = detail.get("round_key")
+                round_type = detail.get("round_type")
+                if (
+                    not isinstance(key, str) or not key
+                    or round_type not in ("coverage", "budget")
+                ):
+                    continue
+                if (key, round_type) in seen:
+                    continue
+                seen.add((key, round_type))
+                outcomes.append((key, round_type, bool(detail.get("passed"))))
+    except OSError:
+        return outcomes
+    return outcomes
+
+
+def design_gate_satisfied(feature_active: Path, round_key: str) -> bool:
+    """Is the design-review gate complete for packet ``round_key``?
+
+    True when both a coverage and a budget round have passed on this
+    packet. Legacy escape: a feature with NO design-round-outcome events
+    at all (started before the alternation existed, or a verdict written
+    by a run that crashed before emitting its outcome) keeps the old
+    single-round semantics — its existing passing verdict satisfies the
+    gate. The first outcome event a feature emits switches it to the
+    pairing rule for good.
+    """
+    outcomes = _design_round_outcomes(feature_active)
+    if not outcomes:
+        return True
+    passed_types = {t for k, t, p in outcomes if p and k == round_key}
+    return {"coverage", "budget"} <= passed_types
+
+
+def design_phase(feature_active: Path, round_key: str) -> str:
+    """What the design-review gate should do for packet ``round_key``.
+
+    Returns ``"complete"`` when both a coverage round and a budget round
+    have passed on this exact packet — the gate is satisfied and no
+    further review (or re-synthesis) runs. Otherwise returns the round
+    type to dispatch next: strict coverage/budget alternation by count
+    of completed rounds, except that a type which already passed on this
+    packet is never re-dispatched (flip to the other type instead).
+    Resume-stable: the in-flight round has no outcome event yet.
+    """
+    outcomes = _design_round_outcomes(feature_active)
+    coverage_passed = {k for k, t, p in outcomes if t == "coverage" and p}
+    budget_passed = {k for k, t, p in outcomes if t == "budget" and p}
+    if round_key in coverage_passed and round_key in budget_passed:
+        return "complete"
+    next_type = "coverage" if len(outcomes) % 2 == 0 else "budget"
+    if next_type == "coverage" and round_key in coverage_passed:
+        return "budget"
+    if next_type == "budget" and round_key in budget_passed:
+        return "coverage"
+    return next_type
 
 
 def minimality_review_body(feature_active: Path) -> str:

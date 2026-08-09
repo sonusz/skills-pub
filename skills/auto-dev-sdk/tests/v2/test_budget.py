@@ -100,6 +100,24 @@ class TestComputeSpent:
         ])
         assert compute_spent(feature_active).design_review_rounds == 2
 
+    def test_coverage_and_budget_on_one_packet_are_two_rounds(
+        self, feature_active: Path,
+    ) -> None:
+        # The alternation runs both round types on one unchanged packet;
+        # the hash alone would under-count design-review spend by 2x.
+        _write_log(feature_active, [
+            _row("2026-08-06T00:00:00+00:00", "panel-review-round", "gate",
+                 {"gate": "design-review", "round_key": "sha256:aa",
+                  "round_type": "coverage"}),
+            _row("2026-08-06T01:00:00+00:00", "panel-review-round", "gate",
+                 {"gate": "design-review", "round_key": "sha256:aa",
+                  "round_type": "budget"}),
+            _row("2026-08-06T02:00:00+00:00", "panel-review-round", "gate",
+                 {"gate": "design-review", "round_key": "sha256:aa",
+                  "round_type": "budget"}),
+        ])
+        assert compute_spent(feature_active).design_review_rounds == 2
+
     def test_out_of_order_timestamps_still_span_min_to_max(
         self, feature_active: Path,
     ) -> None:
@@ -203,8 +221,123 @@ class TestTargetsAndLines:
         assert "BUDGET_RULE" in joined
 
 
-class TestShrinkRound:
-    """Cadence: three coverage rounds, then two whole-panel shrink rounds."""
+def _outcome_row(i: int, key: str, round_type: str, passed: bool) -> dict:
+    return _row(
+        f"2026-08-06T{i:02d}:00:00+00:00", "design-round-outcome", "gate",
+        {"gate": "design-review", "round_key": key,
+         "round_type": round_type, "passed": passed},
+    )
+
+
+class TestDesignPhase:
+    """Coverage/budget alternation replayed from design-round-outcome events."""
+
+    def _phase(self, feature_active: Path, outcomes, round_key="P"):
+        from autodev.budget import design_phase
+        _write_log(feature_active, [
+            _outcome_row(i, k, t, p) for i, (k, t, p) in enumerate(outcomes)
+        ] or [_row("2026-08-06T00:00:00+00:00", "noise")])
+        return design_phase(feature_active, round_key)
+
+    def test_empty_log_starts_with_coverage(self, feature_active: Path) -> None:
+        assert self._phase(feature_active, []) == "coverage"
+
+    def test_alternates_regardless_of_outcome(self, feature_active: Path) -> None:
+        # C fail -> budget next; C fail, B fail -> coverage next.
+        assert self._phase(
+            feature_active, [("P0", "coverage", False)], round_key="P1",
+        ) == "budget"
+        assert self._phase(
+            feature_active,
+            [("P0", "coverage", False), ("P1", "budget", False)],
+            round_key="P2",
+        ) == "coverage"
+
+    def test_coverage_pass_leads_to_budget_on_same_packet(
+        self, feature_active: Path,
+    ) -> None:
+        assert self._phase(
+            feature_active, [("P", "coverage", True)], round_key="P",
+        ) == "budget"
+
+    def test_both_passed_on_same_packet_is_complete(
+        self, feature_active: Path,
+    ) -> None:
+        assert self._phase(
+            feature_active,
+            [("P", "coverage", True), ("P", "budget", True)],
+            round_key="P",
+        ) == "complete"
+
+    def test_pass_pair_on_different_packets_is_not_complete(
+        self, feature_active: Path,
+    ) -> None:
+        # Budget pass on P1, coverage pass later on P2: P2 still owes budget.
+        assert self._phase(
+            feature_active,
+            [("P1", "coverage", False), ("P2", "budget", True),
+             ("P2", "coverage", True)],
+            round_key="P2",
+        ) == "complete"
+        assert self._phase(
+            feature_active,
+            [("P1", "coverage", False), ("P1", "budget", True),
+             ("P2", "coverage", True)],
+            round_key="P2",
+        ) == "budget"
+
+    def test_recorded_pass_is_never_redispatched(
+        self, feature_active: Path,
+    ) -> None:
+        # Parity says coverage, but coverage already passed this packet:
+        # flip to budget instead of re-reviewing a settled type.
+        assert self._phase(
+            feature_active,
+            [("P", "coverage", True), ("P", "budget", False)],
+            round_key="P",
+        ) == "budget"
+        assert self._phase(
+            feature_active,
+            [("Q", "coverage", False), ("P", "coverage", True)],
+            round_key="P",
+        ) == "budget"
+
+    def test_gate_satisfied_requires_pair_once_events_exist(
+        self, feature_active: Path,
+    ) -> None:
+        from autodev.budget import design_gate_satisfied
+        _write_log(feature_active, [
+            _outcome_row(0, "P", "coverage", True),
+        ])
+        assert design_gate_satisfied(feature_active, "P") is False
+        _write_log(feature_active, [
+            _outcome_row(0, "P", "coverage", True),
+            _outcome_row(1, "P", "budget", True),
+        ])
+        assert design_gate_satisfied(feature_active, "P") is True
+
+    def test_gate_satisfied_legacy_escape_without_events(
+        self, feature_active: Path,
+    ) -> None:
+        # In-flight features from before the alternation have passing
+        # verdicts but no outcome events; they keep single-round
+        # semantics instead of being retroactively blocked.
+        from autodev.budget import design_gate_satisfied
+        assert design_gate_satisfied(feature_active, "P") is True
+
+    def test_duplicate_events_do_not_shift_parity(
+        self, feature_active: Path,
+    ) -> None:
+        # The orchestrator may re-emit an outcome on a cached revisit.
+        assert self._phase(
+            feature_active,
+            [("P", "coverage", True), ("P", "coverage", True)],
+            round_key="P",
+        ) == "budget"
+
+
+class TestDesignRoundPlan:
+    """Runner-side plan: type selection + whole-panel budget prompts."""
 
     @staticmethod
     def _config():
@@ -220,16 +353,8 @@ class TestShrinkRound:
             synthesizer=PanelSynthesizerSpec(vendor="codex", model="fake"),
         )
 
-    @staticmethod
-    def _log_prior_rounds(feature_active: Path, keys: list[str]) -> None:
-        _write_log(feature_active, [
-            _row(f"2026-08-06T0{i}:00:00+00:00", "panel-review-round", "gate",
-                 {"gate": "design-review", "round_key": key})
-            for i, key in enumerate(keys)
-        ])
-
-    def _resolve(self, feature_active: Path, *, round_key="rk-cur", **kwargs):
-        from autodev.panel.runner import _shrink_round_prompts
+    def _plan(self, feature_active: Path, *, round_key="P", **kwargs):
+        from autodev.panel.runner import _design_round_plan
         defaults = dict(
             feature_active=feature_active,
             panel_config=self._config(),
@@ -242,55 +367,37 @@ class TestShrinkRound:
             log_emit=None,
         )
         defaults.update(kwargs)
-        return _shrink_round_prompts(**defaults)
+        return defaults, __import__("autodev.panel.runner", fromlist=["x"])._design_round_plan(**defaults)
 
-    def test_first_three_rounds_are_coverage(self, feature_active: Path) -> None:
-        for n in (0, 1, 2):
-            self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(n)])
-            assert self._resolve(feature_active) is None
+    def test_first_round_is_coverage_with_shared_prompts(
+        self, feature_active: Path,
+    ) -> None:
+        _, (round_type, prompts) = self._plan(feature_active)
+        assert round_type == "coverage"
+        assert prompts is None
 
-    def test_rounds_four_and_five_are_shrink(self, feature_active: Path) -> None:
-        for n in (3, 4):
-            self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(n)])
-            prompts = self._resolve(feature_active)
-            assert prompts is not None
-            assert set(prompts) == {"claude", "codex", "grok"}
-            initial, resume = prompts["claude"]
-            # Coverage body replaced; shared context kept.
-            assert "minimality review" in initial
-            assert "COVERAGE BODY" not in initial
-            assert "## Orchestrator context" in initial
-            # Resume keeps the role-agnostic preamble plus the body.
-            assert resume.startswith("CONTINUATION PREAMBLE")
-            assert "minimality review" in resume
-
-    def test_cycle_repeats(self, feature_active: Path) -> None:
-        self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(5)])
-        assert self._resolve(feature_active) is None
-        self._log_prior_rounds(feature_active, [f"rk-{i}" for i in range(8)])
-        assert self._resolve(feature_active) is not None
-
-    def test_resume_of_same_round_is_stable(self, feature_active: Path) -> None:
-        # The current round's own event may already be in the log from a
-        # prior attempt; the ordinal must not shift.
-        self._log_prior_rounds(
-            feature_active, ["rk-0", "rk-1", "rk-2", "rk-cur"],
-        )
-        assert self._resolve(feature_active, round_key="rk-cur") is not None
-        self._log_prior_rounds(feature_active, ["rk-0", "rk-1", "rk-cur"])
-        assert self._resolve(feature_active, round_key="rk-cur") is None
-
-    def test_shrink_round_emits_audit_event(self, feature_active: Path) -> None:
+    def test_budget_round_overrides_all_vendors(
+        self, feature_active: Path,
+    ) -> None:
+        _write_log(feature_active, [
+            _outcome_row(0, "P", "coverage", True),
+        ])
         events: list[dict] = []
-        self._log_prior_rounds(feature_active, ["rk-0", "rk-1", "rk-2"])
-        self._resolve(feature_active, log_emit=events.append)
-        assert [(e["event"], e["ordinal"]) for e in events] == [
-            ("shrink-round", 3),
+        _, (round_type, prompts) = self._plan(
+            feature_active, log_emit=events.append,
+        )
+        assert round_type == "budget"
+        assert prompts is not None
+        assert set(prompts) == {"claude", "codex", "grok"}
+        initial, resume = prompts["claude"]
+        assert "minimality review" in initial
+        assert "COVERAGE BODY" not in initial
+        assert "## Orchestrator context" in initial
+        assert resume.startswith("CONTINUATION PREAMBLE")
+        assert "minimality review" in resume
+        assert [(e["event"], e["round_key"]) for e in events] == [
+            ("budget-round", "P"),
         ]
-        events.clear()
-        self._log_prior_rounds(feature_active, ["rk-0"])
-        self._resolve(feature_active, log_emit=events.append)
-        assert events == []
 
 
 class TestMinimalityBody:

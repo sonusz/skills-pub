@@ -277,6 +277,20 @@ def verdict_exists_and_valid(
         return None
     if v.source_hash != current_source_hash:
         return None  # stale by primary-artifact hash
+    # Coverage/budget alternation: the design-review gate is satisfied only
+    # when BOTH round types have passed on this packet (replayed from
+    # design-round-outcome log events). A verdict from a passing round
+    # whose counterpart has not passed yet is deliberately "not valid" —
+    # the orchestrator then re-enters the gate and the runner dispatches
+    # the other round type on the same packet, with no design rerun.
+    # Skipped verdicts (operator override) bypass the pairing.
+    if gate == "design-review" and v.skip_reason is None:
+        try:
+            from autodev.budget import design_gate_satisfied
+            if not design_gate_satisfied(feature_active, v.source_hash):
+                return None
+        except Exception:
+            pass
     # v3-core: also validate every consulted_docs entry's hash matches
     # current file. This catches the multi-upstream primary-pair case
     # where (e.g.) scope.json regenerated but prd.md unchanged would

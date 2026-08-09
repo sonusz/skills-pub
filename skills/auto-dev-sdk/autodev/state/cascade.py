@@ -90,6 +90,28 @@ def _panel_consulted_docs_fresh(panel_verdict_path: Path) -> bool:
     return ok
 
 
+def _design_round_pair_complete(feature_active: Path, design_verdict_path: Path) -> bool:
+    """Coverage/budget alternation: the design-review artifact is done only
+    when BOTH round types have passed on the packet the verdict reviews
+    (replayed from design-round-outcome log events). Otherwise the cascade
+    keeps routing back into the gate for the other round type. Skipped
+    verdicts (operator override) and any replay failure count as complete
+    (legacy single-round behavior)."""
+    try:
+        data = json.loads(design_verdict_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return True
+        if data.get("skip_reason") is not None:
+            return True
+        source_hash = data.get("source_hash")
+        if not isinstance(source_hash, str) or not source_hash:
+            return True
+        from autodev.budget import design_gate_satisfied
+        return design_gate_satisfied(feature_active, source_hash)
+    except Exception:
+        return True
+
+
 def _design_panel_pair_fresh(design_verdict_path: Path) -> bool:
     """The design-review cascade node represents both parallel panel
     groups. A stale/missing/incomplete trace-review verdict must make the
@@ -158,6 +180,9 @@ class StalenessCascade:
             if ref.is_json and p.name.startswith("panel-"):
                 if p.name == "panel-design-review.json":
                     if not _design_panel_pair_fresh(p):
+                        result[ref.name] = False
+                        continue
+                    if not _design_round_pair_complete(self.root, p):
                         result[ref.name] = False
                         continue
                 elif not _panel_consulted_docs_fresh(p):
