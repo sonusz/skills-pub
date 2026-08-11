@@ -436,12 +436,9 @@ class Orchestrator:
                     detail={"gate": v.gate, "verdict": v.verdict,
                             "finding_count": len(v.findings)},
                 )
-                # Mechanism 2 (rigor-tier): fingerprint bookkeeping +
-                # stall diagnosis BEFORE the revision loop — a diagnosed
-                # round consumes no L[gate] and never dispatches a rerun.
-                diag = self._check_diagnosis(active, v.gate, v, logger, feature)
-                if diag is not None:
-                    raise GatePending(v.gate, diag.halt_reason)
+                # Fingerprints tune the next correction's trust region but
+                # never halt. The normal revision loop/L_MAX owns stopping.
+                self._prepare_panel_rework(active, v.gate, v, logger, feature)
                 decision = handle_panel_verdict(active, v.gate, v)
                 # When merging, override feedback_paths so the rerun
                 # agent reads BOTH verdict files.
@@ -623,12 +620,9 @@ class Orchestrator:
                     detail={"gate": v.gate, "verdict": v.verdict,
                             "finding_count": len(v.findings)},
                 )
-                # Mechanism 2 (rigor-tier): fingerprint bookkeeping +
-                # stall diagnosis BEFORE the revision loop — a diagnosed
-                # round consumes no L[gate] and never dispatches a rerun.
-                diag = self._check_diagnosis(active, v.gate, v, logger, feature)
-                if diag is not None:
-                    raise GatePending(v.gate, diag.halt_reason)
+                # Fingerprints tune the next correction's trust region but
+                # never halt. The normal revision loop/L_MAX owns stopping.
+                self._prepare_panel_rework(active, v.gate, v, logger, feature)
                 decision = handle_panel_verdict(active, v.gate, v)
                 # When merging, override feedback_paths so the rerun
                 # agent reads BOTH verdict files.
@@ -837,12 +831,9 @@ class Orchestrator:
                     pass
 
         if v.effectively_blocks():
-            # Mechanism 2 (rigor-tier): fingerprint bookkeeping + stall
-            # diagnosis BEFORE the revision loop — a diagnosed round
-            # consumes no L[gate] and never dispatches a rerun.
-            diag = self._check_diagnosis(active, gate, v, logger, feature)
-            if diag is not None:
-                raise GatePending(gate, diag.halt_reason)
+            # Fingerprints tune the next correction's trust region but never
+            # halt. The normal revision loop/L_MAX owns stopping.
+            self._prepare_panel_rework(active, gate, v, logger, feature)
             # v3-core R4: revision loop picks a producer rerun based on
             # reviewer-emitted filename-qualified targets, or halts for
             # human when not auto-rerunnable / L_MAX reached.
@@ -894,36 +885,25 @@ class Orchestrator:
         (active / "rework-mode.json").unlink(missing_ok=True)
         return AdvanceResult(stage_name=f"panel-{gate}", success=True)
 
-    def _check_diagnosis(
+    def _prepare_panel_rework(
         self, active: Path, gate: str, v: PanelVerdict,
         logger: JsonlLog, feature: str,
-    ):
-        """Mechanism 2 pre-revision-loop hook (docs/proposals/rigor-tier.md).
+    ) -> None:
+        """Record finding telemetry and select the next rework mode.
 
-        Records the verdict's blocking-finding fingerprints; on
-        recurrence runs the stall classifier and returns a
-        DiagnosisResult (caller halts). Otherwise refreshes
-        rework-mode.json for the upcoming producer rerun and returns
-        None. Never raises — a bookkeeping failure must not take down
-        gate enforcement; it degrades to the pre-mechanism-2 path.
+        Never raises or halts. A bookkeeping failure degrades to the normal
+        revision loop without fingerprint-informed trust-region selection.
         """
         try:
-            from autodev.diagnosis import check_and_diagnose
-            diag = check_and_diagnose(active, gate, v)
+            from autodev.diagnosis import prepare_panel_rework
+            mode = prepare_panel_rework(active, gate, v)
         except Exception as e:  # pragma: no cover - defensive
-            logger.emit(stage="gate", event="diagnosis-error",
+            logger.emit(stage="gate", event="rework-mode-error",
                         feature=feature,
                         detail={"gate": gate, "error": str(e)[:300]})
-            return None
-        if diag is not None:
-            logger.emit(stage="gate", event="stall-diagnosed",
-                        feature=feature, detail={
-                            "gate": gate,
-                            "classification": diag.classification,
-                            "pivot_rs": diag.pivot_rs,
-                            "diagnosis": str(diag.diagnosis_path),
-                        })
-        return diag
+            return
+        logger.emit(stage="gate", event="rework-mode-selected",
+                    feature=feature, detail={"gate": gate, "mode": mode})
 
     def _merge_trace_into_design(
         self, active: Path, v_design: PanelVerdict,
@@ -1227,6 +1207,7 @@ class Orchestrator:
     ) -> list[str]:
         """Return stage-relevant feedback/context artifacts for prompt rendering."""
         context_artifacts: list[str] = []
+        fresh_design = stage == "design" and not primary_target.exists()
 
         def append_once(path: Path) -> None:
             rendered = str(path)
@@ -1282,25 +1263,27 @@ class Orchestrator:
             },
             "build": {"panel-close-approval.json"},
         }
-        for p in sorted(active.glob("panel-*.json")):
-            if p.name.endswith(".docs.json"):
-                continue
-            allowed_panels = panel_context_by_stage.get(stage, set())
-            if p.name in allowed_panels:
-                append_once(p)
+        if not fresh_design:
+            for p in sorted(active.glob("panel-*.json")):
+                if p.name.endswith(".docs.json"):
+                    continue
+                allowed_panels = panel_context_by_stage.get(stage, set())
+                if p.name in allowed_panels:
+                    append_once(p)
 
         # Existing own artifact lets a stage revise in place rather than
         # regenerate from scratch.
-        if primary_target.exists():
-            append_once(primary_target)
-        for extra in extra_targets:
-            if extra.exists():
-                append_once(extra)
+        if not fresh_design:
+            if primary_target.exists():
+                append_once(primary_target)
+            for extra in extra_targets:
+                if extra.exists():
+                    append_once(extra)
 
-        if stage == "design":
-            changelog_path = active / "design-changelog.json"
-            if changelog_path.exists():
-                append_once(changelog_path)
+            if stage == "design":
+                changelog_path = active / "design-changelog.json"
+                if changelog_path.exists():
+                    append_once(changelog_path)
 
         if stage == "build":
             # Build is inside the Ralph loop: each retry must see the latest
@@ -1360,7 +1343,7 @@ class Orchestrator:
         # edits only what changed. The runner pre-seeds the primary
         # (design.md) itself via preseed=True. A stale extra .tmp with no
         # landed source is dropped so it can't leak into the next round.
-        preseed = stage == "design"
+        preseed = stage == "design" and primary_target.exists()
         if preseed:
             for extra_target in extra_targets:
                 extra_tmp = extra_target.with_name(extra_target.name + ".tmp")
@@ -2188,31 +2171,6 @@ class Orchestrator:
             i, dev, dx = routable[0]
             layer = dx["defective_layer"]
             trigger_ref = f"build.json#/deviations/{i}"
-
-            # Mechanism 4 deferral-bet settlement: the same scope items
-            # bouncing back from build across a design change means the
-            # interior deferral is falsified — halt with a depth-aware
-            # amendment draft instead of grinding L to the generic halt.
-            try:
-                from autodev.diagnosis import check_route_recurrence
-                scope_ids = sorted({
-                    str(d.get("scope_id"))
-                    for _, d, _dx in routable if d.get("scope_id")
-                })
-                route_diag = check_route_recurrence(
-                    active, layer, scope_ids, build_path,
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                logger.emit(stage="build", event="route-diagnosis-error",
-                            feature=feature, detail={"error": str(e)[:300]})
-                route_diag = None
-            if route_diag is not None:
-                logger.emit(stage="build", event="deferral-falsified",
-                            feature=feature, detail={
-                                "layer": layer,
-                                "pivot_rs": route_diag.pivot_rs,
-                            })
-                raise GatePending("build_blocking", route_diag.halt_reason)
 
             decision = route_to_layer(
                 active, layer, trigger_ref=trigger_ref,

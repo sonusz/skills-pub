@@ -744,6 +744,33 @@ def test_missing_pending_feedback_fails_closed(git_repo, feature_active):
         )
 
 
+def test_fresh_design_does_not_rehydrate_discarded_design_context(
+    git_repo, feature_active,
+):
+    """Invalidating design.md is a true rebaseline, not history replay."""
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    extras = [
+        feature_active / "scope.json",
+        feature_active / "trace.md",
+        feature_active / "test-plan.md",
+        feature_active / "design-changelog.json",
+    ]
+    for path in extras:
+        path.write_text("discarded prior design\n", encoding="utf-8")
+    (feature_active / "panel-design-review.json").write_text(
+        "discarded prior verdict\n", encoding="utf-8",
+    )
+
+    context = orch._context_artifacts_for_stage(
+        feature_active,
+        "design",
+        feature_active / "design.md",
+        extras,
+    )
+
+    assert context == []
+
+
 def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature_active):
     _seed_feature(feature_active, ids=["t-1", "t-2"])
     (feature_active / "build.json").write_text(

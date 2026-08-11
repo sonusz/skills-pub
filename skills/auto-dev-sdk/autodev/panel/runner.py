@@ -350,7 +350,7 @@ def _reviewer_cache_metadata(
     source_hash: str | None = None,
 ) -> dict:
     # round_type separates cache identities of a coverage round and a
-    # budget round over the SAME packet — the coverage/budget alternation
+    # budget round over the SAME packet — the coverage/budget cadence
     # runs both on one unchanged packet, and a budget round must never be
     # served the coverage round's cached reviews. source_hash may be
     # passed in to reuse a hash already computed for the round decision
@@ -1093,7 +1093,7 @@ def _design_round_plan(
 ) -> tuple[str, dict[str, tuple[str, str]] | None]:
     """Resolve this design-review round's type and prompt overrides.
 
-    Coverage and budget (minimality) rounds strictly alternate; the gate
+    Coverage and budget (minimality) rounds follow the six-round cadence; the gate
     completes only when both types have passed on the same packet (see
     autodev.budget.design_phase — replayed from log events, no state
     file). "complete" should not reach dispatch (freshness checks accept

@@ -230,7 +230,7 @@ def _outcome_row(i: int, key: str, round_type: str, passed: bool) -> dict:
 
 
 class TestDesignPhase:
-    """Coverage/budget alternation replayed from design-round-outcome events."""
+    """Three-coverage/three-budget cadence replayed from outcome events."""
 
     def _phase(self, feature_active: Path, outcomes, round_key="P"):
         from autodev.budget import design_phase
@@ -242,15 +242,42 @@ class TestDesignPhase:
     def test_empty_log_starts_with_coverage(self, feature_active: Path) -> None:
         assert self._phase(feature_active, []) == "coverage"
 
-    def test_alternates_regardless_of_outcome(self, feature_active: Path) -> None:
-        # C fail -> budget next; C fail, B fail -> coverage next.
+    def test_six_round_cycle_uses_three_coverage_then_three_budget(
+        self, feature_active: Path,
+    ) -> None:
         assert self._phase(
             feature_active, [("P0", "coverage", False)], round_key="P1",
+        ) == "coverage"
+        assert self._phase(
+            feature_active,
+            [("P0", "coverage", False), ("P1", "coverage", False)],
+            round_key="P2",
+        ) == "coverage"
+        assert self._phase(
+            feature_active,
+            [("P0", "coverage", False), ("P1", "coverage", False),
+             ("P2", "coverage", False)],
+            round_key="P3",
         ) == "budget"
         assert self._phase(
             feature_active,
-            [("P0", "coverage", False), ("P1", "budget", False)],
-            round_key="P2",
+            [("P0", "coverage", False), ("P1", "coverage", False),
+             ("P2", "coverage", False), ("P3", "budget", False)],
+            round_key="P4",
+        ) == "budget"
+        assert self._phase(
+            feature_active,
+            [("P0", "coverage", False), ("P1", "coverage", False),
+             ("P2", "coverage", False), ("P3", "budget", False),
+             ("P4", "budget", False)],
+            round_key="P5",
+        ) == "budget"
+        assert self._phase(
+            feature_active,
+            [("P0", "coverage", False), ("P1", "coverage", False),
+             ("P2", "coverage", False), ("P3", "budget", False),
+             ("P4", "budget", False), ("P5", "budget", False)],
+            round_key="P6",
         ) == "coverage"
 
     def test_coverage_pass_leads_to_budget_on_same_packet(
@@ -289,7 +316,7 @@ class TestDesignPhase:
     def test_recorded_pass_is_never_redispatched(
         self, feature_active: Path,
     ) -> None:
-        # Parity says coverage, but coverage already passed this packet:
+        # Cadence says coverage, but coverage already passed this packet:
         # flip to budget instead of re-reviewing a settled type.
         assert self._phase(
             feature_active,
@@ -410,6 +437,7 @@ class TestMinimalityBody:
         ])
         body = minimality_review_body(feature_active)
         assert "Shrink round: minimality review" in body
+        assert "must not conflict with any core PRD requirement" in body
         assert "[budget]" in body
         assert "BUDGET_SPENT" in body
         assert "Zero findings is then the correct report" in body

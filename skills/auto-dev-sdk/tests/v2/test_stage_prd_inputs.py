@@ -277,6 +277,36 @@ def test_design_prompt_body_mentions_prd():
     assert "PROTECTED_PATHS" in body
 
 
+def test_fresh_design_prompt_omits_old_iteration_history(
+    feature_active, git_repo,
+):
+    (feature_active / "prd.md").write_text("# prd\n", encoding="utf-8")
+    (feature_active / "log.jsonl").write_text(
+        '{"ts":"2026-08-09T00:00:00+00:00","stage":"design",'
+        '"event":"stage-complete","feature":"t","detail":{}}\n',
+        encoding="utf-8",
+    )
+
+    body = render_stage_prompt(
+        stage="design",
+        feature="t",
+        feature_active=feature_active,
+        repo_root=git_repo,
+        primary_target=feature_active / "design.md",
+        extra_targets=[
+            feature_active / "scope.json",
+            feature_active / "trace.md",
+            feature_active / "test-plan.md",
+            feature_active / "design-changelog.json",
+        ],
+        context_artifacts=[],
+        preseeded=False,
+    )
+
+    assert "CONTEXT_ARTIFACTS: [] (initial run)" in body
+    assert "## Iteration history" not in body
+
+
 def test_build_prompt_body_mentions_prd():
     body = (
         Path(__file__).resolve().parent.parent.parent

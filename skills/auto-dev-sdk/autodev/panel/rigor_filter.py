@@ -35,9 +35,9 @@ Rule B (fail closed): missing ``failure_class`` → mainline; missing
 fail-closed event is returned for loud logging so a silently-inert
 filter is observable.
 
-Counterfactual mode (mechanism 2's stall classifier): pass
-``override_level`` to re-run the filter with selected Rs lowered; the
-caller supplies copies of the findings.
+Counterfactual analysis utility: pass ``override_level`` to re-run the filter
+with selected Rs lowered; the caller supplies copies of the findings. This is
+diagnostic only and does not stop the pipeline or request a PRD amendment.
 """
 from __future__ import annotations
 

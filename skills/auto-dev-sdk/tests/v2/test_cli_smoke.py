@@ -262,6 +262,54 @@ def test_cli_invalidate_clears_same_cycle_skip_gate(git_repo, feature_active):
     assert not loaded.has_active_skip_gate("design-review")
 
 
+def test_cli_invalidate_design_clears_whole_active_package_but_keeps_history(
+    git_repo, feature_active,
+):
+    from autodev import overrides_api as ov
+
+    ov.record_skip_gate(feature_active, gate="design-review", reason="r", who="t")
+    active_outputs = (
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "design-changelog.json",
+        "design-packet.json",
+        "panel-design-review.json",
+        "panel-trace-review.json",
+        "accepted-design.json",
+        "panel-coverage-map.json",
+        "panel-design-review.docs.json",
+        "panel-design-review.reviewers.json",
+        "panel-trace-review.docs.json",
+        "panel-trace-review.reviewers.json",
+        "diagnosis.json",
+        "rework-mode.json",
+    )
+    for name in active_outputs:
+        (feature_active / name).write_text("old\n", encoding="utf-8")
+    for name in active_outputs[:5]:
+        (feature_active / f"{name}.tmp").write_text("partial\n", encoding="utf-8")
+    history = feature_active / "design-package-history" / "package-001"
+    history.mkdir(parents=True)
+    (history / "design.md").write_text("recoverable\n", encoding="utf-8")
+    (feature_active / "prd.md").write_text("binding\n", encoding="utf-8")
+
+    code = main([
+        "invalidate", "demo", "design", "--repo-root", str(git_repo),
+    ])
+
+    assert code == exit_codes.OK
+    assert not any((feature_active / name).exists() for name in active_outputs)
+    assert not any(
+        (feature_active / f"{name}.tmp").exists()
+        for name in active_outputs[:5]
+    )
+    assert (history / "design.md").read_text(encoding="utf-8") == "recoverable\n"
+    assert (feature_active / "prd.md").read_text(encoding="utf-8") == "binding\n"
+    assert not ov.load(feature_active).has_active_skip_gate("design-review")
+
+
 def test_cli_status_surfaces_overrides(git_repo, feature_active, capsys):
     from autodev import overrides_api as ov
     ov.record_skip_gate(feature_active, gate="design-review", reason="hotfix", who="dev")

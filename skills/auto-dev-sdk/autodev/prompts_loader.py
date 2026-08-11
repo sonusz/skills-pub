@@ -235,7 +235,11 @@ def render_stage_prompt(
         render_iteration_history,
     )
 
-    history = build_iteration_history(feature_active)
+    # A human-invalidated design is a true rebaseline. Feeding its old event
+    # timeline back into an otherwise empty initial prompt would recreate the
+    # discarded design through a hidden context channel.
+    fresh_design = stage == "design" and not preseeded and not effective_context
+    history = [] if fresh_design else build_iteration_history(feature_active)
     if history:
         ctx_lines.append("")
         ctx_lines.append("## Iteration history (oldest → newest)")

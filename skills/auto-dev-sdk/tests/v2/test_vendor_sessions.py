@@ -361,6 +361,59 @@ def test_session_keys_are_stable_and_reviewer_slots_are_isolated(tmp_path: Path)
     assert len({first, second, trace}) == 3
 
 
+def test_design_and_design_review_sessions_rotate_on_review_type_switch(
+    tmp_path: Path,
+) -> None:
+    active = tmp_path / "repo" / "docs" / "features" / "feature-a" / "active"
+    active.mkdir(parents=True)
+    log_path = active / "log.jsonl"
+
+    def append_round(round_key: str, round_type: str) -> None:
+        row = {
+            "event": "panel-review-round",
+            "detail": {
+                "gate": "design-review",
+                "round_key": round_key,
+                "round_type": round_type,
+            },
+        }
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+    def reviewer_key(gate: str = "design-review") -> str:
+        return reviewer_session_key(
+            active, gate=gate, slot=0,
+            configured_vendor="claude", configured_model="opus",
+        )
+
+    initial_design = feature_session_key(active, "design")
+    initial_reviewer = reviewer_key()
+    initial_trace = reviewer_key("trace-review")
+
+    append_round("packet-1", "coverage")
+    append_round("packet-2", "coverage")
+    assert feature_session_key(active, "design") == initial_design
+    assert reviewer_key() == initial_reviewer
+
+    append_round("packet-3", "budget")
+    budget_design = feature_session_key(active, "design")
+    budget_reviewer = reviewer_key()
+    assert budget_design != initial_design
+    assert budget_reviewer != initial_reviewer
+
+    append_round("packet-3", "budget")  # resumed duplicate: no new epoch
+    append_round("packet-4", "budget")
+    assert feature_session_key(active, "design") == budget_design
+    assert reviewer_key() == budget_reviewer
+
+    append_round("packet-5", "coverage")
+    assert feature_session_key(active, "design") not in {
+        initial_design, budget_design,
+    }
+    assert reviewer_key() not in {initial_reviewer, budget_reviewer}
+    assert reviewer_key("trace-review") == initial_trace
+
+
 def test_missing_native_session_is_invalidated_and_next_call_starts_fresh(
     tmp_path: Path,
     fake_vendor_env: tuple[dict[str, str], Path],

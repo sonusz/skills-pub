@@ -72,6 +72,14 @@ user wants" (PRD) and "what must be built + how it must be verified"
   - `build.json` if a build halt routed back here: inspect
     `deviations[]` entries and address each one's `evidence` pointer
 
+On an initial run (`CONTEXT_ARTIFACTS: []`), derive the design only from the
+current PRD, current source tree, and current architecture/reference inputs
+named by the harness. Do not inspect `design-package-history`, scratch files,
+deleted prior design artifacts, or Git history of those artifacts. Do not
+preserve old `ra-*` IDs. This is a real rebaseline, not a reconstruction of a
+discarded design. Existing implementation code remains valid evidence, but it
+does not make a component required when the PRD does not require it.
+
 ## Why this stage exists
 
 You are the single design-phase author. Earlier versions of this

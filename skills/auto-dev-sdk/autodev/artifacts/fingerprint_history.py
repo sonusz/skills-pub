@@ -1,5 +1,4 @@
-"""fingerprint-history.json — mechanism 2's per-gate finding-fingerprint
-history + declined re-audit records (docs/proposals/rigor-tier.md).
+"""Per-gate finding-fingerprint history used to size panel rework.
 
 Fingerprint = a coarse structural identity over category, targets,
 evidence references, failure class, and missized direction. Summary wording
@@ -9,16 +8,15 @@ provide the semantic identity; this coarse key is the deterministic fallback.
 
 Recurrence = the same fingerprint appearing under two DIFFERENT
 ``source_hash`` values — the reviewed package changed (producer ran)
-and the finding survived it. Rounds are recorded once per enforced
-verdict (keyed by ``run_ts``, so re-enforcing the same on-disk verdict
+and the finding survived it. Recurrence selects a broader ``root-cause``
+rework mode; it never stops the revision loop. Rounds are recorded once per
+enforced verdict (keyed by ``run_ts``, so re-enforcing the same on-disk verdict
 is idempotent). A panel re-run on an unchanged package (cache
 invalidation, consulted-doc drift, corrupted verdict file) shares the
 prior round's source_hash and is treated as the idempotent re-review
 it is — NOT as recurrence; otherwise the cached, byte-identical
-reviewer outputs would fabricate a stall diagnosis after zero fix
-attempts. Rounds persisted before source_hash existed contribute no
-recurrence evidence (missed recurrence costs one extra rerun; a false
-diagnosis steers the human toward lowering rigor).
+reviewer outputs would incorrectly force broad rework after zero fix attempts.
+Rounds persisted before source_hash existed contribute no recurrence evidence.
 
 The file is reset alongside L[*] on ``autodev update --amendment``.
 """
@@ -75,7 +73,8 @@ class RecurrenceReport:
 class FingerprintHistory:
     # gate → list of {"run_ts": str, "fingerprints": [str, ...]}
     rounds: dict[str, list[dict]] = field(default_factory=dict)
-    # Declined re-audits: {"fingerprint": str, "r": str}
+    # Legacy declined re-audits retained for on-disk compatibility. New runs
+    # do not create these after fingerprint-based early halts were removed.
     declined: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:

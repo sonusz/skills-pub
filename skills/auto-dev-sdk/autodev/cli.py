@@ -439,15 +439,31 @@ def _dispatch_orch(args, call: str) -> int:
 
 
 def cmd_run(args) -> int:
-    if getattr(args, "watch", False):
-        os.environ["AUTODEV_WATCH"] = "1"
-    return _dispatch_orch(args, "run")
+    return _dispatch_with_watch(args, "run")
 
 
 def cmd_next(args) -> int:
-    if getattr(args, "watch", False):
-        os.environ["AUTODEV_WATCH"] = "1"
-    return _dispatch_orch(args, "next")
+    return _dispatch_with_watch(args, "next")
+
+
+def _dispatch_with_watch(args, verb: str) -> int:
+    """Run one orchestrator command with the built-in watch protocol."""
+
+    if not getattr(args, "watch", False):
+        return _dispatch_orch(args, verb)
+
+    os.environ["AUTODEV_WATCH"] = "1"
+    from autodev.watch import WatchSession
+
+    watch = WatchSession(feature=args.feature, verb=verb)
+    watch.start()
+    try:
+        exit_code = _dispatch_orch(args, verb)
+    except BaseException:
+        watch.finish(exit_codes.ERROR)
+        raise
+    watch.finish(exit_code)
+    return exit_code
 
 
 def cmd_pause(args) -> int:
@@ -792,9 +808,41 @@ def cmd_invalidate(args) -> int:
         print(f"unknown stage: {stage!r}; valid: {list(by_name)}", file=sys.stderr)
         return exit_codes.ERROR
     target = active / by_name[stage].path_fragment
-    if target.exists():
-        target.unlink()
-        print(f"invalidated {target}")
+    targets = [target]
+    if stage == "design":
+        # Design is one unified producer with four canonical artifacts plus a
+        # changelog. Invalidating only design.md leaves a hidden replay path:
+        # scope/trace/changelog and stale panel sidecars can be fed into what
+        # status reports as a fresh design run. Preserve package history, but
+        # clear every active output owned by this phase.
+        targets = [
+            active / name for name in (
+                "design.md",
+                "scope.json",
+                "trace.md",
+                "test-plan.md",
+                "design-changelog.json",
+                "design-packet.json",
+                "panel-design-review.json",
+                "panel-trace-review.json",
+                "accepted-design.json",
+                "panel-coverage-map.json",
+                "panel-design-review.docs.json",
+                "panel-design-review.reviewers.json",
+                "panel-trace-review.docs.json",
+                "panel-trace-review.reviewers.json",
+                "diagnosis.json",
+                "rework-mode.json",
+            )
+        ]
+        targets.extend(
+            p.with_name(p.name + ".tmp")
+            for p in targets[:5]
+        )
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            print(f"invalidated {path}")
     # If stage is a gate artifact, also clear same-cycle skip-gate (R4d).
     gate_map = {
         "panel_design_review": "design-review",
@@ -803,6 +851,9 @@ def cmd_invalidate(args) -> int:
     if stage in gate_map:
         ov.invalidate_clears_skip_gate(active, gate_map[stage])
         print(f"cleared same-cycle skip-gate for {gate_map[stage]} (if present)")
+    elif stage == "design":
+        ov.invalidate_clears_skip_gate(active, "design-review")
+        print("cleared same-cycle skip-gate for design-review (if present)")
     return exit_codes.OK
 
 
@@ -925,18 +976,6 @@ def cmd_skip_gate(args) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return exit_codes.ERROR
-    # Mechanism 2 (rigor-tier): skipping a gate while a rigor-pivotal
-    # diagnosis is pending IS the "keep the tolerance" answer — record
-    # the declined (fingerprint, R) pairs so the same re-audit question
-    # is never asked again for this stall.
-    from autodev.diagnosis import record_skip_as_declined
-    declined = record_skip_as_declined(active, args.gate)
-    if declined:
-        print(
-            f"recorded {declined} declined re-audit pair(s) — the pending "
-            f"rigor re-audit for {args.gate} is answered as 'keep the "
-            f"tolerance' and will not be re-asked"
-        )
     # G16: warn if ceiling is approaching.
     from autodev.artifacts.overrides import (
         CEILING_REFUSE_AT, CEILING_WARNING_AT,

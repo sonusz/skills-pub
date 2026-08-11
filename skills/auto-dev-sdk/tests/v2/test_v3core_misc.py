@@ -57,6 +57,14 @@ def test_stage_design_prompt_uses_changelog_for_design_history():
     assert "design-rework-memory.json" not in text
 
 
+def test_initial_design_is_a_true_rebaseline():
+    text = (PROMPTS_DIR / "stage-design.md").read_text(encoding="utf-8")
+    assert "On an initial run (`CONTEXT_ARTIFACTS: []`)" in text
+    assert "Do not inspect `design-package-history`" in text
+    assert "preserve old `ra-*` IDs" in text
+    assert "not make a component required when the PRD does not require it" in text
+
+
 # ---------- SC3: panel prompts have no "Do NOT flag" blocklists ----------
 
 PANEL_PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "autodev" / "panel" / "prompts"

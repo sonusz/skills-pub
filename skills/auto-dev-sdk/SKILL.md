@@ -43,8 +43,9 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Preserves each reviewer finding, clusters semantically equivalent findings
   into one ticket, and enforces the PRD's `Release threshold: P0|P1|P2`.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
-- Rotates persistent agent conversations at successful-turn boundaries: design and Ralph review after 15 turns; build and each panel reviewer after 5. The following turn starts fresh from current artifacts; failed/interrupted calls do not count.
+- Rotates persistent agent conversations at successful-turn boundaries: design and Ralph review after 15 turns; build and each panel reviewer after 5. Design and design-review panel slots also start fresh whenever review type switches between coverage and budget; consecutive rounds of one type keep their session. Failed/interrupted calls do not count.
 - Writes bridge artifacts: `design-packet.json`, `accepted-design.json`, `implementation-index.json`, `prd-checklist.json`.
+- Owns a background-watch protocol: start marker, periodic heartbeat, and one terminal marker for every `run --watch` / `next --watch` outcome.
 - Blocks on missing/stale artifacts, failed gates, dirty workspace without `acknowledge-dirty`, or locks.
 - Owns bundled stage/gate prompts under `autodev/prompts/` and `autodev/panel/prompts/`; neither this skill nor the outer agent can modify them at runtime.
 
@@ -153,16 +154,16 @@ Mirror the harness R5 contract:
 1. Track the latest `<feature>` arg as current feature across turns.
 2. Before each user turn in an active auto-dev session, run `autodev status <current-feature>` and surface state changes.
 3. Before any write-like verb (`skip-gate`, `acknowledge-dirty`, `abort`, `reset-session`, `restore-design`, `invalidate`, `update`, `close`), rerun `autodev status`.
-4. While `run` is active and not paused/failed, treat the wakeup as a **10-minute sliding deadman**, not a fixed cadence:
-   - Schedule the next `ScheduleWakeup` 10 min out from the most recent activity.
-   - **Every time you receive a signal — a `<task-notification>`, a `--watch` stdout alert, or a user message — reset the wakeup to 10 min from now.** Drop the previously-scheduled wakeup; only one is active at a time.
-   - If 10 min passes with no signal at all, the wakeup fires; do a `autodev status` check and either resume the deadman or surface a stall.
-   - Faster is fine if a stage transition is clearly imminent.
+4. For every background `run`/`next`, use `--watch` and attach one generic Monitor that implements [references/watch.md](references/watch.md). Do not invent shell sleep loops, cron polling, or per-feature heartbeat logic.
+   - Treat `started` as the advertised heartbeat contract and reset the silence deadline on every watch marker.
+   - Heartbeats are health signals; do not relay routine ones to the user.
+   - Two missed heartbeat intervals require an immediate `autodev status` and a surfaced alert.
+   - A non-success `terminal` marker requires the same immediate status/alert; `terminal outcome=complete` ends monitoring cleanly.
 5. Do not construct or inject panel-review prompts; harness calls panel-review.
 
 ### Push alerts via `--watch`
 
-`autodev run <feature> --watch` emits one-line stdout markers on key state transitions so the outer agent can react without polling. Run it via `Bash(run_in_background: true)`; optionally attach a `Monitor` task to wake on each alert. Full whitelist, format, and Monitor pattern in [references/watch.md](references/watch.md).
+`autodev run <feature> --watch` emits transition alerts plus harness-owned heartbeat and terminal markers. Run it in the background and attach the required generic Monitor; do not add a second polling loop. Full protocol in [references/watch.md](references/watch.md).
 
 ## Confirmation gate
 

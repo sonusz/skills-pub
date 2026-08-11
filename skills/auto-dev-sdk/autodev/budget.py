@@ -12,11 +12,12 @@ Three responsibilities, all feature-scoped (one active/ dir):
    sizes its work against the feature's remaining budget, not only its
    own context window. Injection must never break prompt rendering: any
    error degrades to no lines.
-3. **Coverage/budget alternation** (`design_phase` +
+3. **Coverage/budget cadence** (`design_phase` +
    `minimality_review_body`): design-review rounds alternate between two
-   types — coverage (sufficiency: is anything required missing?) and
-   budget (minimality: is anything present unrequired?), the whole panel
-   playing one role per round. The gate completes only when BOTH types
+   roles — coverage (sufficiency: is anything required missing?) and
+   budget (minimality: is anything present unrequired?). Each six-round
+   cycle assigns rounds 1–3 to coverage and rounds 4–6 to budget, with the
+   whole panel playing one role per round. The gate completes only when BOTH types
    have passed on the same packet; a recorded pass is final (nothing is
    re-reviewed or re-synthesized to "confirm" it). A pass leaves the
    packet unchanged, so the next round runs the other type on the same
@@ -249,7 +250,13 @@ def format_budget_lines(feature_active: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Coverage/budget alternation
+# Coverage/budget cadence
+
+
+_DESIGN_ROUND_CADENCE = (
+    "coverage", "coverage", "coverage",
+    "budget", "budget", "budget",
+)
 
 
 def _design_round_outcomes(feature_active: Path) -> list[tuple[str, str, bool]]:
@@ -313,8 +320,8 @@ def design_phase(feature_active: Path, round_key: str) -> str:
     Returns ``"complete"`` when both a coverage round and a budget round
     have passed on this exact packet — the gate is satisfied and no
     further review (or re-synthesis) runs. Otherwise returns the round
-    type to dispatch next: strict coverage/budget alternation by count
-    of completed rounds, except that a type which already passed on this
+    type to dispatch next: rounds 1–3 of each six-round cycle are coverage
+    and rounds 4–6 are budget, except that a type which already passed on this
     packet is never re-dispatched (flip to the other type instead).
     Resume-stable: the in-flight round has no outcome event yet.
     """
@@ -323,7 +330,9 @@ def design_phase(feature_active: Path, round_key: str) -> str:
     budget_passed = {k for k, t, p in outcomes if t == "budget" and p}
     if round_key in coverage_passed and round_key in budget_passed:
         return "complete"
-    next_type = "coverage" if len(outcomes) % 2 == 0 else "budget"
+    next_type = _DESIGN_ROUND_CADENCE[
+        len(outcomes) % len(_DESIGN_ROUND_CADENCE)
+    ]
     if next_type == "coverage" and round_key in coverage_passed:
         return "budget"
     if next_type == "budget" and round_key in budget_passed:
@@ -357,7 +366,10 @@ def minimality_review_body(feature_active: Path) -> str:
         "equally. Your proof obligation mirrors a coverage reviewer's: "
         "they must show a clause fails without an addition; you must "
         "show a clause still holds without an item, or holds with a "
-        "cheaper one. What non-minimality costs here in practice:\n\n"
+        "cheaper one. A shrink recommendation must not conflict with "
+        "any core PRD requirement; a cheaper mechanism counts only when "
+        "every affected PRD requirement and amendment remains satisfied. "
+        "What non-minimality costs here in practice:\n\n"
         f"{budget_lines}\n\n"
         "Go through scope.json item by item, with design.md for the "
         "mechanism and prd.md for the clauses:\n\n"
