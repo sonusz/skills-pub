@@ -63,7 +63,15 @@ context cost of reading, implementation, integration, and testing.
   Fully, or otherwise remove concrete remaining evidence gaps. It may
   advance one scope or several scopes. Do not choose a token micro-task
   merely to end the iteration when a larger coherent objective fits.
-- When the queue does not fit and subagents are available, you MUST use
+- Subagents are the recommended way to execute the plan, not a
+  fallback for oversized queues: you write the plan, subagents
+  implement it, each from a bounded, self-contained brief derived
+  from your plan (files, exact changes, how to verify). Because
+  subagents execute an explicit plan rather than design, dispatch
+  them on a mid-tier, medium-effort model (for the claude CLI,
+  `model: sonnet` on the Agent tool) instead of letting them
+  inherit the lead model. When the queue does not fit and
+  subagents are available, you MUST use
   them concurrently with independent, bounded, non-overlapping
   assignments within that objective. Use as many safe parallel
   assignments as the available slots permit while doing useful work
