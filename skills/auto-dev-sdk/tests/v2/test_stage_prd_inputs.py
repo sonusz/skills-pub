@@ -336,6 +336,9 @@ def test_build_prompt_body_mentions_prd():
     assert "plan-review loop" in body
     assert "have one\n   subagent review that plan" in body
     assert "PLAN_REVIEW_BLOCKERS: N" in body
+    assert "If the accepted design specifies a method and the plan uses a\n" in body
+    assert "different method, that is a `BLOCKER` even if it works" in body
+    assert "explicitly leaves the method open" in body
     assert "review the revised plan again" in body
     assert "PLAN_REVIEW_BLOCKERS: 0" in body
     assert "A review without that explicit zero does not\n   pass" in body

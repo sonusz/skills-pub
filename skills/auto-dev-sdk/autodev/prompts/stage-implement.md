@@ -54,8 +54,10 @@ this plan-review loop:
 2. A `BLOCKER` means executing the plan as written could violate an
    accepted requirement or boundary, create a safety/permission defect,
    leave the objective untestable or unintegrable, or cause predictable
-   rework. A preference, optional improvement, or alternative design is
-   not a blocker.
+   rework. If the accepted design specifies a method and the plan uses a
+   different method, that is a `BLOCKER` even if it works, unless the design
+   explicitly leaves the method open. A preference or optional improvement
+   is not a blocker.
 3. When `N` is greater than zero, incorporate every blocker, revise the
    on-disk plan, and have one subagent review the revised plan again.
    Incorporate other actionable feedback when it improves the plan without
