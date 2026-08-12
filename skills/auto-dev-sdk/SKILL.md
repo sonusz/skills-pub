@@ -43,7 +43,7 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 - Preserves each reviewer finding, clusters semantically equivalent findings
   into one ticket, and enforces the PRD's `Release threshold: P0|P1|P2`.
 - Runs build in the Ralph loop: build writes code + `build.json`; `ralph-review` checks coverage; repeat until complete, stalled, or routed.
-- Rotates persistent agent conversations at successful-turn boundaries: design after 15 turns; build, Ralph review, and each panel reviewer after 5. Design and design-review panel slots also start fresh whenever review type switches between coverage and budget; consecutive rounds of one type keep their session. Failed/interrupted calls do not count.
+- Rotates persistent agent conversations at successful-turn boundaries: design after 15 turns, build after 3, and Ralph review plus each panel reviewer after 5. Design and design-review panel slots also start fresh whenever review type switches between coverage and budget; consecutive rounds of one type keep their session. Failed/interrupted calls do not count.
 - Writes bridge artifacts: `design-packet.json`, `accepted-design.json`, `implementation-index.json`, `prd-checklist.json`.
 - Owns a background-watch protocol: start marker, periodic heartbeat, and one terminal marker for every `run --watch` / `next --watch` outcome.
 - Blocks on missing/stale artifacts, failed gates, dirty workspace without `acknowledge-dirty`, or locks.

@@ -18,6 +18,7 @@ from autodev.vendors.config import PanelReviewerSpec, StageSpec
 from autodev.vendors.shared_call import SharedVendorResult
 from autodev.vendors import subprocess_runner
 from autodev.vendors.session_keys import (
+    BUILD_SESSION_MAX_TURNS,
     DEFAULT_SESSION_MAX_TURNS,
     DESIGN_SESSION_MAX_TURNS,
     RALPH_REVIEW_SESSION_MAX_TURNS,
@@ -1213,6 +1214,7 @@ def test_stage_runner_enables_sessions_only_for_repeating_agents(
         assert captured["resume_prompt"] == "delta prompt"
         expected_max_turns = {
             "design": DESIGN_SESSION_MAX_TURNS,
+            "build": BUILD_SESSION_MAX_TURNS,
             "ralph-review": RALPH_REVIEW_SESSION_MAX_TURNS,
         }.get(stage, DEFAULT_SESSION_MAX_TURNS)
         assert captured["session_max_turns"] == expected_max_turns
