@@ -59,11 +59,11 @@ def test_reviewer_prompts_absent_from_blacklist():
 # Fixture-pinned hashes. Bumping these requires intentional prompt change.
 EXPECTED_HASHES = {
     "review-design-review.md":
-        "5945ca93f649833fe4332337cd69bddf351689b5393eb3a593dfbbfb224fc19f",
+        "6edc76927e48b4eb3e8b7df6e7501dbd28fcd8c90ee18b90f671c2c15751284f",
     "review-trace-review.md":
-        "53553bc2ee4a6f600e4d29289a44eaef4d8831a0fff8694199b13f972dff3dae",
+        "4306f587f1d5d5e630bec001013e06f2613772c0115f4893c1368528bb75f834",
     "review-close-approval.md":
-        "b48947cd53be245f8b938ec9fd952413b6fc8467dc5b6594b8f8c0026d2e192d",
+        "e42814b8bb675fe4c94b941e0e4cd2ce19d2e8102b316b38cf764aa0e6b7bee2",
     "synthesize.md":
         "4685aef10285ef8bb6d605e5fa6a4a7a2b3350371cf0e8e8d7aa78f8569a727f",
 }

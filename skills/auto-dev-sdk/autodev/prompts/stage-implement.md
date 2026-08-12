@@ -158,6 +158,16 @@ complete.
   commands for hypothesis / signal / strategy, that's a scope
   gap — write a blocking deviation, do NOT invent the commands
   on top of an unsanctioned scope.
+
+  A prior `ralph-review.json` may also contain
+  `design_conformance.findings`. Treat every finding as required correction
+  work for its named scope IDs: replace the differing implementation method
+  with the method stated in the cited accepted-design section, then test the
+  correction. Do not preserve an alternate method merely because it also
+  appears to work.
+  If the finding proves the accepted design itself cannot satisfy the PRD,
+  use the existing blocking-deviation route with
+  `diagnosis.defective_layer="design"`; never edit protected design files.
 - `WRITABLE_PATHS`: exact files/directories this stage may write.
 - `PROTECTED_PATHS`: immutable PRD and accepted-design inputs. These
   remain read-only even when nested under the writable repo root.

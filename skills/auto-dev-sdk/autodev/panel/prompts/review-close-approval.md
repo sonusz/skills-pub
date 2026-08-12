@@ -73,6 +73,19 @@ Design conformance is separate from PRD satisfaction. If implementation
 deviates from accepted design but still satisfies PRD, record that as an
 opinion unless the deviation creates a PRD-level risk.
 
+## Verify findings before reporting
+
+When subagents are available in your CLI (some reviewer CLIs have
+them; if yours does not, skip this section), use them to fact-check
+each finding you intend to report: the cited clause as it literally
+appears in the anchor document, the code or artifact fact the claim
+depends on, the evidence the finding points to. Drop or downgrade a
+finding whose evidence does not survive the check. Dispatch
+fact-checkers on a mid-tier, medium-effort model (for the claude
+CLI, `model: sonnet` on the Agent tool). Fact-checkers are
+read-only: subagents must not edit code or any artifact, and you
+remain the author of every reported finding.
+
 ## Finding categories
 
 - **MISSING** -- PRD requires behavior absent from implemented-spec.

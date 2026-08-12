@@ -121,10 +121,14 @@ def render_stage_prompt(
                 "IMPLEMENTATION_INDEX_HASH",
             ),
         ],
-        # ralph-review is deliberately context-isolated: code + trace only.
-        # No PRD/scope/build.json — it's a pure "does code match trace?"
-        # classification gear, not an intent-vs-impl judge.
+        # Ralph remains isolated from mutable build narration and the PRD,
+        # but independently checks the delivered code against both the
+        # trace rows and the accepted design package.
         "ralph-review": [
+            (feature_active / "design-packet.json", "DESIGN_PACKET_PATH", "DESIGN_PACKET_HASH"),
+            (feature_active / "accepted-design.json", "ACCEPTED_DESIGN_PATH", "ACCEPTED_DESIGN_HASH"),
+            (feature_active / "design.md",     "DESIGN_PATH",     "DESIGN_HASH"),
+            (feature_active / "scope.json",    "SCOPE_PATH",      "SCOPE_HASH"),
             (feature_active / "trace.md",      "TRACE_PATH",      "TRACE_HASH"),
         ],
     }

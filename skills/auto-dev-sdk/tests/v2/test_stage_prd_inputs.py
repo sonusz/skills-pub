@@ -35,6 +35,12 @@ def _seed(feature_active: Path) -> None:
     (feature_active / "test-plan.md").write_text(
         "<!-- source: x -->\n<!-- source_hash: sha256:0 -->\n", encoding="utf-8"
     )
+    (feature_active / "design-packet.json").write_text(
+        '{"kind":"design-packet"}\n', encoding="utf-8"
+    )
+    (feature_active / "accepted-design.json").write_text(
+        '{"kind":"accepted-design"}\n', encoding="utf-8"
+    )
     (feature_active / "build.json").write_text(
         '{"source":"x","source_hash":"sha256:0","written":"2026-04-20",'
         '"test_cmd_run":"pytest","test_exit_code":0,'
@@ -116,7 +122,7 @@ def test_spec_stage_does_not_see_prd(tmp_path):
     assert "IMPLEMENTATION_INDEX_HASH:" in body
 
 
-def test_ralph_review_prompt_uses_build_context_without_spec(tmp_path):
+def test_ralph_review_prompt_gets_accepted_design_without_prd_or_build(tmp_path):
     active = tmp_path / "active"
     _seed(active)
     body = render_stage_prompt(
@@ -127,13 +133,15 @@ def test_ralph_review_prompt_uses_build_context_without_spec(tmp_path):
         primary_target=active / "ralph-review.json",
         extra_targets=[],
     )
-    # v3-core update: ralph-review is context-isolated — it only gets
-    # trace+code. No PRD/scope/build.json/spec — it classifies
-    # code-against-trace without knowing "intent".
+    # Ralph independently checks implementation against trace + accepted
+    # design, while remaining isolated from PRD/build/spec narration.
+    assert "DESIGN_PACKET_PATH:" in body
+    assert "ACCEPTED_DESIGN_PATH:" in body
+    assert "DESIGN_PATH:" in body
+    assert "SCOPE_PATH:" in body
     assert "TRACE_PATH:" in body
     assert "TARGET_RALPH_REVIEW:" in body
     assert "PRD_PATH:" not in body
-    assert "SCOPE_PATH:" not in body
     assert "BUILD_JSON_PATH:" not in body
     assert "SPEC_PATH:" not in body
 
@@ -212,6 +220,10 @@ def test_stage_write_contract_is_stage_specific(tmp_path):
         extra_targets=[],
     )
     assert review_writable == [active / "ralph-review.json", active / "scratch"]
+    assert active / "design-packet.json" in review_protected
+    assert active / "accepted-design.json" in review_protected
+    assert active / "design.md" in review_protected
+    assert active / "scope.json" in review_protected
     assert active / "trace.md" in review_protected
 
 
@@ -343,6 +355,8 @@ def test_build_prompt_body_mentions_prd():
     assert "fully completed iteration\nobjective" in body
     assert "does not\nrequire the affected scope to reach Fully" in body
     assert "Work outside the objective remains in the queue" in body
+    assert "design_conformance.findings" in body
+    assert "replace the differing implementation method" in body
     assert "Never use `git add -A`, `git add .`" in body
 
 
@@ -351,10 +365,12 @@ def test_ralph_prompt_allows_parallel_subagent_review():
         Path(__file__).resolve().parent.parent.parent
         / "autodev" / "prompts" / "stage-ralph-review.md"
     ).read_text(encoding="utf-8")
-    assert "subagents are available" in body
-    assert "disjoint groups of trace rows" in body
+    assert "use subagents on disjoint rows or changed files" in body
+    assert "disjoint rows or changed files" in body
     assert "one complete" in body
-    assert "one subagent review that plan" in body
-    assert "Do not stop after planning" in body
+    assert "have one subagent\nreview the plan" in body
+    assert "accepted design" in body
+    assert "design_conformance" in body
+    assert "If design.md specifies a method and Dev used a different method" in body
     assert "WRITABLE_PATHS" in body
     assert "PROTECTED_PATHS" in body

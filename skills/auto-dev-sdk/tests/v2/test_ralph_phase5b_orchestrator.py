@@ -91,6 +91,10 @@ def _write_fake_vendor(path: Path) -> Path:
                 return json.dumps({
                     "classifications": classifications,
                     "summary": counts,
+                    "design_conformance": {
+                        "verdict": "Aligned",
+                        "findings": [],
+                    },
                 }, indent=2) + "\\n"
 
             stdin_prompt = sys.stdin.read()
@@ -371,12 +375,15 @@ def test_build_loops_until_all_active_items_fully(git_repo, feature_active, monk
     prompt = (
         feature_active / "scratch" / ".ralph-review.1.prompt"
     ).read_text(encoding="utf-8")
-    # v3-core update: ralph-review is context-isolated (trace+code only).
-    # No PRD/scope/build.json/spec in its inputs.
+    # Ralph gets accepted design + trace, but remains isolated from
+    # PRD/build/spec narration.
+    assert "DESIGN_PACKET_PATH:" in prompt
+    assert "ACCEPTED_DESIGN_PATH:" in prompt
+    assert "DESIGN_PATH:" in prompt
+    assert "SCOPE_PATH:" in prompt
     assert "TRACE_PATH:" in prompt
     assert "TARGET_RALPH_REVIEW:" in prompt
     assert "BUILD_JSON_PATH:" not in prompt
-    assert "SCOPE_PATH:" not in prompt
     assert "SPEC_PATH:" not in prompt
     assert "PRD_PATH:" not in prompt
     assert "TARGET_REVIEW:" not in prompt
@@ -537,6 +544,9 @@ def test_output_retry_keeps_previous_accepted_review_file(
             "Fully": 0, "Partial": 1, "Missing": 0,
             "Deviated": 0, "Deferred": 0,
         },
+        "design_conformance": {
+            "verdict": "Aligned", "findings": [],
+        },
     }
     (feature_active / "ralph-review.json").write_text(
         json.dumps(prior) + "\n", encoding="utf-8",
@@ -546,6 +556,7 @@ def test_output_retry_keeps_previous_accepted_review_file(
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), set()],
         statuses_history=[{}, {"t-1": "Partial"}],
@@ -641,6 +652,7 @@ def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), {"t-1"}],
         statuses_history=[{}, {"t-1": "Fully"}],
@@ -796,12 +808,16 @@ def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature
              "classification": "Fully", "evidence": "x"},
         ],
         "summary": {"Fully": 1, "Partial": 0, "Missing": 0, "Deviated": 0, "Deferred": 0},
+        "design_conformance": {
+            "verdict": "Aligned", "findings": [],
+        },
     }))
     ralph.write_ralph_state(feature_active, ralph.RalphState(
         source=str(feature_active / "scope.json"),
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), {"t-1"}],
         statuses_history=[{}, {"t-1": "Fully"}],
@@ -817,12 +833,16 @@ def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature
              "classification": "Fully", "evidence": "x"},
         ],
         "summary": {"Fully": 2, "Partial": 0, "Missing": 0, "Deviated": 0, "Deferred": 0},
+        "design_conformance": {
+            "verdict": "Aligned", "findings": [],
+        },
     }))
     ralph.write_ralph_state(feature_active, ralph.RalphState(
         source=str(feature_active / "scope.json"),
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=2,
         fully_history=[set(), {"t-1"}, {"t-1", "t-2"}],
         statuses_history=[{}, {"t-1": "Fully"}, {"t-1": "Fully", "t-2": "Fully"}],
@@ -841,6 +861,7 @@ def test_resume_reruns_partially_persisted_iteration(git_repo, feature_active, m
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), set()],
         statuses_history=[{}, {"t-1": "Missing"}],
@@ -876,6 +897,7 @@ def test_upstream_change_resets_only_ralph_state_and_restarts_iter_one(
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=2,
         fully_history=[set(), set(), set()],
         statuses_history=[{}, {"t-1": "Missing"}, {"t-1": "Partial"}],

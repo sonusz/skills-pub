@@ -60,6 +60,13 @@ ALL_STATUSES: tuple[str, ...] = (
     STATUS_DEVIATED, STATUS_DEFERRED,
 )
 
+DESIGN_VERDICT_ALIGNED = "Aligned"
+DESIGN_VERDICT_DEVIATED = "Deviated"
+ALL_DESIGN_VERDICTS: tuple[str, ...] = (
+    DESIGN_VERDICT_ALIGNED,
+    DESIGN_VERDICT_DEVIATED,
+)
+
 # Status rank (for regression detection): higher = more complete.
 _STATUS_RANK: dict[str, int] = {
     STATUS_MISSING: 0,
@@ -81,7 +88,16 @@ def parse_review_statuses(review_path: Path) -> dict[str, str]:
              "classification": "Fully", "evidence": "..."},
             ...
           ],
-          "summary": {"Fully": ..., "Partial": ..., ...}
+          "summary": {"Fully": ..., "Partial": ..., ...},
+          "design_conformance": {
+            "verdict": "Aligned" | "Deviated",
+            "findings": [
+              {"scope_ids": ["v3c-1"],
+               "design_ref": "design.md:24-31",
+               "evidence": "src/x.py:10-18",
+               "difference": "...", "correction": "..."}
+            ]
+          }
         }
 
     Each trace row appears once. This function rolls up per-trace-row
@@ -141,7 +157,87 @@ def _parse_ralph_review_json(data: dict) -> dict[str, str]:
             per_scope_rank[scope_id] = rank
             per_scope_status[scope_id] = cls
 
+    _apply_design_conformance(
+        data,
+        per_scope_rank=per_scope_rank,
+        per_scope_status=per_scope_status,
+    )
+
     return per_scope_status
+
+
+def _required_nonempty_text(entry: dict, key: str, *, where: str) -> str:
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SchemaError(f"{where}.{key} must be non-empty string")
+    return value
+
+
+def _apply_design_conformance(
+    data: dict,
+    *,
+    per_scope_rank: dict[str, int],
+    per_scope_status: dict[str, str],
+) -> None:
+    """Validate design drift findings and fold them into scope status.
+
+    Trace-row classifications remain a faithful code-vs-trace judgment in the
+    artifact.  Any accepted-design deviation is a second, independent reason
+    that the affected scope is not complete, so its rolled-up status is capped
+    at ``Deviated`` here.
+    """
+    conformance = data.get("design_conformance")
+    if not isinstance(conformance, dict):
+        raise SchemaError("ralph-review.design_conformance must be object")
+
+    verdict = conformance.get("verdict")
+    if verdict not in ALL_DESIGN_VERDICTS:
+        raise SchemaError(
+            "ralph-review.design_conformance.verdict must be one of "
+            + ", ".join(ALL_DESIGN_VERDICTS)
+        )
+    findings = conformance.get("findings")
+    if not isinstance(findings, list):
+        raise SchemaError("ralph-review.design_conformance.findings must be list")
+
+    for i, finding in enumerate(findings):
+        where = f"design_conformance.findings[{i}]"
+        if not isinstance(finding, dict):
+            raise SchemaError(f"{where} must be object")
+
+        scope_ids = finding.get("scope_ids")
+        if (
+            not isinstance(scope_ids, list)
+            or not scope_ids
+            or any(not isinstance(sid, str) or not sid for sid in scope_ids)
+        ):
+            raise SchemaError(f"{where}.scope_ids must be non-empty string list")
+        if len(set(scope_ids)) != len(scope_ids):
+            raise SchemaError(f"{where}.scope_ids contains duplicates")
+        unknown = sorted(set(scope_ids) - set(per_scope_status))
+        if unknown:
+            raise SchemaError(
+                f"{where}.scope_ids not present in classifications: "
+                + ", ".join(unknown)
+            )
+
+        for key in ("design_ref", "evidence", "difference", "correction"):
+            _required_nonempty_text(finding, key, where=where)
+
+        deviated_rank = _STATUS_RANK[STATUS_DEVIATED]
+        for scope_id in scope_ids:
+            if per_scope_rank[scope_id] > deviated_rank:
+                per_scope_rank[scope_id] = deviated_rank
+                per_scope_status[scope_id] = STATUS_DEVIATED
+
+    expected_verdict = (
+        DESIGN_VERDICT_DEVIATED if findings else DESIGN_VERDICT_ALIGNED
+    )
+    if verdict != expected_verdict:
+        raise SchemaError(
+            "ralph-review.design_conformance.verdict inconsistent with findings: "
+            f"got {verdict!r}, expected {expected_verdict!r}"
+        )
 
 
 def active_scope_ids(scope_json_path: Path) -> set[str]:
@@ -233,6 +329,7 @@ class RalphState:
     regressions: list[RegressionEvent] = field(default_factory=list)
     trace_hash: str = ""
     test_plan_hash: str = ""
+    design_hash: str = ""
     started_at: str = ""
     last_iter_at: str = ""
 
@@ -252,6 +349,7 @@ class RalphState:
             ],
             "trace_hash": self.trace_hash,
             "test_plan_hash": self.test_plan_hash,
+            "design_hash": self.design_hash,
             "started_at": self.started_at,
             "last_iter_at": self.last_iter_at,
         }
@@ -292,6 +390,7 @@ def load_ralph_state(feature_active: Path) -> RalphState:
         regressions=regs,
         trace_hash=raw.get("trace_hash", ""),
         test_plan_hash=raw.get("test_plan_hash", ""),
+        design_hash=raw.get("design_hash", ""),
         started_at=raw.get("started_at", ""),
         last_iter_at=raw.get("last_iter_at", ""),
     )

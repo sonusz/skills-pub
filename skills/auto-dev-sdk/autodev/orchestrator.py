@@ -139,6 +139,10 @@ _STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
         "panel-trace-review.json",
     ),
     "ralph-review": (
+        "design-packet.json",
+        "accepted-design.json",
+        "design.md",
+        "scope.json",
         "trace.md",
         "ralph-iteration-context.json",
         "ralph-review.previous.json",
@@ -2020,6 +2024,7 @@ class Orchestrator:
         state.source_hash = hash_file(active / "scope.json")
         state.trace_hash = hash_file(active / "trace.md")
         state.test_plan_hash = hash_file(active / "test-plan.md")
+        state.design_hash = hash_file(active / "design.md")
         state, _ = ralph.record_iter(state, statuses=statuses)
         ralph.write_ralph_state(active, state)
 
@@ -2056,10 +2061,12 @@ class Orchestrator:
         current_scope_hash = hash_file(active / "scope.json")
         current_trace_hash = hash_file(active / "trace.md")
         current_test_plan_hash = hash_file(active / "test-plan.md")
+        current_design_hash = hash_file(active / "design.md")
         if (
             state.source_hash == current_scope_hash
             and state.trace_hash == current_trace_hash
             and state.test_plan_hash == current_test_plan_hash
+            and state.design_hash == current_design_hash
         ):
             return
         ralph.clear_ralph_state(active)
@@ -2071,6 +2078,7 @@ class Orchestrator:
                         "scope_hash_changed": state.source_hash != current_scope_hash,
                         "trace_hash_changed": state.trace_hash != current_trace_hash,
                         "test_plan_hash_changed": state.test_plan_hash != current_test_plan_hash,
+                        "design_hash_changed": state.design_hash != current_design_hash,
                     })
 
     # G23: build-blocking halt. stage-implement prompt contracts that a
