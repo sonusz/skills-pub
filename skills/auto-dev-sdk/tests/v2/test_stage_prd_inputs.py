@@ -321,8 +321,15 @@ def test_build_prompt_body_mentions_prd():
     assert "do not defer" in body
     assert "subagents are available" in body
     assert "bounded, non-overlapping\n  assignments" in body
-    assert "have one\nsubagent review that plan" in body
-    assert "do not\nstop after planning" in body
+    assert "plan-review loop" in body
+    assert "have one\n   subagent review that plan" in body
+    assert "PLAN_REVIEW_BLOCKERS: N" in body
+    assert "review the revised plan again" in body
+    assert "PLAN_REVIEW_BLOCKERS: 0" in body
+    assert "A review without that explicit zero does not\n   pass" in body
+    assert "Do not begin implementation or dispatch implementation subagents" in body
+    assert "blocking-deviation path" in body
+    assert "do\nnot stop after planning once the loop passes" in body
     assert "Mandatory iteration sizing" in body
     assert "If the whole runnable queue can fit" in body
     assert "largest coherent objective" in body
@@ -333,7 +340,7 @@ def test_build_prompt_body_mentions_prd():
     assert "It may\n  advance one scope or several scopes" in body
     assert "you MUST use\n  them concurrently" in body
     assert "plan-review subagent does not count" in body
-    assert "fully completed context-sized\nobjective" in body
+    assert "fully completed iteration\nobjective" in body
     assert "does not\nrequire the affected scope to reach Fully" in body
     assert "Work outside the objective remains in the queue" in body
     assert "Never use `git add -A`, `git add .`" in body

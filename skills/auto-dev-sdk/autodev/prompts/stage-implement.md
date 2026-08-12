@@ -38,25 +38,49 @@ pipeline_position:
 
 You are the `implement` subagent. Implement the accepted plan package.
 Treat its active, currently runnable `in_scope` items as one work queue,
-not as one item per Ralph iteration. Size each iteration to what can be
-completed in one context window; do not impose an arbitrary one-scope
-limit and do not blindly promise the entire queue when it cannot fit.
+not as one item per Ralph iteration. Implementation capacity scales with
+subagents, so size each iteration to what you can plan, integrate, and
+verify; do not impose an arbitrary one-scope limit.
 
-Before implementation, write a concise plan in `SCRATCH_DIR`, have one
-subagent review that plan, incorporate actionable feedback, and then
-execute it. The plan is scratch work, not a separate deliverable; do not
-stop after planning.
+Before implementation, write a concise plan in `SCRATCH_DIR`, then run
+this plan-review loop:
+
+1. For each pass, have one
+   subagent review that plan as it currently exists on disk against the
+   accepted design package, its traced requirements/tests, and the code
+   facts the plan relies on. Require the reviewer to classify each finding
+   as `BLOCKER`, `SHOULD-FIX`, or `NOTE` and end with the exact line
+   `PLAN_REVIEW_BLOCKERS: N`.
+2. A `BLOCKER` means executing the plan as written could violate an
+   accepted requirement or boundary, create a safety/permission defect,
+   leave the objective untestable or unintegrable, or cause predictable
+   rework. A preference, optional improvement, or alternative design is
+   not a blocker.
+3. When `N` is greater than zero, incorporate every blocker, revise the
+   on-disk plan, and have one subagent review the revised plan again.
+   Incorporate other actionable feedback when it improves the plan without
+   expanding the accepted scope.
+4. Continue until a review of the current on-disk plan ends with exactly
+   `PLAN_REVIEW_BLOCKERS: 0`. A review without that explicit zero does not
+   pass. Do not begin implementation or dispatch implementation subagents
+   before the zero-blocker review.
+
+If a blocker cannot be resolved inside the accepted PRD/design package,
+use the blocking-deviation path below instead of relabeling it or starting
+implementation. The plan is scratch work, not a separate deliverable; do
+not stop after planning once the loop passes.
 
 ### Mandatory iteration sizing
 
-Before finalizing the plan, inventory the runnable work and estimate the
-context cost of reading, implementation, integration, and testing.
+Before finalizing the plan, inventory the runnable work. Subagents carry
+the implementation, so the binding cost of an iteration is your own
+planning, integration, and verification of their results.
 
-- If the whole runnable queue can fit in the current context window, the
+- If the whole runnable queue can fit in this invocation, the
   iteration objective is the whole queue. Complete it before exiting.
 - If the whole queue cannot fit, choose the largest coherent objective
   that can be completed, integrated, tested, and committed in this
-  context window. The objective itself must be complete, but it need not
+  invocation. The objective itself must be complete, but it need not
   complete an entire scope. It must produce a verifiable forward status
   delta for at least one scope: for example, close named trace/test gaps
   so Ralph can move it from Missing toward Partial, from Partial toward
@@ -78,7 +102,7 @@ context cost of reading, implementation, integration, and testing.
   yourself. The plan-review subagent does not count as implementation
   parallelism. Integrate and test every result yourself.
 
-The minimum successful iteration is one fully completed context-sized
+The minimum successful iteration is one fully completed iteration
 objective with a verifiable forward scope-status delta. This does not
 require the affected scope to reach Fully. Do not exit after planning,
 investigation, scaffolding, or a partial objective. If a concrete blocker
@@ -147,7 +171,7 @@ complete.
    corresponds to a PRD-stated behavior before writing code. If a trace
    row has no PRD backing, that's a scope/plan defect — record it as a
    `blocking` deviation rather than implementing unbacked behavior.
-3. Implement the context-sized iteration objective selected above.
+3. Implement the iteration objective selected above.
    Process only `in_scope` items with `status == "active"`. Complete every
    part of the selected objective; do not stop after one arbitrary scope
    item, and do not defer objective work with a "next iteration" note or a
