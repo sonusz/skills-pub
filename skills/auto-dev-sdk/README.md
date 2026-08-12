@@ -208,9 +208,9 @@ Reset refuses an active session lease; the agent's next turn starts a fresh
 provider-native conversation.
 
 The harness also rotates conversations automatically at successful-turn
-boundaries: design and Ralph review keep at most 15 turns; build and each panel
-reviewer keep at most 5. Turn 16 for design and Ralph review, and turn 6 for
-build and panel reviewers, start fresh with the full current artifact packet.
+boundaries: design keeps at most 15 turns; build, Ralph review, and each panel
+reviewer keep at most 5. Turn 16 for design, and turn 6 for build, Ralph review,
+and panel reviewers, start fresh with the full current artifact packet.
 Failures and handled interruptions do not advance the count.
 
 If an interrupted or mistaken invalidation removed the active design package,
