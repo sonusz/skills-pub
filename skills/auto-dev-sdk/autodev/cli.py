@@ -300,7 +300,7 @@ def cmd_status(args) -> int:
         if report.get("build_blocking", {}).get("blocked"):
             bb = report["build_blocking"]
             ids = ", ".join(bb["scope_ids"]) if bb["scope_ids"] else "(none listed)"
-            print(f"build blocking: {ids} (PRD amendment required)")
+            print(f"build blocking: {ids} (inspect build.json deviations)")
         if report.get("next_stage"):
             print(f"next:    {report['next_stage']}")
         if report.get("stale_artifacts"):

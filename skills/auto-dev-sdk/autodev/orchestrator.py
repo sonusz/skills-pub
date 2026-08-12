@@ -2305,8 +2305,8 @@ class Orchestrator:
         ids = ", ".join(blocking_ids) if blocking_ids else "(none listed)"
         raise GatePending(
             "build_blocking",
-            f"build.json.blocking=true; PRD amendment required for "
-            f"scope items: {ids}",
+            f"build.json.blocking=true; human resolution required for "
+            f"scope items: {ids}; inspect blocking deviations in build.json",
         )
 
     def _apply_route_invalidation(self, active: Path, layer: str) -> None:

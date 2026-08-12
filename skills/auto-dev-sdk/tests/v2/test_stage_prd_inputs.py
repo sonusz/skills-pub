@@ -353,6 +353,11 @@ def test_build_prompt_body_mentions_prd():
     assert "fully completed iteration\nobjective" in body
     assert "does not\nrequire the affected scope to reach Fully" in body
     assert "Work outside the objective remains in the queue" in body
+    assert "sole reason no remaining active work can advance" in body
+    assert "repeat that inventory over every\nunfinished active row" in body
+    assert "A failed credential check alone is not proof" in body
+    assert "including work\n   awaiting external runtime" in body
+    assert "Name\n  the remaining rows and why each lacks a local implementation path" in body
     assert "design_conformance.findings" in body
     assert "replace the differing implementation method" in body
     assert "Never use `git add -A`, `git add .`" in body

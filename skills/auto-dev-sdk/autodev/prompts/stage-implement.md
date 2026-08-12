@@ -46,8 +46,9 @@ verify; do not impose an arbitrary one-scope limit.
 The accepted design package and its reviewed trace/test plan are the
 implementation specification. Validate the bound inputs, inventory the
 runnable work for iteration sizing, then begin code and test work. If that
-package is contradictory, unimplementable, or requires unavailable external
-authority/runtime, use the blocking-deviation path below.
+package is contradictory or unimplementable, use the blocking-deviation path
+below. Unavailable external authority/runtime blocks the build only when it is
+the sole reason no remaining active work can advance.
 
 ### Mandatory iteration sizing
 
@@ -55,6 +56,13 @@ Before selecting the iteration objective, inventory the runnable work.
 Subagents carry
 the implementation, so the binding cost of an iteration is your own
 integration and verification of their results.
+
+Before reporting an external-runtime blocker, repeat that inventory over every
+unfinished active row and every locally implementable part of it. If any code,
+configuration, test, or offline verification can still advance, keep the
+external-evidence work in the queue, set top-level `blocking` false, and
+continue with runnable work. A failed credential check alone is not proof that
+the remaining queue is blocked.
 
 - If the whole runnable queue can fit in this invocation, the
   iteration objective is the whole queue. Complete it before exiting.
@@ -165,7 +173,8 @@ complete.
    part of the selected objective; do not stop after one arbitrary scope
    item, and do not defer objective work with a "next iteration" note or a
    non-blocking deviation. Work outside the objective remains in the queue
-   for Ralph's next iteration and is not itself a deviation.
+   for Ralph's next iteration and is not itself a deviation, including work
+   awaiting external runtime while other active work remains runnable.
 4. For the objective, use the project's tests and test-plan.md to
    implement production code to green; integrate subagent work and iterate
    within this invocation.
@@ -204,6 +213,10 @@ complete.
   with `blocking: true`; set top-level `blocking: true`; still write
   build.json with tests-passing-for-non-blocked-items. Orchestrator
   halts before spec.
+  External runtime/authority is blocking only after the mandatory runnable-work
+  re-inventory proves that no unfinished active row can advance locally. Name
+  the remaining rows and why each lacks a local implementation path; otherwise
+  leave them in the queue rather than halting the feature.
   - **Optional — diagnosis** (phase-5 / g-24): when you know which
     upstream layer is defective, add a `diagnosis` sub-object to the
     deviation so the orchestrator can auto-route the rerun rather
