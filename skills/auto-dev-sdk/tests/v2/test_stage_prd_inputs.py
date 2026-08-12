@@ -333,18 +333,13 @@ def test_build_prompt_body_mentions_prd():
     assert "do not defer" in body
     assert "subagents are available" in body
     assert "bounded, non-overlapping\n  assignments" in body
-    assert "plan-review loop" in body
-    assert "have one\n   subagent review that plan" in body
-    assert "PLAN_REVIEW_BLOCKERS: N" in body
-    assert "If the accepted design specifies a method and the plan uses a\n" in body
-    assert "different method, that is a `BLOCKER` even if it works" in body
-    assert "explicitly leaves the method open" in body
-    assert "review the revised plan again" in body
-    assert "PLAN_REVIEW_BLOCKERS: 0" in body
-    assert "A review without that explicit zero does not\n   pass" in body
-    assert "Do not begin implementation or dispatch implementation subagents" in body
+    assert "Implement the accepted design package\ndirectly" in body
+    assert "The accepted design package and its reviewed trace/test plan are the\n" in body
+    assert "then begin code and test work" in body
+    assert "PLAN_REVIEW_BLOCKERS" not in body
+    assert "plan-review loop" not in body
+    assert "write a concise plan" not in body
     assert "blocking-deviation path" in body
-    assert "do\nnot stop after planning once the loop passes" in body
     assert "Mandatory iteration sizing" in body
     assert "If the whole runnable queue can fit" in body
     assert "largest coherent objective" in body
@@ -354,13 +349,15 @@ def test_build_prompt_body_mentions_prd():
     assert "Partial toward\n  Fully" in body
     assert "It may\n  advance one scope or several scopes" in body
     assert "you MUST use\n  them concurrently" in body
-    assert "plan-review subagent does not count" in body
+    assert "Derive each bounded, self-contained\n  brief directly from the accepted design" in body
     assert "fully completed iteration\nobjective" in body
     assert "does not\nrequire the affected scope to reach Fully" in body
     assert "Work outside the objective remains in the queue" in body
     assert "design_conformance.findings" in body
     assert "replace the differing implementation method" in body
     assert "Never use `git add -A`, `git add .`" in body
+    assert "Run every commit synchronously" in body
+    assert "Never leave a commit or hook running\n  in the background" in body
 
 
 def test_ralph_prompt_allows_parallel_subagent_review():
@@ -374,6 +371,6 @@ def test_ralph_prompt_allows_parallel_subagent_review():
     assert "have one subagent\nreview the plan" in body
     assert "accepted design" in body
     assert "design_conformance" in body
-    assert "If design.md specifies a method and Dev used a different method" in body
+    assert "If the accepted design specifies a method and Dev implemented a different one" in body
     assert "WRITABLE_PATHS" in body
     assert "PROTECTED_PATHS" in body

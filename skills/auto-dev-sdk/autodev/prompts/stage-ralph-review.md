@@ -73,10 +73,9 @@ influence this review.
 
 ## Design-correction rules
 
-If design.md specifies a method and Dev used a different method, record a
-finding even when Dev's method appears to work. The only exception is a choice
-that design.md explicitly leaves open to Dev. Do not invent new requirements
-or offer optional improvements.
+If the accepted design specifies a method and Dev implemented a different one,
+record a finding. The only exception is when the design explicitly leaves the
+method open. Do not invent new requirements or offer optional improvements.
 
 Every finding names affected active scope IDs, cites the design and code, states
 the exact difference, and gives the smallest correction back to the accepted

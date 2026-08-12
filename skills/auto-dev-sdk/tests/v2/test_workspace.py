@@ -8,7 +8,7 @@ import pytest
 from autodev.errors import PreflightError
 from autodev.workspace import (
     detect_out_of_scope_writes, diff_snapshots, ensure_git_repo,
-    is_git_repo, snapshot,
+    is_git_repo, snapshot, user_visible_changes,
 )
 
 
@@ -86,6 +86,33 @@ def test_diff_snapshots_detects_new_file(git_repo):
     after = snapshot(git_repo)
     diff = diff_snapshots(before, after)
     assert any("new.txt" in d for d in diff)
+
+
+def test_user_visible_changes_preserves_existing_dirt_and_ignores_active_state(
+    git_repo,
+):
+    existing = git_repo / "existing.txt"
+    existing.write_text("user dirt\n")
+    before = snapshot(git_repo)
+
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    (active / "scratch.md").write_text("harness state\n")
+    product = git_repo / "product.py"
+    product.write_text("VALUE = 1\n")
+    subprocess.run(["git", "add", "--", "product.py"], cwd=git_repo, check=True)
+
+    residue = user_visible_changes(before, snapshot(git_repo))
+    assert any("product.py" in line for line in residue)
+    assert not any("scratch.md" in line for line in residue)
+    assert not any("existing.txt" in line for line in residue)
+
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "commit product"],
+        cwd=git_repo,
+        check=True,
+    )
+    assert user_visible_changes(before, snapshot(git_repo)) == []
 
 
 def test_detect_out_of_scope_write(git_repo):

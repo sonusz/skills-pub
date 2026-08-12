@@ -44,7 +44,7 @@ from autodev.state.hashing import hash_file
 from autodev.state.lock import Lock
 from autodev.state.log import JsonlLog
 from autodev.vendors.config import VendorsConfig
-from autodev.workspace import snapshot
+from autodev.workspace import snapshot, user_visible_changes
 
 # Mapping from cascade artifact names → gate names (R4 / R4e).
 ARTIFACT_TO_GATE = {
@@ -1297,6 +1297,9 @@ class Orchestrator:
                 path = active / name
                 if path.exists():
                     append_once(path)
+            rejection = active / "build-output-rejection.json"
+            if rejection.exists():
+                append_once(rejection)
 
         # build.json if it exists. Do not hand it to spec: spec must see
         # only implementation-index.json so semantic build deviations do
@@ -1780,55 +1783,112 @@ class Orchestrator:
 
             ralph_context_path = self._prepare_ralph_iteration_context(active)
 
-            build_context = self._context_artifacts_for_stage(
-                active, "build", primary_target, [],
-            )
-            iteration_protected = _protect_context_inputs(
-                protected_write_paths or [],
-                context_artifacts=build_context,
-                owned_outputs=[primary_target],
-            )
-            prompt = render_stage_prompt(
-                stage="build",
-                feature=feature,
-                feature_active=active,
-                repo_root=self.cfg.repo_root,
-                primary_target=primary_target,
-                extra_targets=[],
-                context_artifacts=build_context,
-                writable_paths=allowed_write_paths,
-                protected_paths=iteration_protected,
-            )
-            resume_prompt = render_stage_prompt(
-                stage="build",
-                feature=feature,
-                feature_active=active,
-                repo_root=self.cfg.repo_root,
-                primary_target=primary_target,
-                extra_targets=[],
-                context_artifacts=build_context,
-                writable_paths=allowed_write_paths,
-                protected_paths=iteration_protected,
-                continuation=True,
-            )
-            pre_snap = snapshot(
-                self.cfg.repo_root,
-                watched_paths=iteration_protected,
-            )
-            result = self._run_stage_subprocess_checked(
-                feature=feature,
-                active=active,
-                stage="build",
-                logger=logger,
-                stage_spec=stage_spec,
-                prompt=prompt,
-                resume_prompt=resume_prompt,
-                primary_target=primary_target,
-                extra_targets=[],
-                allowed_write_paths=allowed_write_paths,
-                pre_snap=pre_snap,
-                protected_write_paths=iteration_protected,
-            )
+            feedback_path = active / "build-output-rejection.json"
+            iteration_baseline = snapshot(self.cfg.repo_root)
+            result = None
+            for attempt in range(1, STAGE_OUTPUT_RETRY_MAX + 1):
+                build_context = self._context_artifacts_for_stage(
+                    active, "build", primary_target, [],
+                )
+                iteration_protected = _protect_context_inputs(
+                    protected_write_paths or [],
+                    context_artifacts=build_context,
+                    owned_outputs=[primary_target],
+                )
+                prompt = render_stage_prompt(
+                    stage="build",
+                    feature=feature,
+                    feature_active=active,
+                    repo_root=self.cfg.repo_root,
+                    primary_target=primary_target,
+                    extra_targets=[],
+                    context_artifacts=build_context,
+                    writable_paths=allowed_write_paths,
+                    protected_paths=iteration_protected,
+                )
+                resume_prompt = render_stage_prompt(
+                    stage="build",
+                    feature=feature,
+                    feature_active=active,
+                    repo_root=self.cfg.repo_root,
+                    primary_target=primary_target,
+                    extra_targets=[],
+                    context_artifacts=build_context,
+                    writable_paths=allowed_write_paths,
+                    protected_paths=iteration_protected,
+                    continuation=True,
+                )
+                pre_snap = snapshot(
+                    self.cfg.repo_root,
+                    watched_paths=iteration_protected,
+                )
+                try:
+                    result = self._run_stage_subprocess_checked(
+                        feature=feature,
+                        active=active,
+                        stage="build",
+                        logger=logger,
+                        stage_spec=stage_spec,
+                        prompt=prompt,
+                        resume_prompt=resume_prompt,
+                        primary_target=primary_target,
+                        extra_targets=[],
+                        allowed_write_paths=allowed_write_paths,
+                        pre_snap=pre_snap,
+                        protected_write_paths=iteration_protected,
+                    )
+                    residue = user_visible_changes(
+                        iteration_baseline,
+                        snapshot(self.cfg.repo_root),
+                    )
+                    if residue:
+                        raise StageOutputInvalid(
+                            "build",
+                            "uncommitted_product_changes",
+                            "Build exited before its product/test changes were "
+                            "fully committed. Wait synchronously for git commit "
+                            "and all hooks, then return with the iteration's "
+                            f"workspace baseline restored. Changes: {residue[:10]}",
+                        )
+                except StageOutputInvalid as e:
+                    self._write_output_rejection_feedback(
+                        feedback_path,
+                        stage="build",
+                        attempt=attempt,
+                        kind=e.kind,
+                        detail=e.detail,
+                        primary_target=primary_target,
+                        extra_targets=None,
+                        missing_ids=None,
+                    )
+                    if attempt >= STAGE_OUTPUT_RETRY_MAX:
+                        logger.emit(
+                            stage="build",
+                            event="output-rejected-exhausted",
+                            feature=feature,
+                            detail={
+                                "attempts": attempt,
+                                "kind": e.kind,
+                                "detail": str(e.detail)[:300],
+                            },
+                        )
+                        raise
+                    logger.emit(
+                        stage="build",
+                        event="output-rejected-retrying",
+                        feature=feature,
+                        detail={
+                            "attempt": attempt,
+                            "max": STAGE_OUTPUT_RETRY_MAX,
+                            "kind": e.kind,
+                            "detail": str(e.detail)[:300],
+                        },
+                    )
+                    continue
+                feedback_path.unlink(missing_ok=True)
+                break
+            if result is None:  # defensive: loop either sets it or raises
+                raise PreflightError("build output retry loop produced no result")
             # Stamp current git HEAD into build.json. Without this, a
             # rerun whose LLM-produced build.json is byte-identical to
             # the previous one (same test_results, same files_changed,

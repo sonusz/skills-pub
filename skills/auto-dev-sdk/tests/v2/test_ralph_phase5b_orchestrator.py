@@ -123,6 +123,20 @@ def _write_fake_vendor(path: Path) -> Path:
             if tgt_build:
                 n = bump(active, "build")
                 log_prompt(active, "build", n, prompt)
+                if os.environ.get("AUTODEV_PHASE5B_DIRTY_ONCE") == "1":
+                    changed = Path.cwd() / "src" / "interrupted.py"
+                    if n == 1:
+                        changed.parent.mkdir(parents=True, exist_ok=True)
+                        changed.write_text("VALUE = 1\\n", encoding="utf-8")
+                        subprocess.run(
+                            ["git", "add", "--", str(changed.relative_to(Path.cwd()))],
+                            cwd=Path.cwd(), check=True,
+                        )
+                    elif n == 2:
+                        subprocess.run(
+                            ["git", "commit", "-q", "-m", "finish interrupted build"],
+                            cwd=Path.cwd(), check=True,
+                        )
                 if os.environ.get("AUTODEV_PHASE5B_AMEND_BUILD") == "1":
                     changed = Path.cwd() / "src" / "amended.py"
                     changed.parent.mkdir(parents=True, exist_ok=True)
@@ -462,6 +476,55 @@ def test_ralph_diff_context_preserves_amended_commit_delta(
     assert f"- BUILD_BEFORE_REF: `{before}`" in review_prompt
     assert f"- BUILD_AFTER_REF: `{after}`" in review_prompt
     assert f"- RALPH_ITERATION_CONTEXT_PATH: `{context_path}`" in review_prompt
+
+
+def test_build_retries_until_product_changes_are_committed(
+    git_repo, feature_active, monkeypatch,
+):
+    """A Build may not hand Ralph a staged tree while its commit is pending."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+    before = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
+
+    monkeypatch.setenv("AUTODEV_PHASE5B_DIRTY_ONCE", "1")
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 2
+    assert _count(feature_active, "ralph-review") == 1
+    assert not (feature_active / "build-output-rejection.json").exists()
+    assert subprocess.check_output(
+        ["git", "status", "--short", "--", "src/interrupted.py"],
+        cwd=str(git_repo), text=True,
+    ) == ""
+
+    context_path = feature_active / "ralph-iteration-context.json"
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    assert context["before_ref"] == before
+    assert context["before_ref"] != context["after_ref"]
+    patch_result = subprocess.run(
+        context["diff"]["patch_command"],
+        cwd=str(git_repo), text=True, capture_output=True, check=True,
+    )
+    assert "src/interrupted.py" in patch_result.stdout
+
+    retry_prompt = (
+        feature_active / "scratch" / ".build.2.prompt"
+    ).read_text(encoding="utf-8")
+    assert str(feature_active / "build-output-rejection.json") in retry_prompt
+    assert any(
+        event.get("stage") == "build"
+        and event.get("event") == "output-rejected-retrying"
+        and event.get("detail", {}).get("kind") == "uncommitted_product_changes"
+        for event in _read_log(feature_active)
+    )
 
 
 def test_ralph_diff_context_reuses_original_before_ref_on_reentry(

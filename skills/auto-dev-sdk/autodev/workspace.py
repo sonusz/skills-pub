@@ -253,6 +253,21 @@ def diff_snapshots(before: WorkspaceState, after: WorkspaceState) -> list[str]:
     return sorted(changed)
 
 
+def user_visible_changes(
+    before: WorkspaceState,
+    after: WorkspaceState,
+) -> list[str]:
+    """Return user-visible worktree/index changes between two snapshots.
+
+    This keeps pre-existing user dirt as a baseline while still noticing a
+    stage that adds, stages, removes, or rewrites a product file. Active
+    feature artifacts and harness internals remain excluded by the same rules
+    used for the preflight dirty check.
+    """
+    visible = set(before.user_visible_lines()) | set(after.user_visible_lines())
+    return [entry for entry in diff_snapshots(before, after) if entry in visible]
+
+
 def _committed_path_entries(
     before: WorkspaceState,
     after: WorkspaceState,
