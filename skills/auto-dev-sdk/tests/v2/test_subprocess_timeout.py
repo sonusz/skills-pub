@@ -145,3 +145,84 @@ def test_stage_effort_field_passed_to_shared_vendor(
 
     assert result.ok
     assert captured["effort"] == "xhigh"
+
+
+def test_existing_unchanged_artifact_does_not_satisfy_a_new_stage_turn(
+    git_repo, feature_active, tmp_path, monkeypatch,
+):
+    artifact = feature_active / "build.json"
+    artifact.write_text('{"old": true}\n', encoding="utf-8")
+
+    def fake_call_shared_vendor(**kwargs):
+        return SharedVendorResult(
+            vendor=kwargs["vendor"],
+            output_id=kwargs["output_id"],
+            returncode=0,
+            output="exited without writing this turn's output",
+            log="",
+            status={"exit_code": "0"},
+            summary_stdout="",
+            summary_stderr="",
+            elapsed_sec=0.01,
+            output_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
+    spec = StageSpec(
+        stage="build", vendor="claude", model="fake", probe_interval_sec=30,
+    )
+
+    result = run_stage_subprocess(
+        stage="build",
+        stage_spec=spec,
+        prompt="test stale output",
+        artifact_target=artifact,
+        feature_active=feature_active,
+        allowed_write_paths=[feature_active],
+        cwd=git_repo,
+    )
+
+    assert not result.ok
+    assert result.failure_kind == "stale_artifact"
+    assert "pre-existing build.json was unchanged" in result.failure_detail
+    assert artifact.read_text(encoding="utf-8") == '{"old": true}\n'
+
+
+def test_changed_direct_target_remains_a_supported_stage_output(
+    git_repo, feature_active, tmp_path, monkeypatch,
+):
+    artifact = feature_active / "build.json"
+    artifact.write_text('{"old": true}\n', encoding="utf-8")
+
+    def fake_call_shared_vendor(**kwargs):
+        artifact.write_text('{"fresh": true}\n', encoding="utf-8")
+        return SharedVendorResult(
+            vendor=kwargs["vendor"],
+            output_id=kwargs["output_id"],
+            returncode=0,
+            output="wrote target directly",
+            log="",
+            status={"exit_code": "0"},
+            summary_stdout="",
+            summary_stderr="",
+            elapsed_sec=0.01,
+            output_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
+    spec = StageSpec(
+        stage="build", vendor="claude", model="fake", probe_interval_sec=30,
+    )
+
+    result = run_stage_subprocess(
+        stage="build",
+        stage_spec=spec,
+        prompt="test direct output",
+        artifact_target=artifact,
+        feature_active=feature_active,
+        allowed_write_paths=[feature_active],
+        cwd=git_repo,
+    )
+
+    assert result.ok
+    assert artifact.read_text(encoding="utf-8") == '{"fresh": true}\n'

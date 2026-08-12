@@ -1384,6 +1384,14 @@ class Orchestrator:
             logger.emit(stage=stage, event="subprocess-failed", feature=feature,
                         detail={"kind": result.failure_kind,
                                 "detail": result.failure_detail})
+            if stage == "build" and result.failure_kind in {
+                "missing_artifact", "stale_artifact",
+            }:
+                raise StageOutputInvalid(
+                    stage,
+                    result.failure_kind,
+                    result.failure_detail,
+                )
             raise PreflightError(
                 f"stage {stage} failed: {result.failure_kind} — {result.failure_detail}"
             )

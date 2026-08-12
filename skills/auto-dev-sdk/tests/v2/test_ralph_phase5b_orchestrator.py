@@ -123,6 +123,11 @@ def _write_fake_vendor(path: Path) -> Path:
             if tgt_build:
                 n = bump(active, "build")
                 log_prompt(active, "build", n, prompt)
+                if (
+                    os.environ.get("AUTODEV_PHASE5B_MISSING_BUILD_ONCE") == "1"
+                    and n == 1
+                ):
+                    sys.exit(0)
                 if os.environ.get("AUTODEV_PHASE5B_DIRTY_ONCE") == "1":
                     changed = Path.cwd() / "src" / "interrupted.py"
                     if n == 1:
@@ -523,6 +528,37 @@ def test_build_retries_until_product_changes_are_committed(
         event.get("stage") == "build"
         and event.get("event") == "output-rejected-retrying"
         and event.get("detail", {}).get("kind") == "uncommitted_product_changes"
+        for event in _read_log(feature_active)
+    )
+
+
+def test_build_retries_when_a_successful_turn_writes_no_artifact(
+    git_repo, feature_active, monkeypatch,
+):
+    """Exit 0 without this turn's build.json must not launch an empty Ralph."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+
+    monkeypatch.setenv("AUTODEV_PHASE5B_MISSING_BUILD_ONCE", "1")
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 2
+    assert _count(feature_active, "ralph-review") == 1
+    assert not (feature_active / "build-output-rejection.json").exists()
+    retry_prompt = (
+        feature_active / "scratch" / ".build.2.prompt"
+    ).read_text(encoding="utf-8")
+    assert str(feature_active / "build-output-rejection.json") in retry_prompt
+    assert any(
+        event.get("stage") == "build"
+        and event.get("event") == "output-rejected-retrying"
+        and event.get("detail", {}).get("kind") == "missing_artifact"
         for event in _read_log(feature_active)
     )
 

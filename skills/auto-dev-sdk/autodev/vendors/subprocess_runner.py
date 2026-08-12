@@ -6,6 +6,7 @@ logged for debugging, not parsed as the stage result.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from dataclasses import dataclass, field
@@ -71,6 +72,29 @@ def _exit_code_from_status(status: dict[str, str], fallback: int) -> int:
         return fallback
 
 
+def _artifact_identity(path: Path) -> tuple[int, int, int, int, str] | None:
+    """Return enough identity to distinguish a fresh direct write from residue.
+
+    The normal stage contract writes ``<target>.tmp``.  A small compatibility
+    path still accepts agents that write the target directly, but an already
+    landed target must not make an exit-0 turn with no output look successful.
+    Include metadata as well as bytes so an intentional identical-content
+    rewrite is still recognized as a fresh direct write.
+    """
+    try:
+        stat_result = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return (
+        stat_result.st_mode,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        digest,
+    )
+
+
 def run_stage_subprocess(
     *,
     stage: str,
@@ -116,6 +140,7 @@ def run_stage_subprocess(
     )
 
     artifact_tmp = artifact_target.with_name(artifact_target.name + ".tmp")
+    artifact_before = _artifact_identity(artifact_target)
     # Clean any stale tmp from a prior attempt, then optionally pre-seed.
     if artifact_tmp.exists():
         try:
@@ -255,8 +280,14 @@ def run_stage_subprocess(
             except OSError as e:
                 failure_kind = "missing_artifact"
                 failure_detail = f"rename failed: {e}"
-        # If artifact_target already exists (vendor wrote directly, skipping
-        # our .tmp convention), we accept but flag a warning in log.
+        elif artifact_before is not None and _artifact_identity(artifact_target) == artifact_before:
+            failure_kind = "stale_artifact"
+            failure_detail = (
+                f"{artifact_tmp.name} was not produced and the pre-existing "
+                f"{artifact_target.name} was unchanged after exit 0"
+            )
+        # If artifact_target changed (vendor wrote directly, skipping our
+        # .tmp convention), retain the compatibility path.
         if failure_kind is None:
             ok = True
 
