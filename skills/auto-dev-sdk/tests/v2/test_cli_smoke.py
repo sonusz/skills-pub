@@ -31,6 +31,147 @@ def test_cli_explain_uses_human_status_mode(git_repo, feature_active, capsys):
     assert "status:  active" in out
 
 
+def test_cli_grant_rerun_records_one_auditable_credit(
+    git_repo, feature_active, capsys,
+):
+    from autodev.artifacts.revision_state import (
+        L_MAX, RevisionState, load_state, write_state,
+    )
+    from autodev.artifacts.verdict import (
+        PanelFinding, PanelVerdict, write_verdict,
+    )
+
+    state = RevisionState()
+    state.L["design-review"] = L_MAX
+    write_state(feature_active, state)
+    write_verdict(
+        feature_active / "panel-design-review.json",
+        PanelVerdict(
+            gate="design-review", verdict="needs_revision",
+            findings=[PanelFinding(
+                severity="risk", vendor="codex", summary="fix design",
+                targets=["primary_pair.design.md"],
+            )],
+            source="design.md", source_hash="sha256:" + "0" * 64,
+            prompt_file="p", prompt_hash="sha256:" + "0" * 64,
+            harness_version="test", run_ts="2026-08-13T00:00:00Z",
+        ),
+    )
+
+    code = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "one narrow correction", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    saved = load_state(feature_active)
+    assert saved.manual_rerun_credits["design-review"] == 1
+    assert saved.manual_rerun_grants[-1]["reason"] == "one narrow correction"
+    assert saved.manual_rerun_grants[-1]["who"] == "operator"
+    assert saved.manual_rerun_grants[-1]["consumed_at"] is None
+    assert "gate still must pass" in capsys.readouterr().out
+
+    duplicate = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "do not stack", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert duplicate == exit_codes.ERROR
+    assert "already pending" in capsys.readouterr().err
+
+
+def test_cli_grant_rerun_accepts_trace_only_design_blocker(
+    git_repo, feature_active, capsys,
+):
+    from autodev.artifacts.revision_state import (
+        L_MAX, RevisionState, load_state, write_state,
+    )
+    from autodev.artifacts.verdict import (
+        PanelFinding, PanelVerdict, ReviewDecision, write_verdict,
+    )
+
+    state = RevisionState()
+    state.L["design-review"] = L_MAX
+    write_state(feature_active, state)
+    common = {
+        "source": "design-packet.json",
+        "source_hash": "sha256:" + "1" * 64,
+        "prompt_file": "p", "prompt_hash": "sha256:" + "0" * 64,
+        "harness_version": "test", "run_ts": "2026-08-13T00:00:00Z",
+    }
+    write_verdict(
+        feature_active / "panel-design-review.json",
+        PanelVerdict(
+            gate="design-review", verdict="pass", findings=[],
+            decision=ReviewDecision(
+                node="design_review", outcome="pass", blocking=False,
+                severity="opinion", summary="design passes",
+            ),
+            **common,
+        ),
+    )
+    write_verdict(
+        feature_active / "panel-trace-review.json",
+        PanelVerdict(
+            gate="trace-review", verdict="needs_revision",
+            findings=[PanelFinding(
+                severity="risk", vendor="codex", summary="trace blocks",
+                targets=["primary_pair.trace.md"],
+            )],
+            **common,
+        ),
+    )
+
+    code = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "trace correction", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    assert load_state(feature_active).manual_rerun_credits["design-review"] == 1
+
+
+def test_cli_grant_rerun_rejects_human_only_verdict(
+    git_repo, feature_active, capsys,
+):
+    from autodev.artifacts.revision_state import (
+        L_MAX, RevisionState, load_state, write_state,
+    )
+    from autodev.artifacts.verdict import (
+        PanelFinding, PanelVerdict, ReviewDecision, write_verdict,
+    )
+
+    state = RevisionState()
+    state.L["design-review"] = L_MAX
+    write_state(feature_active, state)
+    write_verdict(
+        feature_active / "panel-design-review.json",
+        PanelVerdict(
+            gate="design-review", verdict="needs_revision",
+            findings=[PanelFinding(
+                severity="risk", vendor="codex", summary="human decision",
+                targets=["primary_pair.prd.md"],
+            )],
+            source="design-packet.json", source_hash="sha256:" + "2" * 64,
+            prompt_file="p", prompt_hash="sha256:" + "0" * 64,
+            harness_version="test", run_ts="2026-08-13T00:00:00Z",
+            decision=ReviewDecision(
+                node="design_review", outcome="halt_for_human", blocking=True,
+                severity="risk", summary="requires human",
+            ),
+        ),
+    )
+
+    code = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "must reject", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.ERROR
+    assert "not a producer-rerunnable" in capsys.readouterr().err
+    assert load_state(feature_active).manual_rerun_credits["design-review"] == 0
+
+
 def test_cli_prd_from_file(git_repo, capsys, tmp_path):
     src = tmp_path / "draft.md"
     # PRD must pass Stage 0 schema (six sections + ≥1 `### R<N>:` marker).

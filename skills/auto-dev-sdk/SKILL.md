@@ -61,7 +61,7 @@ Before `autodev prd`, spawn a fresh read-only subagent. Give it only the PRD and
 
 Compare its independent reading with the user's confirmed intent. If they differ materially, surface the mismatch, make only the smallest user-approved clarification, and repeat with a fresh pass until they align. Do not proceed merely because the subagent says the PRD is acceptable, and do not let it invent requirements or replace user approval. Apply the same check after a material PRD amendment and before resuming the pipeline; clarify an active PRD only through `autodev update`.
 
-Trigger the pre-flight when the user says "write a PRD", "draft requirements", "spec out a new feature", or hands over an unstructured idea and asks to start auto-dev. For `update`, skip only the cold-start authoring steps; a material amendment still requires the semantic-intent check before resume. Skip the full pre-flight for `close`, `pause`, `resume`, `abort`, `retry`, `invalidate`, `skip-gate`, and `acknowledge-dirty`.
+Trigger the pre-flight when the user says "write a PRD", "draft requirements", "spec out a new feature", or hands over an unstructured idea and asks to start auto-dev. For `update`, skip only the cold-start authoring steps; a material amendment still requires the semantic-intent check before resume. Skip the full pre-flight for `close`, `pause`, `resume`, `abort`, `retry`, `invalidate`, `grant-rerun`, `skip-gate`, and `acknowledge-dirty`.
 
 ## CLI install check
 
@@ -82,6 +82,7 @@ I may only invoke these:
 | `autodev pause <f>` | Write `.pause` sentinel |
 | `autodev resume <f>` | Remove `.pause` sentinel |
 | `autodev quota-resume <f>` | Conditionally resume a quota-paused feature (auto-continues only if still quota-paused, resume_at reached, quota recovered, and repo unchanged; else no-op) |
+| `autodev grant-rerun <f> <gate> --reason "..."` | After a gate exhausts `L_MAX`, authorize one auditable producer correction. This neither passes nor skips the gate; the next blocking verdict halts again. |
 | `autodev skip-gate <f> <gate> --reason "..."` | Override a mandatory gate |
 | `autodev acknowledge-dirty <f> --reason "..."` | Override dirty-workspace block |
 | `autodev abort <f>` | Hard-stop the run: write `.pause` sentinel (so orchestrator can't dispatch next stage) + kill running vendor subprocess + write interrupted failure. Run `autodev resume` before next `run`. |
@@ -152,7 +153,7 @@ Mirror the harness R5 contract:
 
 1. Track the latest `<feature>` arg as current feature across turns.
 2. Before each user turn in an active auto-dev session, run `autodev status <current-feature>` and surface state changes.
-3. Before any write-like verb (`skip-gate`, `acknowledge-dirty`, `abort`, `reset-session`, `restore-design`, `invalidate`, `update`, `close`), rerun `autodev status`.
+3. Before any write-like verb (`grant-rerun`, `skip-gate`, `acknowledge-dirty`, `abort`, `reset-session`, `restore-design`, `invalidate`, `update`, `close`), rerun `autodev status`.
 4. For every background `run`/`next`, use `--watch` and attach one generic Monitor that implements [references/watch.md](references/watch.md). Do not invent shell sleep loops, cron polling, or per-feature heartbeat logic.
    - Treat `started` as the advertised heartbeat contract and reset the silence deadline on every watch marker.
    - Heartbeats are health signals; do not relay routine ones to the user.

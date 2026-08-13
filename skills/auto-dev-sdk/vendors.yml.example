@@ -47,14 +47,14 @@ stages:
     vendor: codex
     model: gpt-5.6-sol
     probe_interval_sec: 1200
-    effort: max
+    effort: high
     # Example quota gate: prefer codex while it has >=20% of its window left;
     # otherwise fall back to claude (>=15%), then cursor (>=10%).
     min_quota_pct: 20
     fallbacks:
       - vendor: claude
         model: claude-fable-5
-        effort: max
+        effort: high
         min_quota_pct: 15
       - vendor: cursor
         model: gpt-5.6-sol-xhigh
@@ -99,7 +99,7 @@ panel:
   synthesizer:
     vendor: codex
     model: gpt-5.6-sol
-    effort: max
+    effort: medium
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
 

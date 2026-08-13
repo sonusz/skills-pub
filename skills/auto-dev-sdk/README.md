@@ -29,7 +29,7 @@ stages:
     vendor: codex
     model: gpt-5.6-sol
     probe_interval_sec: 1200
-    effort: max
+    effort: high
   build:
     vendor: codex
     model: gpt-5.6-terra
@@ -46,7 +46,7 @@ stages:
     probe_interval_sec: 900
     effort: high
 
-panel:
+  panel:
   # Default transport quorum. An omitted reviewer must first fail a retry and
   # then have quota exhaustion positively confirmed.
   min_responding_reviewers: 2
@@ -193,6 +193,19 @@ autodev run myfeature --until design
 autodev status myfeature
 tail docs/features/myfeature/active/log.jsonl
 ```
+
+When a blocking gate has exhausted its local revision budget, an operator can
+authorize one more producer correction without amending the PRD or bypassing
+review:
+
+```bash
+autodev grant-rerun myfeature design-review \
+  --reason "one narrow correction after reviewing the blocking verdict"
+autodev run myfeature
+```
+
+The grant is auditable and single-use. It leaves the counter capped, does not
+mark the gate passed, and another blocking verdict halts again.
 
 `run` has three pacings: end-to-end (`autodev run`), one stage at a time
 (`autodev next`), and phase-bounded (`autodev run --until design|build`).

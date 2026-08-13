@@ -909,8 +909,9 @@ class Orchestrator:
         logger.emit(stage="gate", event="rework-mode-selected",
                     feature=feature, detail={"gate": gate, "mode": mode})
 
-    def _merge_trace_into_design(
-        self, active: Path, v_design: PanelVerdict,
+    @staticmethod
+    def merge_trace_into_design(
+        active: Path, v_design: PanelVerdict,
     ) -> tuple[PanelVerdict | None, list[str] | None]:
         """Return a merged design-review PanelVerdict if a fresh
         panel-trace-review.json exists referencing the same source as
@@ -994,6 +995,12 @@ class Orchestrator:
             round_type=v_design.round_type,
         )
         return merged, ["panel-design-review.json", "panel-trace-review.json"]
+
+    def _merge_trace_into_design(
+        self, active: Path, v_design: PanelVerdict,
+    ) -> tuple[PanelVerdict | None, list[str] | None]:
+        """Compatibility wrapper for the effective design-gate merge."""
+        return self.merge_trace_into_design(active, v_design)
 
     def _apply_revision_invalidation(self, active: Path, decision: Decision) -> None:
         """Delete artifacts so cascade re-runs ``decision.stage_to_rerun``.

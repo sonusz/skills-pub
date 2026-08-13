@@ -26,12 +26,12 @@
 stages:
   # Produces the design packet from PRD and repo context.
   # Context: largest stage; reads PRD, repo structure, prior completed specs,
-  # and panel feedback during rework. Effort: highest.
+  # and panel feedback during rework. Effort: high.
   design:
     vendor: claude
     model: fable
     probe_interval_sec: 2400
-    effort: max
+    effort: high
 
   # Implements the accepted design and writes target artifacts/code.
   # Context: large and repo-heavy; needs enough room for design packet,
@@ -40,7 +40,7 @@ stages:
     vendor: claude
     model: opus
     probe_interval_sec: 3600
-    effort: max
+    effort: medium
 
   # Ralph close/review pass over implementation/spec/checklist.
   # Context: medium; checks consistency and release readiness, not broad design
@@ -72,7 +72,7 @@ panel:
     # Claude: strong natural-language critique and ambiguity detection.
     - vendor: claude
       model: opus
-      effort: max
+      effort: medium
     # Grok: independent xAI-backed reviewer for divergence signal.
     - vendor: grok
       model: grok-4.5
@@ -84,14 +84,14 @@ panel:
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
       model: gpt-5.6-sol
-      effort: max
+      effort: medium
   # Preserves reviewer findings and performs semantic issue clustering.
   # This identity work controls rerun sizing and recurrence, so use the
   # strongest configured reasoning model rather than the extraction model.
   synthesizer:
     vendor: codex
     model: gpt-5.6-sol
-    effort: max
+    effort: medium
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300
 

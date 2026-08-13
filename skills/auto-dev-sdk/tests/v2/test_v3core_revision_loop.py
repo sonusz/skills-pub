@@ -20,11 +20,12 @@ import pytest
 
 from autodev.artifacts.revision_state import (
     ALL_PANEL_GATES, L_MAX, PRD_TARGET_HALT_STREAK, RevisionState, load_state,
-    reset_on_amendment, write_state,
+    grant_manual_rerun, reset_on_amendment, write_state,
 )
 from autodev.artifacts.verdict import PanelFinding, PanelVerdict, ReviewDecision
 from autodev.revision_loop import (
-    Decision, DecisionKind, handle_panel_verdict, route_to_layer,
+    Decision, DecisionKind, handle_panel_verdict,
+    producer_eligible_for_manual_rerun, route_to_layer,
 )
 
 
@@ -318,6 +319,73 @@ def test_third_blocking_verdict_dispatches(active):
     assert load_state(active).L["design-review"] == L_MAX
 
 
+def test_manual_rerun_credit_allows_exactly_one_extra_dispatch(active):
+    s = RevisionState()
+    s.L["design-review"] = L_MAX
+    write_state(active, s)
+    grant_manual_rerun(
+        active, "design-review", reason="one narrow correction", who="operator",
+    )
+    v = _v("design-review", [_f(targets=["primary_pair.trace.md"])])
+
+    first = handle_panel_verdict(active, "design-review", v)
+    assert first.kind == DecisionKind.LOCAL_REVISE
+    assert "consumed human-authorized" in first.reason
+    after = load_state(active)
+    assert after.L["design-review"] == L_MAX
+    assert after.manual_rerun_credits["design-review"] == 0
+    assert after.manual_rerun_grants[-1]["consumed_at"] is not None
+
+    second = handle_panel_verdict(active, "design-review", v)
+    assert second.kind == DecisionKind.HALT_FOR_HUMAN
+
+
+def test_manual_rerun_credit_supports_canonical_retry_design(active):
+    s = RevisionState()
+    s.L["design-review"] = L_MAX
+    write_state(active, s)
+    grant_manual_rerun(active, "design-review", reason="retry", who="operator")
+    v = _v("design-review", [_f(targets=["primary_pair.trace.md"])])
+    v.decision = ReviewDecision(
+        node="design_review", outcome="retry_design", blocking=False,
+        severity="risk", summary="retry", prd_targeted=False,
+    )
+    d = handle_panel_verdict(active, "design-review", v)
+    assert d.kind == DecisionKind.LOCAL_REVISE
+    assert "consumed human-authorized" in d.reason
+
+
+def test_manual_rerun_grant_requires_cap_and_cannot_stack(active):
+    with pytest.raises(ValueError, match="has not reached"):
+        grant_manual_rerun(active, "design-review", reason="early", who="operator")
+    s = RevisionState()
+    s.L["design-review"] = L_MAX
+    write_state(active, s)
+    grant_manual_rerun(active, "design-review", reason="first", who="operator")
+    with pytest.raises(ValueError, match="already pending"):
+        grant_manual_rerun(active, "design-review", reason="second", who="operator")
+
+
+def test_manual_rerun_eligibility_rejects_human_only_decision(active):
+    s = RevisionState()
+    s.L["design-review"] = L_MAX
+    write_state(active, s)
+    v = _v("design-review", [_f(targets=["primary_pair.prd.md"])])
+    v.decision = ReviewDecision(
+        node="design_review", outcome="halt_for_human", blocking=True,
+        severity="risk", summary="human only",
+    )
+    assert producer_eligible_for_manual_rerun(active, "design-review", v) is None
+
+
+def test_manual_rerun_eligibility_accepts_rerunnable_cap_halt(active):
+    s = RevisionState()
+    s.L["design-review"] = L_MAX
+    write_state(active, s)
+    v = _v("design-review", [_f(targets=["primary_pair.trace.md"])])
+    assert producer_eligible_for_manual_rerun(active, "design-review", v) == "design"
+
+
 def test_first_blocking_verdict_bumps_l_to_1(active):
     v = _v("design-review", [_f(targets=["primary_pair.trace.md"])])
     d = handle_panel_verdict(active, "design-review", v)
@@ -357,6 +425,17 @@ def test_route_to_layer_halts_at_l_max(active):
     assert d.kind == DecisionKind.HALT_FOR_HUMAN
 
 
+def test_route_to_layer_consumes_manual_rerun_credit_at_l_max(active):
+    s = RevisionState()
+    s.L["design-review"] = L_MAX
+    write_state(active, s)
+    grant_manual_rerun(active, "design-review", reason="route", who="operator")
+    d = route_to_layer(active, "design", trigger_ref="build.json#/0")
+    assert d.kind == DecisionKind.LOCAL_REVISE
+    assert "consumed human-authorized" in d.reason
+    assert load_state(active).manual_rerun_credits["design-review"] == 0
+
+
 def test_route_to_layer_prd_halts_unconditionally(active):
     d = route_to_layer(active, "prd", trigger_ref="b")
     assert d.kind == DecisionKind.HALT_FOR_HUMAN
@@ -375,11 +454,15 @@ def test_reset_on_amendment_clears_l(active):
     s.L["close-approval"] = 1
     s.prd_target_streak["design-review"] = 1
     s.pending_feedback = {"design": ["x"]}
+    s.L["design-review"] = L_MAX
     write_state(active, s)
+    grant_manual_rerun(active, "design-review", reason="stale", who="operator")
     s2 = reset_on_amendment(active)
     assert all(v == 0 for v in s2.L.values())
     assert all(v == 0 for v in s2.prd_target_streak.values())
     assert s2.pending_feedback == {}
+    assert all(v == 0 for v in s2.manual_rerun_credits.values())
+    assert s2.manual_rerun_grants == []
 
 
 # ---------- legacy-field tolerance ----------
@@ -399,6 +482,8 @@ def test_load_tolerates_legacy_m_and_auto_pass_next(active):
     assert s.L["design-review"] == 1
     assert s.prd_target_streak["design-review"] == 0
     assert s.pending_feedback == {"design": ["x"]}
+    assert all(v == 0 for v in s.manual_rerun_credits.values())
+    assert s.manual_rerun_grants == []
 
 
 def test_write_state_drops_legacy_fields(active):

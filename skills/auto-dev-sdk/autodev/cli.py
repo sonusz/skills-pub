@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("retry", "Retry failed current stage"),
         ("invalidate", "Invalidate a stage artifact (rollback)"),
         ("update", "Append PRD amendment; advance cycle"),
+        ("grant-rerun", "Authorize one extra producer rerun after L_MAX"),
         ("close", "Close feature"),
         ("explain", "Human-readable state summary"),
         ("prd-lint", "Stage 0: validate prd.md against PRD schema"),
@@ -108,6 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     upd = sub._name_parser_map["update"]
     upd.add_argument("--amendment", required=True)
+
+    grant_rerun = sub._name_parser_map["grant-rerun"]
+    grant_rerun.add_argument(
+        "gate", choices=("design-review", "close-approval"),
+    )
+    grant_rerun.add_argument("--reason", required=True)
+    grant_rerun.add_argument("--who", default=None)
 
     cl = sub._name_parser_map["close"]
     cl.add_argument("reason", choices=("complete", "retiring", "deferred", "cancelled"))
@@ -289,6 +297,10 @@ def cmd_status(args) -> int:
                 g: s.prd_target_streak.get(g, 0) for g in ALL_PANEL_GATES
             },
             "pending_feedback": dict(s.pending_feedback),
+            "manual_rerun_credits": {
+                g: s.manual_rerun_credits.get(g, 0)
+                for g in ALL_PANEL_GATES
+            },
         }
     if json_mode:
         print(json.dumps(report, indent=2, default=str))
@@ -326,6 +338,15 @@ def cmd_status(args) -> int:
                     + ", ".join(
                         f"{g}={rs['L'][g]}/{rs['L'][g] + rs['L_remaining'][g]}"
                         for g in rs["L"]
+                    )
+                )
+            if any(rs["manual_rerun_credits"].values()):
+                print(
+                    "manual rerun credits: "
+                    + ", ".join(
+                        f"{g}={n}"
+                        for g, n in rs["manual_rerun_credits"].items()
+                        if n
                     )
                 )
                 if any(rs["prd_target_streak"].values()):
@@ -1001,6 +1022,84 @@ def cmd_skip_gate(args) -> int:
     return exit_codes.OK
 
 
+def cmd_grant_rerun(args) -> int:
+    """Authorize one more producer correction without passing the gate."""
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+    if read_owner(active) is not None:
+        print(
+            f"cannot grant rerun while {args.feature} has an active or stale lock",
+            file=sys.stderr,
+        )
+        return exit_codes.LOCK_CONFLICT
+    if ov.load(active).has_active_skip_gate(args.gate):
+        print(
+            f"cannot grant rerun while skip-gate is active for {args.gate}",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+
+    from autodev.artifacts.revision_state import grant_manual_rerun
+    from autodev.artifacts.verdict import load_verdict
+
+    verdict_path = active / f"panel-{args.gate}.json"
+    if not verdict_path.is_file():
+        print(
+            f"cannot grant rerun: {verdict_path.name} is absent",
+            file=sys.stderr,
+        )
+        return exit_codes.GATE_PENDING
+    try:
+        verdict = load_verdict(verdict_path)
+    except (AutodevError, OSError, ValueError) as exc:
+        print(f"cannot grant rerun: invalid gate verdict: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    if args.gate == "design-review":
+        merged, _ = Orchestrator.merge_trace_into_design(active, verdict)
+        if merged is not None:
+            verdict = merged
+    if not verdict.effectively_blocks():
+        print(
+            f"cannot grant rerun: {args.gate} is not currently blocking",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    from autodev.revision_loop import producer_eligible_for_manual_rerun
+    producer = producer_eligible_for_manual_rerun(active, args.gate, verdict)
+    if producer is None:
+        print(
+            "cannot grant rerun: current blocking verdict is not a "
+            "producer-rerunnable L_MAX halt",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    who = ov.resolve_who(args.who)
+    try:
+        grant_manual_rerun(
+            active, args.gate, reason=args.reason, who=who,
+        )
+    except (AutodevError, ValueError) as exc:
+        print(f"cannot grant rerun: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    JsonlLog(active / "log.jsonl").emit(
+        stage="gate",
+        event="manual-rerun-granted",
+        feature=args.feature,
+        detail={
+            "gate": args.gate, "producer": producer,
+            "reason": args.reason.strip(), "who": who,
+        },
+    )
+    print(
+        f"granted one rerun beyond L_MAX for {args.gate} on {args.feature}; "
+        "the gate still must pass"
+    )
+    return exit_codes.OK
+
+
 def cmd_escalate(args) -> int:
     """G16: snapshot feature state into escalation.json for human review."""
     fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
@@ -1082,6 +1181,7 @@ _DISPATCH = {
     "retry": cmd_retry,
     "invalidate": cmd_invalidate,
     "update": cmd_update,
+    "grant-rerun": cmd_grant_rerun,
     "close": cmd_close,
     "explain": cmd_explain,
     "skip-gate": cmd_skip_gate,
