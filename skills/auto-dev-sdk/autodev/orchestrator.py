@@ -1351,6 +1351,7 @@ class Orchestrator:
         from datetime import datetime, timezone
         import os
         import shutil
+        from autodev.vendors.subprocess_runner import should_resume_transient_draft
 
         # Design reruns revise the prior package in place: pre-fill each
         # extra artifact's .tmp from its landed version so the subagent
@@ -1359,8 +1360,11 @@ class Orchestrator:
         # landed source is dropped so it can't leak into the next round.
         preseed = stage == "design" and primary_target.exists()
         if preseed:
+            resume_transient_draft = should_resume_transient_draft(active, stage)
             for extra_target in extra_targets:
                 extra_tmp = extra_target.with_name(extra_target.name + ".tmp")
+                if resume_transient_draft and extra_tmp.exists():
+                    continue
                 if extra_target.exists():
                     try:
                         shutil.copyfile(extra_target, extra_tmp)
