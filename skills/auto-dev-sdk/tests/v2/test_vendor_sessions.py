@@ -232,8 +232,11 @@ def test_shared_vendor_reuses_native_session_and_delta_prompt(
     events = [json.loads(line) for line in capture.read_text().splitlines()]
     mine = [event for event in events if event["provider"] == output_id]
     assert len(mine) == 2
-    assert mine[0]["prompt"].strip() == "INITIAL FULL PROMPT"
-    assert mine[1]["prompt"].strip() == "DELTA PROMPT"
+    # codex prompts carry the shared-module non-interactive preamble
+    # (VENDORS_CODEX_PREAMBLE) ahead of the caller's text.
+    assert mine[0]["prompt"].strip().endswith("INITIAL FULL PROMPT")
+    assert mine[1]["prompt"].strip().endswith("DELTA PROMPT")
+    assert "INITIAL FULL PROMPT" not in mine[1]["prompt"]
     assert mine[0]["session_id"] == mine[1]["session_id"]
     assert resume_flag in mine[1]["args"]
 

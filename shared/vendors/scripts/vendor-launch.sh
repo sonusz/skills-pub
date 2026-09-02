@@ -731,6 +731,19 @@ vendors_run_codex() {
 
   command=(codex exec --skip-git-repo-check --json --output-last-message "$output_file")
 
+  # Codex models are tuned for the interactive approval flow and, on large
+  # analysis prompts, often spend their single `codex exec` turn asking
+  # "proceed?" instead of answering. Pin the non-interactive contract in the
+  # prompt itself. VENDORS_CODEX_PREAMBLE=0 opts out.
+  if [ "${VENDORS_CODEX_PREAMBLE:-1}" = "1" ]; then
+    local preamble_file="$output_file.prompt"
+    {
+      printf '%s\n\n' "Non-interactive run: this is a single-shot \`codex exec\` call with no human attached. Never reply with a question, a confirmation request, or a plan-only answer — produce the complete final deliverable in this one response."
+      cat "$prompt_file"
+    } > "$preamble_file"
+    prompt_file="$preamble_file"
+  fi
+
   if [ -n "${VENDORS_RESOLVED_MODEL:-}" ]; then
     command+=(--model "$VENDORS_RESOLVED_MODEL")
   fi

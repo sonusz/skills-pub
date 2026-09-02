@@ -101,9 +101,14 @@ def test_shared_vendor_exposes_standard_live_stream_for_codex(
     stream = out_dir / "codex-stream" / "stream"
     assert result.returncode == 0
     assert stream.exists()
-    assert "live transcript for stream sentinel" in stream.read_text()
+    # shared/vendors prepends a non-interactive preamble to codex prompts
+    # (VENDORS_CODEX_PREAMBLE), so match the sentinel, not the exact prompt.
+    stream_text = stream.read_text()
+    assert stream_text.startswith("live transcript for ")
+    assert stream_text.rstrip().endswith("stream sentinel")
     assert result.status["stream"] == str(stream)
-    assert "final answer for stream sentinel" in result.output
+    assert result.output.startswith("final answer for ")
+    assert result.output.rstrip().endswith("stream sentinel")
 
 
 def test_stage_effort_field_passed_to_shared_vendor(
