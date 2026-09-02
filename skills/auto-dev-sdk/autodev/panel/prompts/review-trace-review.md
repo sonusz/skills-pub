@@ -90,6 +90,19 @@ behaviors being tested?
 - A e2e test for a trivially pure function is over-engineered
   (opinion severity).
 
+## Verify findings before reporting
+
+When subagents are available in your CLI (some reviewer CLIs have
+them; if yours does not, skip this section), use them to fact-check
+each finding you intend to report: the cited clause as it literally
+appears in the anchor document, the code or artifact fact the claim
+depends on, the evidence the finding points to. Drop or downgrade a
+finding whose evidence does not survive the check. Dispatch
+fact-checkers on a mid-tier, medium-effort model (for the claude
+CLI, `model: sonnet` on the Agent tool). Fact-checkers are
+read-only: subagents must not edit code or any artifact, and you
+remain the author of every reported finding.
+
 ## Finding categories
 
 - **MISSING** — a PRD `### R<N>:` requirement has no trace row
@@ -179,6 +192,10 @@ guarantee that finding-writing is exhaustive across R<N>s.
 Per finding state:
 
 - `severity`: `invariant_violation` / `risk` / `opinion`
+- `priority`: `P0` only when the core release path or an explicitly
+  highest-rigor acceptance event cannot run; otherwise `P1` for important
+  deferrable work or `P2` for polish/optional hardening. Priority is
+  independent from severity.
 - `summary`: one sentence naming the category (MISSING /
   INCOMPLETE / WEAKENED / UNTESTED / UNTESTABLE) and the
   specific defect

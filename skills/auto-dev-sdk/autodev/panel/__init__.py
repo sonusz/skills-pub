@@ -3,9 +3,9 @@
 G15 replaces the previous `panel-review` skill + markdown regex wrapper
 (`autodev/panel_wrapper.py`) with a harness-owned implementation:
 
-  1. Parallel reviewer dispatch (claude / agy / codex) with open-ended
+  1. Parallel configured-reviewer dispatch with open-ended
      markdown prompts — reviewers write judgment prose, not JSON.
-  2. Configured synthesizer LLM call that reads the three markdown
+  2. Configured synthesizer LLM call that reads the quorum's markdown
      outputs and produces one schema-constrained
      panel-verdict.
   3. Mechanical fallback when synthesis fails (conservative union rule).
@@ -209,7 +209,28 @@ def run_panel_gate(
         integrity.discard(guard)
         raise
 
-    changes = integrity.detect_after(guard, canonical_files)
+    # These files are written by the harness inside the guarded interval, not
+    # by reviewers. A design review owns both its design and trace group
+    # verdict/cache pairs. Keep the exception narrow: canonical inputs remain
+    # hash-protected, and every other tracked-file delta is still rejected.
+    output_gates = (
+        ["design-review", "trace-review"]
+        if gate == "design-review"
+        else [gate]
+    )
+    expected_panel_writes = [
+        feature_active / name
+        for output_gate in output_gates
+        for name in (
+            f"panel-{output_gate}.json",
+            f"panel-{output_gate}.reviewers.json",
+        )
+    ]
+    changes = integrity.detect_after(
+        guard,
+        canonical_files,
+        expected_tracked_writes=expected_panel_writes,
+    )
     if changes:
         # Round is tainted: drop its verdict + reviewer cache so resume
         # re-runs fresh, then pause. The restore point is preserved (NOT
@@ -256,6 +277,20 @@ def verdict_exists_and_valid(
         return None
     if v.source_hash != current_source_hash:
         return None  # stale by primary-artifact hash
+    # Coverage/budget alternation: the design-review gate is satisfied only
+    # when BOTH round types have passed on this packet (replayed from
+    # design-round-outcome log events). A verdict from a passing round
+    # whose counterpart has not passed yet is deliberately "not valid" —
+    # the orchestrator then re-enters the gate and the runner dispatches
+    # the other round type on the same packet, with no design rerun.
+    # Skipped verdicts (operator override) bypass the pairing.
+    if gate == "design-review" and v.skip_reason is None:
+        try:
+            from autodev.budget import design_gate_satisfied
+            if not design_gate_satisfied(feature_active, v.source_hash):
+                return None
+        except Exception:
+            pass
     # v3-core: also validate every consulted_docs entry's hash matches
     # current file. This catches the multi-upstream primary-pair case
     # where (e.g.) scope.json regenerated but prd.md unchanged would

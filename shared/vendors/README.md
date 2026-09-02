@@ -58,6 +58,12 @@ Common arguments:
   `<id>/stream`, and `<id>/usage.json`
   for one or more calls
 - `--id ID` to choose output directory ids; repeat once per `--vendor`
+- `--session-key KEY` to persist and resume one opaque logical conversation;
+  repeat once per `--vendor` in fan-out calls
+- `--session-max-turns N` to rotate a keyed native conversation after N
+  successful turns; the next call sends the full prompt and starts at turn 1
+- `--resume-prompt TEXT` / `--resume-prompt-file FILE` to provide a smaller
+  prompt that is sent only after an existing native session is found
 - `--min-success N` to set how many selected vendors must succeed
 - `--timeout SECONDS` to stop a hanging vendor call
 - `--native-arg ARG` for a selected vendor's raw CLI-specific escape hatch
@@ -72,6 +78,97 @@ Common arguments:
 transport, output files, timeouts, context inlining, cwd, and environment
 variables are wrapper runtime contract, not model capability abstractions. Other
 vendor CLI behavior must be passed explicitly with `--native-arg`.
+
+## Persistent Sessions
+
+Session persistence is opt-in. Calls without `--session-key` keep the original
+stateless behavior. For a keyed call, the first successful invocation sends the
+full prompt and records the provider's native conversation id; later calls with
+the same key, normalized vendor, resolved model, real working directory, and
+ordered native-argument fingerprint resume that conversation. When `--cwd` is
+omitted, the invocation directory is the real working directory for this
+identity. Raw native arguments are not stored. If a non-empty
+`--resume-prompt` is supplied, only that continuation prompt is sent on resume.
+Otherwise the full prompt is sent again.
+
+Callers may bound conversational lifetime with `--session-max-turns N`. Turns
+1 through N share one native session; the following call atomically forgets
+that mapping and starts a new session. Only successful calls advance the
+counter. Failed or interrupted calls retain the prior count, while an explicit
+`session-state.py reset` clears it. Keyed status files expose `session_turn`,
+`session_max_turns`, and `session_auto_reset` for audit.
+
+```bash
+VENDORS=${VENDORS:-/tmp/skills/vendors}
+
+# First turn: establishes the provider-native session.
+"$VENDORS/scripts/call.sh" \
+  --vendor claude \
+  --session-key 'my-workflow:design' \
+  --prompt-file /tmp/full-design-contract.md \
+  --resume-prompt-file /tmp/current-revision.md \
+  --cwd /path/to/repo \
+  --output-dir /tmp/design-turn-1
+
+# Later turn: resumes the same session and sends current-revision.md.
+"$VENDORS/scripts/call.sh" \
+  --vendor claude \
+  --session-key 'my-workflow:design' \
+  --prompt-file /tmp/full-design-contract.md \
+  --resume-prompt-file /tmp/current-revision.md \
+  --cwd /path/to/repo \
+  --output-dir /tmp/design-turn-2
+```
+
+The provider mappings are native: Codex uses `exec resume`, Claude and Grok
+use explicit session UUIDs plus `--resume`, Agy resumes by conversation id, and
+Cursor uses `--resume`. Session-enabled Agy calls use its JSON output envelope
+to discover `conversation_id`; `out` is normalized back to the plain response.
+Native arguments that override session selection/persistence (and Agy/Cursor
+output formats needed to observe their dynamic ids) are rejected on keyed
+calls; `--session-key` owns that transport.
+
+A successful keyed provider process is not sufficient by itself: the wrapper
+must also obtain a native session id. If a dynamic provider omits that id, or
+session observation/finalization fails, the call reports exit code 70 in its
+status and does not create a resumable mapping. Session support requires Python
+3.10 or newer. Session ids are accepted only from each provider's trusted
+top-level protocol event (never nested model/tool payloads), must have a safe
+token shape, and must match a wrapper-requested id when one was supplied.
+
+Runtime mappings live outside repositories under
+`${VENDORS_SESSION_STATE_DIR}`, `${XDG_STATE_HOME}/shared-vendors/sessions`, or
+`~/.local/state/shared-vendors/sessions` (in that order). The opaque key itself
+is never stored; only its SHA-256 identity is retained in mode-0600 files. A
+per-session lease rejects concurrent turns with exit code 75 rather than
+corrupting conversation order. An unexpired lease remains reserved after its
+owner crashes; a live owner remains reserved even if a long call outlives the
+lease timestamp. A conclusive native "session not found" error invalidates the
+mapping; the failed call remains failed, and the next caller starts a fresh
+native session. A handled `INT`, `TERM`, or `HUP` releases leases only after
+the keyed call's dedicated kernel process group is empty. Direct keyed calls
+automatically re-exec into such a group when needed. Cleanup repeatedly scans
+the group so reparented or post-signal children cannot escape, then releases
+only the exact random lease tokens published in that invocation's session
+plans. An unverified shutdown keeps both session and output locks fail closed.
+
+The bundled `session-state.py reset --state-dir DIR --key KEY` operator command
+forgets every provider/model/cwd mapping for one logical key. It is serialized
+against new plans and refuses to reset while any matching lease is live. The
+next keyed call therefore starts a fresh provider-native conversation.
+
+Each `<output-dir>/<id>` also has an atomic coordinator lock acquired before
+any call artifact is created or truncated. Reusing that output id concurrently
+fails immediately. IDs `.` and `..` and symlinked call directories are rejected;
+an existing directory must resolve to a direct child of the canonical output
+root. Normal exits and verified handled signals remove the lock. A coordinator
+killed with `SIGKILL` intentionally leaves a fail-closed stale lock; verify its
+recorded pid is gone before removing that hidden lock directory, or choose a
+new `--output-dir`.
+
+Keyed status files additionally expose `session_mode=new|resume`, `session_id`,
+`session_key_hash`, `session`, and `session_invalidated`. Treat native session
+ids as local runtime metadata, not portable workflow artifacts.
 
 ## Yolo Mapping
 
@@ -334,8 +431,9 @@ response and may be written only after the vendor exits.
 
 Callers should treat `total_tokens` as the portable field and use `raw` only
 for diagnostics. When usage cannot be extracted, `available` is `false` and
-`total_tokens` is `null`. Agy print mode currently exposes no machine-readable
-token totals, so its successful calls use that unavailable form.
+`total_tokens` is `null`. Stateless Agy text-mode calls use that unavailable
+form; session-enabled Agy calls use its JSON envelope and expose normalized
+usage.
 
 The module does not require every supported vendor to be healthy. A caller
 selects the vendors it needs for that workflow and sets `--min-success` for

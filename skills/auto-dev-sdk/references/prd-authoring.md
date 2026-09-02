@@ -49,7 +49,8 @@ PRD MUST have:
 
 Plus optional `## Amendment <date>` blocks appended via
 `autodev update <feature> --amendment "..."` after a feature is
-underway.
+underway. An amendment may introduce a new, uniquely numbered
+`### R<n>: <Title>` requirement without rewriting the original section.
 
 Every requirement is a `### R<n>: <Title>` block followed by 1-3
 short paragraphs and optional bullets. Number sequentially without
@@ -118,6 +119,7 @@ Section shape (absent section ⇒ every R is `strict`):
 ## Assurance
 
 Default: loose
+Release threshold: P1
 
 | Req | Rigor | Rationale |
 |---|---|---|
@@ -129,6 +131,12 @@ Rows are needed only for Rs deviating from the default. Rationale is
 required — it calibrates reviewers and is re-asked verbatim at
 graduation or stall re-audits. Amendments override levels with
 `Assurance: R3 core -> strict` lines (latest wins).
+
+`Release threshold` is separate from rigor and severity. It accepts `P0`,
+`P1`, or `P2`; `P1` is the default and preserves historical behavior. Use
+`P0` for a time-critical release where P1/P2 findings must be retained as
+deferred work but must not trigger another producer/design round. A later
+amendment may set `Release threshold: P0` (last declaration wins).
 
 **Elicitation protocol — never ask for a level by name.** Users have
 no stable intuition for the labels but do for "can you accept this
@@ -272,15 +280,32 @@ When this list grows, lift the canonical wording into a shared
 `auto-dev-sdk/references/implementation-discipline.md` and
 reference it from each PRD's Constraints section.
 
-### 7. Validate format
+### 7. Validate semantic intent with a fresh subagent
 
-Before invoking `autodev prd <feature> --from-file <path>`:
+Before import, test whether the PRD communicates the user's intent without
+conversation context:
 
-- Run `autodev prd-lint --file <path>` (or import then re-lint).
-- Confirm 0 errors. The lint catches missing sections, malformed
-  R blocks, duplicate IDs.
+1. Give a fresh subagent only the PRD and its source references. Do not include
+   the intended interpretation, suspected ambiguity, or prior conclusions.
+2. Ask it to restate each requirement in plain language and flag multiple
+   plausible readings, contradictions, unbounded scope, and accidental
+   retention or deletion.
+3. Compare its reading with the user's confirmed intent. A material mismatch
+   means the PRD is unclear even if the subagent calls it acceptable.
+4. Surface the mismatch to the user, make the smallest user-approved wording
+   change, and repeat with a fresh independent pass until the readings align.
 
-### 8. Promote
+This is a semantic test, not an approval authority. The subagent must not add,
+remove, or relax requirements, and its verdict never replaces user approval.
+
+### 8. Validate format
+
+`autodev prd <feature> --from-file <path>` validates the source before writing
+it. After a successful import and before `autodev run`, run
+`autodev prd-lint <feature>` and confirm 0 errors. The lint catches missing
+sections, malformed R blocks, and duplicate IDs.
+
+### 9. Promote
 
 After import:
 

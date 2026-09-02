@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 
 from autodev.artifacts.scope import Scope, ScopeItem
-from autodev.artifacts.verdict import PanelFinding, PanelVerdict, load_verdict, write_verdict
+from autodev.artifacts.verdict import (
+    PanelFinding, PanelVerdict, ReviewDecision, load_verdict, write_verdict,
+)
 from autodev.assurance import AssuranceMap
 from autodev.panel.rigor_filter import (
     apply_rigor_filter, has_effective_blocking, one_level_down, resolve_rs,
@@ -235,6 +237,45 @@ def test_has_effective_blocking():
     b = _finding(severity="risk")
     assert not has_effective_blocking([a])
     assert has_effective_blocking([a, b])
+
+
+def test_release_threshold_defers_p1_but_not_p0():
+    p1 = _finding(severity="risk")
+    p1.priority = "P1"
+    p0 = _finding(severity="risk")
+    p0.priority = "P0"
+    assert not has_effective_blocking([p1], "P0")
+    assert has_effective_blocking([p0, p1], "P0")
+    # Historical default remains P1.
+    assert has_effective_blocking([p1])
+
+
+def test_verdict_p0_policy_retains_deferred_finding_without_blocking():
+    finding = _finding(severity="invariant_violation")
+    finding.priority = "P1"
+    v = PanelVerdict(
+        gate="design-review", verdict="pass", findings=[finding],
+        source="x", source_hash="sha256:0", prompt_file="p",
+        prompt_hash="sha256:1", harness_version="test", run_ts="t",
+        release_threshold="P0",
+    )
+    assert v.findings == [finding]
+    assert v.blocking_findings() == []
+    assert not v.effectively_blocks()
+
+
+def test_unreconciled_halt_for_human_remains_fail_closed():
+    finding = _finding(severity="opinion")
+    v = PanelVerdict(
+        gate="design-review", verdict="fail", findings=[finding],
+        source="x", source_hash="sha256:0", prompt_file="p",
+        prompt_hash="sha256:1", harness_version="test", run_ts="t",
+        decision=ReviewDecision(
+            node="design_review", outcome="halt_for_human", blocking=True,
+            severity="risk", summary="human decision required",
+        ),
+    )
+    assert v.effectively_blocks()
 
 
 def test_verdict_roundtrip_with_rigor_fields(tmp_path):

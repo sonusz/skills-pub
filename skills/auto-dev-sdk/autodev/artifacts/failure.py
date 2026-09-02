@@ -14,13 +14,15 @@ FailureKind = Literal[
     "timeout",
     "exit_nonzero",
     "missing_artifact",
+    "stale_artifact",
     "malformed_artifact",
     "detected_out_of_scope_write",
     "interrupted",
 ]
 
 _VALID_KINDS = {
-    "timeout", "exit_nonzero", "missing_artifact", "malformed_artifact",
+    "timeout", "exit_nonzero", "missing_artifact", "stale_artifact",
+    "malformed_artifact",
     "detected_out_of_scope_write", "interrupted",
 }
 

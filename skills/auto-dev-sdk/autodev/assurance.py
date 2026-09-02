@@ -5,6 +5,7 @@ Grammar (see docs/proposals/rigor-tier.md):
     ## Assurance
 
     Default: loose
+    Release threshold: P0
 
     | Req | Rigor | Rationale |
     |---|---|---|
@@ -46,6 +47,9 @@ _LEVEL_RANK: dict[str, int] = {"loose": 0, "core": 1, "strict": 2}
 _H2_RE = re.compile(r"^\s*##\s+(.+?)\s*$")
 _R_MARKER_RE = re.compile(r"^\s*###\s+R(\d+)\s*:")
 _DEFAULT_RE = re.compile(r"^\s*Default\s*:\s*(\S+)\s*$", re.IGNORECASE)
+_RELEASE_THRESHOLD_RE = re.compile(
+    r"^\s*Release\s+threshold\s*:\s*(\S+)\s*$", re.IGNORECASE,
+)
 _ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
 _R_TOKEN_RE = re.compile(r"^R(\d+)$")
 # Amendment override: `Assurance: R3 core -> strict` (from-level optional).
@@ -84,6 +88,9 @@ class AssuranceMap:
     rationale: dict[str, str] = field(default_factory=dict)
     # Mechanism 4 — per-R forethought directive; unspecified = "auto".
     depth_per_r: dict[str, str] = field(default_factory=dict)
+    # P1 preserves the historical gate: invariant violations and risks
+    # block, opinions do not. A PRD may opt into P0-only release gating.
+    release_threshold: str = "P1"
     # Requirement markers that actually exist in the PRD (`### R<n>:`).
     # None = unknown (map constructed without PRD text; no filtering).
     # The rigor filter drops reviewer-cited `prd:R<n>` tokens not in
@@ -105,6 +112,7 @@ class AssuranceMap:
             "present": self.present,
             "default": self.default,
             "per_r": dict(self.per_r),
+            "release_threshold": self.release_threshold,
         }
 
 
@@ -116,8 +124,7 @@ def _section_body(text: str, name: str) -> str | None:
         m = _H2_RE.match(line)
         if not m:
             continue
-        header = re.sub(r"^(§?\d+[\.\)]?\s+)", "", m.group(1).strip().lower())
-        header = re.sub(r"\s+", " ", header)
+        header = _normalized_h2(m.group(1))
         if start is None and header == name:
             start = i
             continue
@@ -126,6 +133,50 @@ def _section_body(text: str, name: str) -> str | None:
     if start is not None:
         return "\n".join(lines[start + 1:])
     return None
+
+
+def _normalized_h2(raw: str) -> str:
+    header = re.sub(r"^(§?\d+[\.\)]?\s+)", "", raw.strip().lower())
+    return re.sub(r"\s+", " ", header)
+
+
+def _unfenced_lines(body: str):
+    """Yield directive-eligible lines, ignoring fenced examples."""
+    fence: str | None = None
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        marker = "```" if stripped.startswith("```") else (
+            "~~~" if stripped.startswith("~~~") else None
+        )
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+            continue
+        if fence is None:
+            yield line
+
+
+def _amendment_bodies(text: str) -> list[str]:
+    """Bodies of explicit ``## Amendment ...`` sections."""
+    bodies: list[str] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        match = _H2_RE.match(line)
+        if match:
+            if current is not None:
+                bodies.append("\n".join(current))
+            header = _normalized_h2(match.group(1))
+            current = [] if re.fullmatch(
+                r"amendment(?:\s+\d{4}-\d{2}-\d{2})?", header,
+            ) else None
+            continue
+        if current is not None:
+            current.append(line)
+    if current is not None:
+        bodies.append("\n".join(current))
+    return bodies
 
 
 def _parse_rows(
@@ -258,6 +309,7 @@ def parse_assurance(
     rationale: dict[str, str] = {}
     depth_per_r: dict[str, str] = {}
     default: Level = "strict"
+    release_threshold = "P1"
     present = body is not None
 
     if body is not None:
@@ -284,6 +336,24 @@ def parse_assurance(
     # Amendment overrides apply whether or not the section exists —
     # an amendment may introduce the first per-R deviation.
     _apply_overrides(text, per_r, rationale, depth_per_r, errors)
+    # Like per-R Assurance overrides, an amendment may change the release
+    # threshold. Only directive sections count; prose and fenced examples in
+    # requirements/constraints must never silently weaken the gate.
+    threshold_bodies = ([body] if body is not None else []) + _amendment_bodies(text)
+    for directive_body in threshold_bodies:
+        for line in _unfenced_lines(directive_body):
+            threshold_m = _RELEASE_THRESHOLD_RE.match(line)
+            if not threshold_m:
+                continue
+            present = True
+            candidate = threshold_m.group(1).upper()
+            if candidate not in {"P0", "P1", "P2"}:
+                errors.append(
+                    "Assurance Release threshold must be one of "
+                    f"['P0', 'P1', 'P2'], got {threshold_m.group(1)!r}"
+                )
+                continue
+            release_threshold = candidate
     if per_r or depth_per_r:
         present = True
 
@@ -305,5 +375,6 @@ def parse_assurance(
 
     return AssuranceMap(
         present=present, default=default, per_r=per_r, rationale=rationale,
-        depth_per_r=depth_per_r, known_rs=markers,
+        depth_per_r=depth_per_r, release_threshold=release_threshold,
+        known_rs=markers,
     ), errors

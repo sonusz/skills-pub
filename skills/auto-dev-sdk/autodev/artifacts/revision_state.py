@@ -13,11 +13,20 @@ Shape::
       },
       "pending_feedback": {          # stage → paths list (panel verdicts or build.json)
         "design": ["panel-design-review.json"]
-      }
+      },
+      "manual_rerun_credits": {      # one-shot human-authorized L_MAX extensions
+        "design-review": <0|1>,
+        "close-approval": <0|1>
+      },
+      "manual_rerun_grants": [       # audit trail; consumed grants remain visible
+        {"gate": "design-review", "reason": "...", "who": "...",
+         "granted_at": "...", "consumed_at": null}
+      ]
     }
 
 Invariants:
   - 0 ≤ L[gate] ≤ L_MAX (==10) for each gate
+  - At most one unconsumed manual rerun credit exists per gate
   - File absent ≡ all zeros + empty feedback
   - Atomic writes only
 
@@ -34,12 +43,16 @@ Budget semantics:
     second consecutive PRD-targeted design-review halt does not bump L.
   - Other halt conditions (arch-doc target, mixed producers,
     indeterminate+multi-producer, pre-check failure) do NOT bump L.
-  - L resets only on ``autodev update --amendment``.
+  - At L_MAX, an explicit human ``grant-rerun`` may authorize one more
+    producer rerun without passing the gate or changing the PRD. The next
+    blocking verdict halts again unless another human grant is made.
+  - L and unconsumed credits reset on ``autodev update --amendment``.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from autodev.errors import SchemaError
@@ -142,6 +155,10 @@ class RevisionState:
     prd_target_streak: dict[str, int] = field(
         default_factory=lambda: {g: 0 for g in ALL_PANEL_GATES}
     )
+    manual_rerun_credits: dict[str, int] = field(
+        default_factory=lambda: {g: 0 for g in ALL_PANEL_GATES}
+    )
+    manual_rerun_grants: list[dict[str, str | None]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -150,6 +167,11 @@ class RevisionState:
                 g: self.prd_target_streak.get(g, 0) for g in ALL_PANEL_GATES
             },
             "pending_feedback": dict(self.pending_feedback),
+            "manual_rerun_credits": {
+                g: self.manual_rerun_credits.get(g, 0)
+                for g in ALL_PANEL_GATES
+            },
+            "manual_rerun_grants": [dict(record) for record in self.manual_rerun_grants],
         }
 
     def remaining_local(self, gate: str) -> int:
@@ -182,6 +204,42 @@ def _validate(raw: dict) -> None:
             raise SchemaError(
                 f"revision-state.pending_feedback[{stage}] must be list[str]"
             )
+    credits = raw.get("manual_rerun_credits", {})
+    if not isinstance(credits, dict):
+        raise SchemaError("revision-state.manual_rerun_credits must be object")
+    for gate, n in credits.items():
+        if gate not in ALL_PANEL_GATES or not isinstance(n, int) or n not in (0, 1):
+            raise SchemaError(
+                f"revision-state.manual_rerun_credits[{gate}] must be 0 or 1"
+            )
+    grants = raw.get("manual_rerun_grants", [])
+    if not isinstance(grants, list):
+        raise SchemaError("revision-state.manual_rerun_grants must be list")
+    for record in grants:
+        if not isinstance(record, dict):
+            raise SchemaError("revision-state manual rerun grant must be object")
+        if record.get("gate") not in ALL_PANEL_GATES:
+            raise SchemaError("revision-state manual rerun grant has invalid gate")
+        for key in ("reason", "who", "granted_at"):
+            if not isinstance(record.get(key), str) or not record[key].strip():
+                raise SchemaError(
+                    f"revision-state manual rerun grant requires non-empty {key}"
+                )
+        if record.get("consumed_at") is not None and not isinstance(
+            record.get("consumed_at"), str
+        ):
+            raise SchemaError(
+                "revision-state manual rerun grant consumed_at must be string or null"
+            )
+    for gate in ALL_PANEL_GATES:
+        pending = sum(
+            1 for record in grants
+            if record.get("gate") == gate and record.get("consumed_at") is None
+        )
+        if pending > 1 or pending != credits.get(gate, 0):
+            raise SchemaError(
+                f"revision-state manual rerun credit/audit mismatch for {gate}"
+            )
 
 
 def state_path(feature_active: Path) -> Path:
@@ -202,12 +260,20 @@ def load_state(feature_active: Path) -> RevisionState:
     for gate, n in raw.get("prd_target_streak", {}).items():
         if gate in ALL_PANEL_GATES:
             prd_target_streak[gate] = n
+    manual_rerun_credits = {g: 0 for g in ALL_PANEL_GATES}
+    for gate, n in raw.get("manual_rerun_credits", {}).items():
+        if gate in ALL_PANEL_GATES:
+            manual_rerun_credits[gate] = n
     return RevisionState(
         L=L,
         prd_target_streak=prd_target_streak,
         pending_feedback={
             k: list(v) for k, v in raw.get("pending_feedback", {}).items()
         },
+        manual_rerun_credits=manual_rerun_credits,
+        manual_rerun_grants=[
+            dict(record) for record in raw.get("manual_rerun_grants", [])
+        ],
     )
 
 
@@ -228,8 +294,51 @@ def reset_on_amendment(feature_active: Path) -> RevisionState:
     s.L = {g: 0 for g in ALL_PANEL_GATES}
     s.prd_target_streak = {g: 0 for g in ALL_PANEL_GATES}
     s.pending_feedback = {}
+    s.manual_rerun_credits = {g: 0 for g in ALL_PANEL_GATES}
+    s.manual_rerun_grants = []
     write_state(feature_active, s)
     return s
+
+
+def grant_manual_rerun(
+    feature_active: Path, gate: str, *, reason: str, who: str,
+) -> RevisionState:
+    """Grant one auditable rerun beyond L_MAX without passing the gate."""
+    if gate not in ALL_PANEL_GATES:
+        raise ValueError(f"unknown panel gate {gate!r}")
+    if not reason.strip() or not who.strip():
+        raise ValueError("manual rerun grant requires non-empty reason and who")
+    s = load_state(feature_active)
+    if s.L.get(gate, 0) < L_MAX:
+        raise ValueError(
+            f"L[{gate}]={s.L.get(gate, 0)} has not reached L_MAX={L_MAX}"
+        )
+    if s.manual_rerun_credits.get(gate, 0):
+        raise ValueError(f"manual rerun credit for {gate} is already pending")
+    s.manual_rerun_credits[gate] = 1
+    s.manual_rerun_grants.append({
+        "gate": gate,
+        "reason": reason.strip(),
+        "who": who.strip(),
+        "granted_at": datetime.now(timezone.utc).isoformat(),
+        "consumed_at": None,
+    })
+    write_state(feature_active, s)
+    return s
+
+
+def consume_manual_rerun_credit(s: RevisionState, gate: str) -> bool:
+    """Consume one in-memory credit; caller persists the surrounding state."""
+    if not s.manual_rerun_credits.get(gate, 0):
+        return False
+    for record in s.manual_rerun_grants:
+        if record.get("gate") == gate and record.get("consumed_at") is None:
+            record["consumed_at"] = datetime.now(timezone.utc).isoformat()
+            s.manual_rerun_credits[gate] = 0
+            return True
+    raise SchemaError(
+        f"manual rerun credit for {gate} has no matching unconsumed audit record"
+    )
 
 
 def reset_prd_target_streak(feature_active: Path, gate: str) -> RevisionState:

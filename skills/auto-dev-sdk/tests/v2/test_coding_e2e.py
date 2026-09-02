@@ -265,6 +265,37 @@ def test_coding_stage_out_of_scope_write_detected(git_repo, monkeypatch, tmp_pat
     assert failure["kind"] == "detected_out_of_scope_write"
 
 
+def test_design_stage_rejects_write_to_prd_inside_feature_root(
+    git_repo, monkeypatch,
+):
+    """The old feature-root allowlist silently allowed design to edit PRD."""
+    planned, prd = _prd(git_repo)
+    from autodev.state.hashing import hash_file
+
+    env = _fake_env(
+        target_artifact=planned / "design.md",
+        source_path=prd,
+        source_hash=hash_file(prd),
+        behavior="out_of_scope_write",
+    )
+    env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
+    env["AUTODEV_FAKE_TARGET_TRACE"] = str(planned / "trace.md")
+    env["AUTODEV_FAKE_TARGET_TEST_PLAN"] = str(planned / "test-plan.md")
+    env["AUTODEV_FAKE_ESCAPE_PATH"] = str(prd)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    orch = Orchestrator(OrchestratorConfig(
+        repo_root=git_repo, vendors=_vendors_for_test(git_repo), session_id="t",
+    ))
+    with pytest.raises(Exception):
+        orch.advance_one("toy")
+
+    failure = json.loads((planned / "design-failure.json").read_text())
+    assert failure["kind"] == "detected_out_of_scope_write"
+    assert "prd.md" in failure["detail"]
+
+
 def test_coding_stage_deficient_output_retries_then_succeeds(git_repo, monkeypatch):
     """A stage that exits 0 but omits a required artifact must NOT halt
     the run on the first slip. The harness re-dispatches the same agent
@@ -292,7 +323,7 @@ def test_coding_stage_deficient_output_retries_then_succeeds(git_repo, monkeypat
     assert result.success
     # Two attempts: the first omitted scope/trace/test-plan, the second
     # (amend pass) produced the complete set.
-    assert int((planned / ".fake.design.attempt").read_text()) == 2
+    assert int((planned / "scratch" / ".fake.design.attempt").read_text()) == 2
     assert (planned / "design.md").exists()
     assert (planned / "scope.json").exists()
     assert (planned / "trace.md").exists()

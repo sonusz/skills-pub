@@ -31,6 +31,147 @@ def test_cli_explain_uses_human_status_mode(git_repo, feature_active, capsys):
     assert "status:  active" in out
 
 
+def test_cli_grant_rerun_records_one_auditable_credit(
+    git_repo, feature_active, capsys,
+):
+    from autodev.artifacts.revision_state import (
+        L_MAX, RevisionState, load_state, write_state,
+    )
+    from autodev.artifacts.verdict import (
+        PanelFinding, PanelVerdict, write_verdict,
+    )
+
+    state = RevisionState()
+    state.L["design-review"] = L_MAX
+    write_state(feature_active, state)
+    write_verdict(
+        feature_active / "panel-design-review.json",
+        PanelVerdict(
+            gate="design-review", verdict="needs_revision",
+            findings=[PanelFinding(
+                severity="risk", vendor="codex", summary="fix design",
+                targets=["primary_pair.design.md"],
+            )],
+            source="design.md", source_hash="sha256:" + "0" * 64,
+            prompt_file="p", prompt_hash="sha256:" + "0" * 64,
+            harness_version="test", run_ts="2026-08-13T00:00:00Z",
+        ),
+    )
+
+    code = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "one narrow correction", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    saved = load_state(feature_active)
+    assert saved.manual_rerun_credits["design-review"] == 1
+    assert saved.manual_rerun_grants[-1]["reason"] == "one narrow correction"
+    assert saved.manual_rerun_grants[-1]["who"] == "operator"
+    assert saved.manual_rerun_grants[-1]["consumed_at"] is None
+    assert "gate still must pass" in capsys.readouterr().out
+
+    duplicate = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "do not stack", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert duplicate == exit_codes.ERROR
+    assert "already pending" in capsys.readouterr().err
+
+
+def test_cli_grant_rerun_accepts_trace_only_design_blocker(
+    git_repo, feature_active, capsys,
+):
+    from autodev.artifacts.revision_state import (
+        L_MAX, RevisionState, load_state, write_state,
+    )
+    from autodev.artifacts.verdict import (
+        PanelFinding, PanelVerdict, ReviewDecision, write_verdict,
+    )
+
+    state = RevisionState()
+    state.L["design-review"] = L_MAX
+    write_state(feature_active, state)
+    common = {
+        "source": "design-packet.json",
+        "source_hash": "sha256:" + "1" * 64,
+        "prompt_file": "p", "prompt_hash": "sha256:" + "0" * 64,
+        "harness_version": "test", "run_ts": "2026-08-13T00:00:00Z",
+    }
+    write_verdict(
+        feature_active / "panel-design-review.json",
+        PanelVerdict(
+            gate="design-review", verdict="pass", findings=[],
+            decision=ReviewDecision(
+                node="design_review", outcome="pass", blocking=False,
+                severity="opinion", summary="design passes",
+            ),
+            **common,
+        ),
+    )
+    write_verdict(
+        feature_active / "panel-trace-review.json",
+        PanelVerdict(
+            gate="trace-review", verdict="needs_revision",
+            findings=[PanelFinding(
+                severity="risk", vendor="codex", summary="trace blocks",
+                targets=["primary_pair.trace.md"],
+            )],
+            **common,
+        ),
+    )
+
+    code = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "trace correction", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    assert load_state(feature_active).manual_rerun_credits["design-review"] == 1
+
+
+def test_cli_grant_rerun_rejects_human_only_verdict(
+    git_repo, feature_active, capsys,
+):
+    from autodev.artifacts.revision_state import (
+        L_MAX, RevisionState, load_state, write_state,
+    )
+    from autodev.artifacts.verdict import (
+        PanelFinding, PanelVerdict, ReviewDecision, write_verdict,
+    )
+
+    state = RevisionState()
+    state.L["design-review"] = L_MAX
+    write_state(feature_active, state)
+    write_verdict(
+        feature_active / "panel-design-review.json",
+        PanelVerdict(
+            gate="design-review", verdict="needs_revision",
+            findings=[PanelFinding(
+                severity="risk", vendor="codex", summary="human decision",
+                targets=["primary_pair.prd.md"],
+            )],
+            source="design-packet.json", source_hash="sha256:" + "2" * 64,
+            prompt_file="p", prompt_hash="sha256:" + "0" * 64,
+            harness_version="test", run_ts="2026-08-13T00:00:00Z",
+            decision=ReviewDecision(
+                node="design_review", outcome="halt_for_human", blocking=True,
+                severity="risk", summary="requires human",
+            ),
+        ),
+    )
+
+    code = main([
+        "grant-rerun", "demo", "design-review",
+        "--reason", "must reject", "--who", "operator",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.ERROR
+    assert "not a producer-rerunnable" in capsys.readouterr().err
+    assert load_state(feature_active).manual_rerun_credits["design-review"] == 0
+
+
 def test_cli_prd_from_file(git_repo, capsys, tmp_path):
     src = tmp_path / "draft.md"
     # PRD must pass Stage 0 schema (six sections + ≥1 `### R<N>:` marker).
@@ -63,6 +204,62 @@ def test_cli_pause_and_resume(git_repo, feature_active):
     code = main(["resume", "demo", "--repo-root", str(git_repo)])
     assert code == exit_codes.OK
     assert not (feature_active / ".pause").exists()
+
+
+def test_cli_reset_session_requires_pause_and_delegates(
+    git_repo, feature_active, capsys, monkeypatch,
+):
+    import autodev.vendors.session_control as session_control
+
+    calls = []
+    monkeypatch.setattr(
+        session_control,
+        "reset_feature_session",
+        lambda active, role: calls.append((active, role)) or 2,
+    )
+    code = main([
+        "reset-session", "demo", "design", "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.ERROR
+    assert "must be paused" in capsys.readouterr().err
+    assert calls == []
+
+    (feature_active / ".pause").touch()
+    code = main([
+        "reset-session", "demo", "design", "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    assert calls == [(feature_active, "design")]
+    assert "reset 2 persistent session mapping" in capsys.readouterr().out
+
+
+def test_cli_restore_design_requires_pause_and_delegates(
+    git_repo, feature_active, capsys, monkeypatch,
+):
+    import autodev.artifacts.design_package_history as history
+
+    calls = []
+    snapshot = feature_active / "design-package-history" / "package-007"
+    monkeypatch.setattr(
+        history,
+        "restore_design_package",
+        lambda active, package: calls.append((active, package)) or (snapshot, ["design.md"]),
+    )
+    code = main([
+        "restore-design", "demo", "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.ERROR
+    assert "must be paused" in capsys.readouterr().err
+    assert calls == []
+
+    (feature_active / ".pause").touch()
+    code = main([
+        "restore-design", "demo", "--package", "package-007",
+        "--repo-root", str(git_repo),
+    ])
+    assert code == exit_codes.OK
+    assert calls == [(feature_active, "package-007")]
+    assert "restored package-007" in capsys.readouterr().out
 
 
 def test_cli_abort_writes_pause_sentinel(git_repo, feature_active, capsys):
@@ -204,6 +401,54 @@ def test_cli_invalidate_clears_same_cycle_skip_gate(git_repo, feature_active):
     assert code == exit_codes.OK
     loaded = ov.load(feature_active)
     assert not loaded.has_active_skip_gate("design-review")
+
+
+def test_cli_invalidate_design_clears_whole_active_package_but_keeps_history(
+    git_repo, feature_active,
+):
+    from autodev import overrides_api as ov
+
+    ov.record_skip_gate(feature_active, gate="design-review", reason="r", who="t")
+    active_outputs = (
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "design-changelog.json",
+        "design-packet.json",
+        "panel-design-review.json",
+        "panel-trace-review.json",
+        "accepted-design.json",
+        "panel-coverage-map.json",
+        "panel-design-review.docs.json",
+        "panel-design-review.reviewers.json",
+        "panel-trace-review.docs.json",
+        "panel-trace-review.reviewers.json",
+        "diagnosis.json",
+        "rework-mode.json",
+    )
+    for name in active_outputs:
+        (feature_active / name).write_text("old\n", encoding="utf-8")
+    for name in active_outputs[:5]:
+        (feature_active / f"{name}.tmp").write_text("partial\n", encoding="utf-8")
+    history = feature_active / "design-package-history" / "package-001"
+    history.mkdir(parents=True)
+    (history / "design.md").write_text("recoverable\n", encoding="utf-8")
+    (feature_active / "prd.md").write_text("binding\n", encoding="utf-8")
+
+    code = main([
+        "invalidate", "demo", "design", "--repo-root", str(git_repo),
+    ])
+
+    assert code == exit_codes.OK
+    assert not any((feature_active / name).exists() for name in active_outputs)
+    assert not any(
+        (feature_active / f"{name}.tmp").exists()
+        for name in active_outputs[:5]
+    )
+    assert (history / "design.md").read_text(encoding="utf-8") == "recoverable\n"
+    assert (feature_active / "prd.md").read_text(encoding="utf-8") == "binding\n"
+    assert not ov.load(feature_active).has_active_skip_gate("design-review")
 
 
 def test_cli_status_surfaces_overrides(git_repo, feature_active, capsys):

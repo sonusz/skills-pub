@@ -13,18 +13,26 @@ from pathlib import Path
 
 import pytest
 
-from autodev.artifacts.verdict import load_verdict
+from autodev.artifacts.verdict import (
+    IssueCluster, PanelFinding, PanelVerdict, load_verdict,
+    panel_verdict_transport_incomplete,
+)
+from autodev.artifacts.design_package_history import archive_design_package
+from autodev.artifacts.fingerprint_history import record_verdict
 from autodev.panel.runner import (
     FAKE_INVOKER_ENV, _compose_reviewer_prompt, _compose_synthesizer_prompt,
-    _invoke_reviewer, _invoke_synthesizer,
+    _build_issue_clusters, _invoke_reviewer, _invoke_reviewer_with_retry,
+    _invoke_synthesizer,
+    _synthesize_and_build_verdict,
     _read_only_native_args, run_panel_gate_internal,
 )
 from autodev.panel.schemas import synthesizer_output_schema
 from autodev.vendors.config import (
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
-from autodev.errors import GatePending
+from autodev.errors import GatePending, QuotaHalt, SchemaError
 from autodev.vendors.shared_call import cli_name_for_vendor, normalize_shared_vendor
+from autodev.vendors.quota.base import QuotaResult, now_utc
 
 FAKE_SCRIPT = Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"
 
@@ -36,6 +44,14 @@ def fake_invoker(monkeypatch):
     # v3-core R5: these tests stub synthetic single-artifact fixtures
     # and target the runner's dispatch path, not the pre-check.
     monkeypatch.setenv("AUTODEV_PANEL_SKIP_PRECHECK", "1")
+    # Reviewer-failure tests must not depend on the developer machine's live
+    # vendor quota. Individual quota tests replace this with a numeric result.
+    monkeypatch.setattr(
+        "autodev.panel.runner.get_quota_remaining",
+        lambda vendor, model=None, force=False: QuotaResult.unknown(
+            vendor, "test quota intentionally unknown",
+        ),
+    )
     yield
 
 
@@ -59,32 +75,87 @@ def _make_artifact(feature_active: Path) -> Path:
     return p
 
 
+def test_revision_reviewer_prompt_exposes_package_git_diff(feature_active):
+    for name, content in {
+        "design.md": "# Design\nold\n",
+        "scope.json": "{}\n",
+        "trace.md": "# Trace\n",
+        "test-plan.md": "# Tests\n",
+        "design-changelog.json": '{"kind":"design-changelog"}\n',
+    }.items():
+        (feature_active / name).write_text(content)
+    archive_design_package(feature_active)
+    (feature_active / "design.md").write_text("# Design\nnew\n")
+    archive_design_package(feature_active)
+    repo_root = feature_active.parents[3]
+
+    prompt = _compose_reviewer_prompt(
+        gate="design-review",
+        artifact_path=feature_active / "design.md",
+        consulted_docs=[],
+        feature_active=feature_active,
+        repo_root=repo_root,
+        continuation=True,
+    )
+
+    assert "CURRENT_DESIGN_REF: `refs/autodev/design/demo/package-002`" in prompt
+    assert "PREVIOUS_DESIGN_REF: `refs/autodev/design/demo/package-001`" in prompt
+    assert "DIFF_COMMAND:" in prompt
+    assert "design.md" in prompt
+    assert "scope.json" in prompt
+    assert "Read the revision diff first" in prompt
+
+
 def test_schema_is_per_reviewer_extraction():
     """Synthesizer JSON schema keeps per-reviewer extraction and may add a canonical decision."""
     schema = synthesizer_output_schema()
-    assert schema["required"] == ["per_reviewer"]
+    assert set(schema["required"]) == {
+        "per_reviewer", "issue_clusters", "decision",
+    }
     entry = schema["properties"]["per_reviewer"]["items"]
-    assert set(entry["required"]) == {"vendor", "verdict", "findings"}
+    assert set(entry["required"]) == {"vendor", "verdict", "findings", "coverage"}
     assert set(entry["properties"]["verdict"]["enum"]) == {
         "pass", "needs_revision", "fail"
     }
     finding_schema = entry["properties"]["findings"]["items"]
     # Findings live INSIDE a reviewer entry — they do NOT carry
     # originating_vendors; the reviewer's own vendor label owns them.
-    assert set(finding_schema["required"]) == {"severity", "summary"}
+    assert set(finding_schema["required"]) == set(finding_schema["properties"])
     assert "originating_vendors" not in finding_schema["properties"]
+    assert {"finding_id", "priority"} <= set(finding_schema["required"])
+    cluster_schema = schema["properties"]["issue_clusters"]["items"]
+    assert set(cluster_schema["required"]) == {
+        "prior_cluster_id", "finding_ids", "summary",
+    }
     coverage_schema = entry["properties"]["coverage"]["items"]
-    assert set(coverage_schema["required"]) == {"req_id", "status", "evidence"}
+    assert set(coverage_schema["required"]) == {"req_id", "status", "evidence", "notes"}
     assert set(coverage_schema["properties"]["status"]["enum"]) == {
         "satisfied", "partial", "missing", "deviated", "ambiguous",
     }
-    decision = schema["properties"]["decision"]
+    decision = schema["properties"]["decision"]["anyOf"][0]
     assert set(decision["required"]) == {
         "node", "outcome", "blocking", "severity", "summary",
     }
     assert set(decision["properties"]["outcome"]["enum"]) == {
         "pass", "retry_design", "halt_for_human",
     }
+
+
+def test_schema_meets_openai_strict_required_property_rule():
+    """Every object declares all properties required; optionality is nullable."""
+    schema = synthesizer_output_schema()
+
+    def visit(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                assert set(node.get("required", [])) == set(node.get("properties", {}))
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(schema)
 
 
 def test_compose_reviewer_prompt_references_artifact_file(feature_active):
@@ -198,6 +269,232 @@ def test_compose_synthesizer_prompt_does_not_truncate_or_inline_artifact(feature
     assert tail not in sp
 
 
+def test_harness_validates_clusters_and_keeps_raw_findings(feature_active):
+    findings = [
+        PanelFinding(
+            severity="risk", priority="P1", finding_id="claude:1",
+            vendor="claude", summary="cache race",
+        ),
+        PanelFinding(
+            severity="risk", priority="P0", finding_id="codex:1",
+            vendor="codex", summary="concurrent cache corruption",
+        ),
+    ]
+    clusters = _build_issue_clusters(
+        findings,
+        {"issue_clusters": [{
+            "prior_cluster_id": None,
+            "finding_ids": ["claude:1", "codex:1"],
+            "summary": "cache concurrency defect",
+        }]},
+        feature_active=feature_active, gate="design-review",
+    )
+    assert len(findings) == 2
+    assert len(clusters) == 1
+    assert clusters[0].priority == "P0"
+
+
+def test_harness_rejects_cluster_that_drops_a_raw_finding(feature_active):
+    findings = [
+        PanelFinding(
+            severity="risk", finding_id="claude:1", vendor="claude",
+            summary="one",
+        ),
+        PanelFinding(
+            severity="risk", finding_id="codex:1", vendor="codex",
+            summary="two",
+        ),
+    ]
+    with pytest.raises(SchemaError, match="assign every raw finding"):
+        _build_issue_clusters(
+            findings,
+            {"issue_clusters": [{
+                "prior_cluster_id": None,
+                "finding_ids": ["claude:1"], "summary": "one",
+            }]},
+            feature_active=feature_active, gate="design-review",
+        )
+
+
+def test_synth_prompt_includes_prior_cluster_catalog(feature_active):
+    artifact = _make_artifact(feature_active)
+    finding = PanelFinding(
+        severity="risk", priority="P1", finding_id="claude:1",
+        vendor="claude", summary="cache race",
+    )
+    record_verdict(
+        feature_active, "design-review",
+        PanelVerdict(
+            gate="design-review", verdict="needs_revision", findings=[finding],
+            source=str(artifact), source_hash="sha256:first",
+            prompt_file="p", prompt_hash="sha256:p", harness_version="t",
+            run_ts="t1", issue_clusters=[IssueCluster(
+                cluster_id="issue-cache", finding_ids=["claude:1"],
+                summary="cache concurrency defect", priority="P1",
+            )],
+        ),
+    )
+    from autodev.panel.runner import ReviewerResult
+    prompt = _compose_synthesizer_prompt(
+        gate="design-review", artifact_path=artifact,
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True, output="Verdict: pass",
+            elapsed_sec=0.1,
+        )],
+        feature_active=feature_active,
+    )
+    assert '"cluster_id": "issue-cache"' in prompt
+    assert "Reuse a `cluster_id`" in prompt
+
+
+def test_p0_policy_overrides_p1_halt_but_retains_finding(
+    feature_active, panel_config, monkeypatch,
+):
+    artifact = feature_active / "design.md"
+    artifact.write_text("design", encoding="utf-8")
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n## Assurance\n\nDefault: strict\nRelease threshold: P0\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "per_reviewer": [{
+            "vendor": "claude", "verdict": "fail", "coverage": [],
+            "findings": [{
+                "finding_id": "claude:1", "severity": "risk",
+                "priority": "P1", "summary": "deferrable concern",
+                "targets": ["primary_pair.design.md"], "category": "other",
+                "evidence_refs": [], "failure_class": "mainline",
+                "missized_direction": None,
+            }],
+        }],
+        "issue_clusters": [{
+            "prior_cluster_id": None, "finding_ids": ["claude:1"],
+            "summary": "deferrable concern",
+        }],
+        "decision": {
+            "node": "design_review", "outcome": "halt_for_human",
+            "blocking": True, "severity": "risk", "summary": "halt",
+        },
+    }
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, payload, ""),
+    )
+    from autodev.panel.runner import ReviewerResult
+    verdict, _path, error = _synthesize_and_build_verdict(
+        gate_label="design-review",
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True, output="review",
+            elapsed_sec=0.1,
+        )],
+        primary_artifact=artifact, prompt_file_for_audit=artifact,
+        consulted_docs=[], per_vendor_raw={"claude": "review"},
+        panel_config=panel_config, feature_active=feature_active,
+        vendor_cwd=feature_active, probe_config=None, log_emit=None,
+    )
+    assert error is None
+    assert verdict.verdict == "pass"
+    assert verdict.findings[0].priority == "P1"
+    assert verdict.decision.outcome == "pass"
+    assert verdict.decision_overridden_by_policy["outcome"] == "halt_for_human"
+    assert not verdict.effectively_blocks()
+
+
+def test_synthesizer_cannot_omit_a_responding_reviewer(
+    feature_active, panel_config, monkeypatch,
+):
+    artifact = _make_artifact(feature_active)
+    payload = {
+        "per_reviewer": [{
+            "vendor": "claude", "verdict": "pass", "findings": [],
+            "coverage": [],
+        }],
+        "issue_clusters": [],
+        "decision": {
+            "node": "design_review", "outcome": "pass", "blocking": False,
+            "severity": "opinion", "summary": "pass",
+        },
+    }
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, payload, ""),
+    )
+    from autodev.panel.runner import ReviewerResult
+    verdict, _path, error = _synthesize_and_build_verdict(
+        gate_label="design-review",
+        reviewer_results=[
+            ReviewerResult(
+                vendor="claude", model="m", ok=True, output="pass",
+                elapsed_sec=0.1,
+            ),
+            ReviewerResult(
+                vendor="codex", model="m", ok=True, output="P0 failure",
+                elapsed_sec=0.1,
+            ),
+        ],
+        primary_artifact=artifact, prompt_file_for_audit=artifact,
+        consulted_docs=[], per_vendor_raw={}, panel_config=panel_config,
+        feature_active=feature_active, vendor_cwd=feature_active,
+        probe_config=None, log_emit=None,
+    )
+    assert "exactly match responding reviewers" in error
+    assert verdict.verdict == "fail"
+    assert verdict.findings[0].priority == "P0"
+    assert verdict.effectively_blocks()
+
+
+def test_blocking_p0_finding_overrides_design_pass_decision(
+    feature_active, panel_config, monkeypatch,
+):
+    artifact = feature_active / "design.md"
+    artifact.write_text("design", encoding="utf-8")
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n## Assurance\n\nDefault: strict\nRelease threshold: P0\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "per_reviewer": [{
+            "vendor": "claude", "verdict": "pass", "coverage": [],
+            "findings": [{
+                "finding_id": "claude:1", "severity": "risk",
+                "priority": "P0", "summary": "core path cannot run",
+                "targets": ["primary_pair.design.md"], "category": "missing",
+                "evidence_refs": [], "failure_class": "mainline",
+                "missized_direction": None,
+            }],
+        }],
+        "issue_clusters": [{
+            "prior_cluster_id": None, "finding_ids": ["claude:1"],
+            "summary": "core path cannot run",
+        }],
+        "decision": {
+            "node": "design_review", "outcome": "pass", "blocking": False,
+            "severity": "opinion", "summary": "pass",
+        },
+    }
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, payload, ""),
+    )
+    from autodev.panel.runner import ReviewerResult
+    verdict, _path, error = _synthesize_and_build_verdict(
+        gate_label="design-review",
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True, output="review",
+            elapsed_sec=0.1,
+        )],
+        primary_artifact=artifact, prompt_file_for_audit=artifact,
+        consulted_docs=[], per_vendor_raw={}, panel_config=panel_config,
+        feature_active=feature_active, vendor_cwd=feature_active,
+        probe_config=None, log_emit=None,
+    )
+    assert error is None
+    assert verdict.verdict == "needs_revision"
+    assert verdict.decision.outcome == "retry_design"
+    assert verdict.effectively_blocks()
+    assert verdict.decision_overridden_by_policy["outcome"] == "pass"
+
+
 def test_reviewer_invocation_via_fake(fake_invoker, monkeypatch):
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
     spec = PanelReviewerSpec(vendor="claude", model="fake")
@@ -221,6 +518,38 @@ def test_reviewer_timeout(fake_invoker, monkeypatch):
     r = _invoke_reviewer(spec, "test prompt", probe_interval_sec=2)
     assert not r.ok
     assert "timeout" in r.failure_detail.lower()
+
+
+def test_quota_preflight_failure_is_rechecked_before_skip(monkeypatch):
+    forced: list[bool] = []
+
+    def quota_halt(*args, force_quota=False, **kwargs):
+        forced.append(force_quota)
+        raise QuotaHalt(
+            role="reviewer:agy",
+            diagnostics=[{
+                "vendor": "agy",
+                "model": "fake",
+                "min_quota_pct": 10.0,
+                "remaining_pct": 0.0,
+                "resets_at": None,
+                "error": None,
+            }],
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", quota_halt)
+    result = _invoke_reviewer_with_retry(
+        PanelReviewerSpec(
+            vendor="agy", model="fake", min_quota_pct=10.0,
+        ),
+        "prompt",
+        10,
+    )
+
+    assert forced == [False, True]
+    assert result.quota_skipped
+    assert result.attempt_count == 2
+    assert len(result.failure_history) == 2
 
 
 def test_synthesizer_pass(fake_invoker, monkeypatch):
@@ -293,9 +622,7 @@ def test_end_to_end_inv_violation_fails(fake_invoker, monkeypatch, feature_activ
 def test_incomplete_panel_one_missing_halts_and_caches_successes(
     fake_invoker, monkeypatch, feature_active, panel_config,
 ):
-    """Any missing reviewer is panel transport failure, not a content
-    verdict. Successful reviewers are cached so restart retries only the
-    missing reviewer."""
+    """Two responses do not excuse a non-quota reviewer failure."""
     monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
     artifact = _make_artifact(feature_active)
     # The design-review gate runs the design-review and trace-review groups
@@ -318,6 +645,100 @@ def test_incomplete_panel_one_missing_halts_and_caches_successes(
     )
     assert set(cache["reviewers"]) == {"claude", "codex"}
     assert "agy" in cache["failures"]
+    assert cache["failures"]["agy"]["attempt_count"] == 2
+    assert len(cache["failures"]["agy"]["failure_history"]) == 2
+    assert cache["quota_skipped"] == {}
+
+
+def test_panel_quorum_skips_only_retried_quota_exhausted_reviewer(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
+    quota_calls: list[tuple[str, str | None, bool]] = []
+
+    def exhausted(vendor, model=None, *, force=False):
+        quota_calls.append((vendor, model, force))
+        return QuotaResult(
+            vendor=vendor,
+            remaining_pct=0.0,
+            resets_at=None,
+            fetched_at=now_utc(),
+            detail="test quota exhausted",
+        )
+
+    monkeypatch.setattr("autodev.panel.runner.get_quota_remaining", exhausted)
+    artifact = _make_artifact(feature_active)
+    verdict = run_panel_gate_internal(
+        gate="design-review",
+        feature_active=feature_active,
+        primary_artifact=artifact,
+        prompt_file_for_audit=artifact,
+        consulted_docs=[],
+        panel_config=panel_config,
+    )
+
+    assert quota_calls == [
+        ("agy", "fake-agy", True),
+        ("agy", "fake-agy", True),
+    ]
+    assert verdict.per_vendor_raw["agy"].startswith(
+        "[SKIPPED: quota confirmed after 2 dispatch attempt(s)"
+    )
+    assert not panel_verdict_transport_incomplete(verdict)
+    cache = json.loads(
+        (feature_active / "panel-design-review.reviewers.json").read_text()
+    )
+    assert cache["quota_skipped"]["agy"]["attempt_count"] == 2
+    assert len(cache["quota_skipped"]["agy"]["failure_history"]) == 2
+    confirmation = cache["quota_skipped"]["agy"]["quota_confirmation"]
+    assert confirmation["confirmed"]
+    assert confirmation["min_quota_pct"] > 0.0
+
+
+def test_quota_shortfall_halts_then_retries_skipped_vendor_after_recovery(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_one_empty")
+    monkeypatch.setattr(
+        "autodev.panel.runner.get_quota_remaining",
+        lambda vendor, model=None, force=False: QuotaResult(
+            vendor=vendor,
+            remaining_pct=0.0,
+            resets_at=None,
+            fetched_at=now_utc(),
+        ),
+    )
+    strict_quorum = PanelConfig(
+        reviewers=panel_config.reviewers,
+        synthesizer=panel_config.synthesizer,
+        reviewer_probe_interval_sec=panel_config.reviewer_probe_interval_sec,
+        synthesizer_probe_interval_sec=panel_config.synthesizer_probe_interval_sec,
+        min_responding_reviewers=3,
+    )
+    artifact = _make_artifact(feature_active)
+    with pytest.raises(QuotaHalt, match="panel-reviewers"):
+        run_panel_gate_internal(
+            gate="close-approval",
+            feature_active=feature_active,
+            primary_artifact=artifact,
+            prompt_file_for_audit=artifact,
+            consulted_docs=[],
+            panel_config=strict_quorum,
+        )
+
+    # A later run represents quota-resume recovery. Cached successful reviews
+    # remain reusable, but the formerly quota-skipped reviewer must run again.
+    monkeypatch.setenv("AUTODEV_PANEL_FAKE_BEHAVIOR", "reviewers_all_pass")
+    verdict = run_panel_gate_internal(
+        gate="close-approval",
+        feature_active=feature_active,
+        primary_artifact=artifact,
+        prompt_file_for_audit=artifact,
+        consulted_docs=[],
+        panel_config=strict_quorum,
+    )
+    assert verdict.verdict == "pass"
+    assert not verdict.per_vendor_raw["agy"].startswith("[SKIPPED:")
 
 
 def test_incomplete_panel_restart_retries_missing_reviewer_only(
@@ -377,9 +798,12 @@ def test_incomplete_panel_restart_retries_missing_reviewer_only(
         "  exit 0\n"
         "fi\n"
         "cat <<'EOF'\n"
-        '{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},'
-        '{"vendor":"agy","verdict":"pass","findings":[]},'
-        '{"vendor":"codex","verdict":"pass","findings":[]}]}\n'
+            '{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},'
+            '{"vendor":"agy","verdict":"pass","findings":[]},'
+            '{"vendor":"codex","verdict":"pass","findings":[]}],'
+            '"issue_clusters":[],"decision":{"node":"design_review",'
+            '"outcome":"pass","blocking":false,"severity":"opinion",'
+            '"summary":"pass"}}\n'
         "EOF\n"
         "exit 0\n"
     )
@@ -479,7 +903,7 @@ def test_parallel_dispatch_uses_threadpool(fake_invoker, monkeypatch, feature_ac
         "  echo \"Verdict: pass\"\n"
         "  exit 0\n"
         "fi\n"
-        '  echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},{"vendor":"agy","verdict":"pass","findings":[]},{"vendor":"codex","verdict":"pass","findings":[]}]}\'\n'
+        '  echo \'{"per_reviewer":[{"vendor":"claude","verdict":"pass","findings":[]},{"vendor":"agy","verdict":"pass","findings":[]},{"vendor":"codex","verdict":"pass","findings":[]}],"issue_clusters":[],"decision":{"node":"design_review","outcome":"pass","blocking":false,"severity":"opinion","summary":"pass"}}\'\n'
         "exit 0\n"
     )
     wrapper.chmod(0o755)

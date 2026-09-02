@@ -76,9 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         ("quota-resume", "Conditionally resume a quota-paused feature (only if still "
                          "paused, time reached, quota recovered, repo unchanged)"),
         ("abort", "Kill running subprocess; write interrupted failure.json"),
+        ("reset-session", "Forget one paused feature agent's persistent session"),
+        ("restore-design", "Restore a hash-verified archived design package"),
         ("retry", "Retry failed current stage"),
         ("invalidate", "Invalidate a stage artifact (rollback)"),
         ("update", "Append PRD amendment; advance cycle"),
+        ("grant-rerun", "Authorize one extra producer rerun after L_MAX"),
         ("close", "Close feature"),
         ("explain", "Human-readable state summary"),
         ("prd-lint", "Stage 0: validate prd.md against PRD schema"),
@@ -97,8 +100,22 @@ def build_parser() -> argparse.ArgumentParser:
     inv = sub._name_parser_map["invalidate"]
     inv.add_argument("stage", help="stage artifact name to invalidate")
 
+    from autodev.vendors.session_control import PERSISTENT_AGENT_ROLES
+    reset_session = sub._name_parser_map["reset-session"]
+    reset_session.add_argument("role", choices=PERSISTENT_AGENT_ROLES)
+
+    restore_design = sub._name_parser_map["restore-design"]
+    restore_design.add_argument("--package", default="latest")
+
     upd = sub._name_parser_map["update"]
     upd.add_argument("--amendment", required=True)
+
+    grant_rerun = sub._name_parser_map["grant-rerun"]
+    grant_rerun.add_argument(
+        "gate", choices=("design-review", "close-approval"),
+    )
+    grant_rerun.add_argument("--reason", required=True)
+    grant_rerun.add_argument("--who", default=None)
 
     cl = sub._name_parser_map["close"]
     cl.add_argument("reason", choices=("complete", "retiring", "deferred", "cancelled"))
@@ -280,6 +297,10 @@ def cmd_status(args) -> int:
                 g: s.prd_target_streak.get(g, 0) for g in ALL_PANEL_GATES
             },
             "pending_feedback": dict(s.pending_feedback),
+            "manual_rerun_credits": {
+                g: s.manual_rerun_credits.get(g, 0)
+                for g in ALL_PANEL_GATES
+            },
         }
     if json_mode:
         print(json.dumps(report, indent=2, default=str))
@@ -291,7 +312,7 @@ def cmd_status(args) -> int:
         if report.get("build_blocking", {}).get("blocked"):
             bb = report["build_blocking"]
             ids = ", ".join(bb["scope_ids"]) if bb["scope_ids"] else "(none listed)"
-            print(f"build blocking: {ids} (PRD amendment required)")
+            print(f"build blocking: {ids} (inspect build.json deviations)")
         if report.get("next_stage"):
             print(f"next:    {report['next_stage']}")
         if report.get("stale_artifacts"):
@@ -317,6 +338,15 @@ def cmd_status(args) -> int:
                     + ", ".join(
                         f"{g}={rs['L'][g]}/{rs['L'][g] + rs['L_remaining'][g]}"
                         for g in rs["L"]
+                    )
+                )
+            if any(rs["manual_rerun_credits"].values()):
+                print(
+                    "manual rerun credits: "
+                    + ", ".join(
+                        f"{g}={n}"
+                        for g, n in rs["manual_rerun_credits"].items()
+                        if n
                     )
                 )
                 if any(rs["prd_target_streak"].values()):
@@ -430,15 +460,31 @@ def _dispatch_orch(args, call: str) -> int:
 
 
 def cmd_run(args) -> int:
-    if getattr(args, "watch", False):
-        os.environ["AUTODEV_WATCH"] = "1"
-    return _dispatch_orch(args, "run")
+    return _dispatch_with_watch(args, "run")
 
 
 def cmd_next(args) -> int:
-    if getattr(args, "watch", False):
-        os.environ["AUTODEV_WATCH"] = "1"
-    return _dispatch_orch(args, "next")
+    return _dispatch_with_watch(args, "next")
+
+
+def _dispatch_with_watch(args, verb: str) -> int:
+    """Run one orchestrator command with the built-in watch protocol."""
+
+    if not getattr(args, "watch", False):
+        return _dispatch_orch(args, verb)
+
+    os.environ["AUTODEV_WATCH"] = "1"
+    from autodev.watch import WatchSession
+
+    watch = WatchSession(feature=args.feature, verb=verb)
+    watch.start()
+    try:
+        exit_code = _dispatch_orch(args, verb)
+    except BaseException:
+        watch.finish(exit_codes.ERROR)
+        raise
+    watch.finish(exit_code)
+    return exit_code
 
 
 def cmd_pause(args) -> int:
@@ -722,6 +768,56 @@ def cmd_retry(args) -> int:
     return _dispatch_orch(args, "next")
 
 
+def cmd_reset_session(args) -> int:
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+    if not (active / ".pause").exists():
+        print(
+            "feature must be paused before resetting a persistent session; "
+            f"run `autodev pause {args.feature}` first",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    from autodev.vendors.session_control import reset_feature_session
+    try:
+        reset_count = reset_feature_session(active, args.role)
+    except (RuntimeError, ValueError) as exc:
+        print(f"session reset failed: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    print(
+        f"reset {reset_count} persistent session mapping(s) for "
+        f"{args.feature}/{args.role}"
+    )
+    return exit_codes.OK
+
+
+def cmd_restore_design(args) -> int:
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+    if not (active / ".pause").exists():
+        print(
+            "feature must be paused before restoring a design package; "
+            f"run `autodev pause {args.feature}` first",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    from autodev.artifacts.design_package_history import restore_design_package
+    try:
+        snapshot, restored = restore_design_package(active, args.package)
+    except (AutodevError, ValueError) as exc:
+        print(f"design restore failed: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    changed = ", ".join(restored) if restored else "no files (already current)"
+    print(f"restored {snapshot.name} for {args.feature}: {changed}")
+    return exit_codes.OK
+
+
 def cmd_invalidate(args) -> int:
     fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
     active = fp.active()
@@ -733,9 +829,41 @@ def cmd_invalidate(args) -> int:
         print(f"unknown stage: {stage!r}; valid: {list(by_name)}", file=sys.stderr)
         return exit_codes.ERROR
     target = active / by_name[stage].path_fragment
-    if target.exists():
-        target.unlink()
-        print(f"invalidated {target}")
+    targets = [target]
+    if stage == "design":
+        # Design is one unified producer with four canonical artifacts plus a
+        # changelog. Invalidating only design.md leaves a hidden replay path:
+        # scope/trace/changelog and stale panel sidecars can be fed into what
+        # status reports as a fresh design run. Preserve package history, but
+        # clear every active output owned by this phase.
+        targets = [
+            active / name for name in (
+                "design.md",
+                "scope.json",
+                "trace.md",
+                "test-plan.md",
+                "design-changelog.json",
+                "design-packet.json",
+                "panel-design-review.json",
+                "panel-trace-review.json",
+                "accepted-design.json",
+                "panel-coverage-map.json",
+                "panel-design-review.docs.json",
+                "panel-design-review.reviewers.json",
+                "panel-trace-review.docs.json",
+                "panel-trace-review.reviewers.json",
+                "diagnosis.json",
+                "rework-mode.json",
+            )
+        ]
+        targets.extend(
+            p.with_name(p.name + ".tmp")
+            for p in targets[:5]
+        )
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            print(f"invalidated {path}")
     # If stage is a gate artifact, also clear same-cycle skip-gate (R4d).
     gate_map = {
         "panel_design_review": "design-review",
@@ -744,6 +872,9 @@ def cmd_invalidate(args) -> int:
     if stage in gate_map:
         ov.invalidate_clears_skip_gate(active, gate_map[stage])
         print(f"cleared same-cycle skip-gate for {gate_map[stage]} (if present)")
+    elif stage == "design":
+        ov.invalidate_clears_skip_gate(active, "design-review")
+        print("cleared same-cycle skip-gate for design-review (if present)")
     return exit_codes.OK
 
 
@@ -866,18 +997,6 @@ def cmd_skip_gate(args) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return exit_codes.ERROR
-    # Mechanism 2 (rigor-tier): skipping a gate while a rigor-pivotal
-    # diagnosis is pending IS the "keep the tolerance" answer — record
-    # the declined (fingerprint, R) pairs so the same re-audit question
-    # is never asked again for this stall.
-    from autodev.diagnosis import record_skip_as_declined
-    declined = record_skip_as_declined(active, args.gate)
-    if declined:
-        print(
-            f"recorded {declined} declined re-audit pair(s) — the pending "
-            f"rigor re-audit for {args.gate} is answered as 'keep the "
-            f"tolerance' and will not be re-asked"
-        )
     # G16: warn if ceiling is approaching.
     from autodev.artifacts.overrides import (
         CEILING_REFUSE_AT, CEILING_WARNING_AT,
@@ -900,6 +1019,84 @@ def cmd_skip_gate(args) -> int:
             f"will block `autodev close`.",
             file=sys.stderr,
         )
+    return exit_codes.OK
+
+
+def cmd_grant_rerun(args) -> int:
+    """Authorize one more producer correction without passing the gate."""
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+    if read_owner(active) is not None:
+        print(
+            f"cannot grant rerun while {args.feature} has an active or stale lock",
+            file=sys.stderr,
+        )
+        return exit_codes.LOCK_CONFLICT
+    if ov.load(active).has_active_skip_gate(args.gate):
+        print(
+            f"cannot grant rerun while skip-gate is active for {args.gate}",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+
+    from autodev.artifacts.revision_state import grant_manual_rerun
+    from autodev.artifacts.verdict import load_verdict
+
+    verdict_path = active / f"panel-{args.gate}.json"
+    if not verdict_path.is_file():
+        print(
+            f"cannot grant rerun: {verdict_path.name} is absent",
+            file=sys.stderr,
+        )
+        return exit_codes.GATE_PENDING
+    try:
+        verdict = load_verdict(verdict_path)
+    except (AutodevError, OSError, ValueError) as exc:
+        print(f"cannot grant rerun: invalid gate verdict: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    if args.gate == "design-review":
+        merged, _ = Orchestrator.merge_trace_into_design(active, verdict)
+        if merged is not None:
+            verdict = merged
+    if not verdict.effectively_blocks():
+        print(
+            f"cannot grant rerun: {args.gate} is not currently blocking",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    from autodev.revision_loop import producer_eligible_for_manual_rerun
+    producer = producer_eligible_for_manual_rerun(active, args.gate, verdict)
+    if producer is None:
+        print(
+            "cannot grant rerun: current blocking verdict is not a "
+            "producer-rerunnable L_MAX halt",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    who = ov.resolve_who(args.who)
+    try:
+        grant_manual_rerun(
+            active, args.gate, reason=args.reason, who=who,
+        )
+    except (AutodevError, ValueError) as exc:
+        print(f"cannot grant rerun: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+    JsonlLog(active / "log.jsonl").emit(
+        stage="gate",
+        event="manual-rerun-granted",
+        feature=args.feature,
+        detail={
+            "gate": args.gate, "producer": producer,
+            "reason": args.reason.strip(), "who": who,
+        },
+    )
+    print(
+        f"granted one rerun beyond L_MAX for {args.gate} on {args.feature}; "
+        "the gate still must pass"
+    )
     return exit_codes.OK
 
 
@@ -979,9 +1176,12 @@ _DISPATCH = {
     "resume": cmd_resume,
     "quota-resume": cmd_quota_resume,
     "abort": cmd_abort,
+    "reset-session": cmd_reset_session,
+    "restore-design": cmd_restore_design,
     "retry": cmd_retry,
     "invalidate": cmd_invalidate,
     "update": cmd_update,
+    "grant-rerun": cmd_grant_rerun,
     "close": cmd_close,
     "explain": cmd_explain,
     "skip-gate": cmd_skip_gate,

@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from autodev.errors import SchemaError
-from autodev.state.atomic import atomic_write_json
+from autodev.state.atomic import atomic_write, atomic_write_json
 from autodev.state.hashing import hash_bytes, hash_file
 
 HISTORY_DIRNAME = "design-package-history"
@@ -21,6 +24,7 @@ DESIGN_PACKAGE_FILENAMES = (
 DESIGN_PACKAGE_SIDECARS = (
     "design-changelog.json",
 )
+DESIGN_REF_ROOT = "refs/autodev/design"
 
 
 def _utc_now() -> str:
@@ -71,6 +75,211 @@ def _load_manifest(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _git(
+    repo_root: Path,
+    *args: str,
+    index_file: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    if index_file is not None:
+        env["GIT_INDEX_FILE"] = index_file
+    # These commits are local harness metadata, not user-authored history.
+    env.setdefault("GIT_AUTHOR_NAME", "auto-dev")
+    env.setdefault("GIT_AUTHOR_EMAIL", "auto-dev@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", "auto-dev")
+    env.setdefault("GIT_COMMITTER_EMAIL", "auto-dev@localhost")
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
+def _git_stdout(
+    repo_root: Path,
+    *args: str,
+    index_file: str | None = None,
+) -> str:
+    result = _git(repo_root, *args, index_file=index_file)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise SchemaError(
+            f"design package git snapshot failed: git {' '.join(args)}: {detail}"
+        )
+    return result.stdout.strip()
+
+
+def _repo_root(feature_active: Path) -> Path:
+    raw = _git_stdout(feature_active, "rev-parse", "--show-toplevel")
+    root = Path(raw).resolve()
+    try:
+        feature_active.resolve().relative_to(root)
+    except ValueError as exc:
+        raise SchemaError(
+            f"feature workspace {feature_active} is outside git root {root}"
+        ) from exc
+    return root
+
+
+def _package_ref(feature_active: Path, snapshot: Path) -> str:
+    feature = feature_active.parent.name
+    ref = f"{DESIGN_REF_ROOT}/{feature}/{snapshot.name}"
+    result = _git(feature_active, "check-ref-format", ref)
+    if result.returncode != 0:
+        raise SchemaError(f"invalid design package git ref: {ref!r}")
+    return ref
+
+
+def _snapshot_artifact_names(snapshot: Path) -> list[str]:
+    names = [name for name in DESIGN_PACKAGE_FILENAMES if (snapshot / name).is_file()]
+    names.extend(
+        name for name in DESIGN_PACKAGE_SIDECARS if (snapshot / name).is_file()
+    )
+    missing = sorted(set(DESIGN_PACKAGE_FILENAMES).difference(names))
+    if missing:
+        raise SchemaError(
+            f"design package {snapshot.name} missing snapshot files: {missing}"
+        )
+    return names
+
+
+def _snapshot_tree(
+    *, repo_root: Path, feature_active: Path, snapshot: Path,
+) -> str:
+    """Write a package-only tree under the canonical active-workspace paths.
+
+    A throwaway index prevents changes to the user's branch, real index,
+    worktree, or stash. Unlike the panel integrity restore point, this snapshot
+    intentionally does not run ``git add -A``: only the five design package
+    artifacts become Git objects.
+    """
+    active_rel = feature_active.resolve().relative_to(repo_root).as_posix()
+    fd, index_path = tempfile.mkstemp(prefix="autodev-design-idx-")
+    os.close(fd)
+    try:
+        os.unlink(index_path)  # git creates a fresh index
+        for name in _snapshot_artifact_names(snapshot):
+            source = snapshot / name
+            blob = _git_stdout(repo_root, "hash-object", "-w", "--", str(source))
+            canonical_path = f"{active_rel}/{name}"
+            _git_stdout(
+                repo_root,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                blob,
+                canonical_path,
+                index_file=index_path,
+            )
+        return _git_stdout(repo_root, "write-tree", index_file=index_path)
+    finally:
+        try:
+            os.unlink(index_path)
+        except OSError:
+            pass
+
+
+def _commit_for_tree(
+    *,
+    repo_root: Path,
+    ref: str,
+    tree: str,
+    parent_commit: str | None,
+    message: str,
+) -> str:
+    existing = _git(
+        repo_root, "rev-parse", "--verify", f"{ref}^{{commit}}",
+    )
+    if existing.returncode == 0 and existing.stdout.strip():
+        commit = existing.stdout.strip()
+        existing_tree = _git_stdout(repo_root, "rev-parse", f"{commit}^{{tree}}")
+        parents = _git_stdout(repo_root, "show", "-s", "--format=%P", commit).split()
+        expected_parents = [parent_commit] if parent_commit else []
+        if existing_tree == tree and parents == expected_parents:
+            return commit
+
+    args = ["commit-tree", tree]
+    if parent_commit:
+        args.extend(["-p", parent_commit])
+    args.extend(["-m", message])
+    commit = _git_stdout(repo_root, *args)
+    _git_stdout(repo_root, "update-ref", ref, commit)
+    return commit
+
+
+def ensure_design_package_refs(feature_active: Path) -> list[dict[str, str | None]]:
+    """Create/backfill a local Git-ref chain for every archived package."""
+    feature_active = Path(feature_active)
+    snapshots = _existing_snapshots(_history_dir(feature_active))
+    if not snapshots:
+        return []
+    repo_root = _repo_root(feature_active)
+    records: list[dict[str, str | None]] = []
+    parent_ref: str | None = None
+    parent_commit: str | None = None
+    for snapshot in snapshots:
+        tree = _snapshot_tree(
+            repo_root=repo_root,
+            feature_active=feature_active,
+            snapshot=snapshot,
+        )
+        ref = _package_ref(feature_active, snapshot)
+        commit = _commit_for_tree(
+            repo_root=repo_root,
+            ref=ref,
+            tree=tree,
+            parent_commit=parent_commit,
+            message=(
+                f"autodev design package {feature_active.parent.name} "
+                f"{snapshot.name}"
+            ),
+        )
+        manifest_path = snapshot / "manifest.json"
+        manifest = _load_manifest(manifest_path)
+        if manifest is None:
+            raise SchemaError(f"invalid design package manifest: {manifest_path}")
+        git_snapshot = {
+            "ref": ref,
+            "commit": commit,
+            "tree": tree,
+            "parent_ref": parent_ref,
+            "parent_commit": parent_commit,
+        }
+        if manifest.get("git_snapshot") != git_snapshot:
+            manifest["git_snapshot"] = git_snapshot
+            atomic_write_json(manifest_path, manifest)
+        records.append(git_snapshot)
+        parent_ref = ref
+        parent_commit = commit
+    return records
+
+
+def latest_design_revision_refs(feature_active: Path) -> dict[str, str | None] | None:
+    """Return the latest package ref and its predecessor for panel navigation."""
+    snapshots = _existing_snapshots(_history_dir(Path(feature_active)))
+    if not snapshots:
+        return None
+    latest = _load_manifest(snapshots[-1] / "manifest.json") or {}
+    current = latest.get("git_snapshot")
+    if not isinstance(current, dict) or not current.get("ref"):
+        return None
+    previous_ref = current.get("parent_ref")
+    return {
+        "current_package": snapshots[-1].name,
+        "current_ref": str(current["ref"]),
+        "current_commit": str(current.get("commit") or ""),
+        "previous_ref": str(previous_ref) if previous_ref else None,
+        "previous_commit": (
+            str(current.get("parent_commit"))
+            if current.get("parent_commit")
+            else None
+        ),
+    }
+
+
 def _current_artifacts(feature_active: Path) -> list[dict[str, str]]:
     artifacts: list[dict[str, str]] = []
     for name in DESIGN_PACKAGE_FILENAMES:
@@ -105,6 +314,7 @@ def archive_design_package(feature_active: Path) -> Path:
     for snapshot in snapshots:
         manifest = _load_manifest(snapshot / "manifest.json")
         if manifest is not None and manifest.get("package_hash") == package_hash:
+            ensure_design_package_refs(feature_active)
             return snapshot
 
     next_no = max((_snapshot_number(p) or 0 for p in snapshots), default=0) + 1
@@ -132,4 +342,77 @@ def archive_design_package(feature_active: Path) -> Path:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
+    ensure_design_package_refs(feature_active)
     return snapshot_dir
+
+
+def restore_design_package(
+    feature_active: Path,
+    package: str = "latest",
+) -> tuple[Path, list[str]]:
+    """Restore one hash-verified archived package into the active workspace."""
+
+    feature_active = Path(feature_active)
+    snapshots = _existing_snapshots(_history_dir(feature_active))
+    if not snapshots:
+        raise SchemaError("no archived design packages are available")
+    if package == "latest":
+        snapshot = snapshots[-1]
+    else:
+        if _snapshot_number(Path(package)) is None or Path(package).name != package:
+            raise SchemaError(f"invalid design package name: {package!r}")
+        snapshot = _history_dir(feature_active) / package
+        if snapshot not in snapshots:
+            raise SchemaError(f"design package not found: {package!r}")
+
+    manifest = _load_manifest(snapshot / "manifest.json")
+    if manifest is None or manifest.get("kind") != "design-package-snapshot":
+        raise SchemaError(f"invalid design package manifest: {snapshot / 'manifest.json'}")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise SchemaError(f"design package {snapshot.name} has no artifact inventory")
+
+    allowed = set(DESIGN_PACKAGE_FILENAMES + DESIGN_PACKAGE_SIDECARS)
+    verified: list[tuple[str, Path, str]] = []
+    inventory: list[dict[str, str]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SchemaError(f"design package {snapshot.name} has malformed artifact entry")
+        name = artifact.get("path")
+        expected_hash = artifact.get("hash")
+        if not isinstance(name, str) or name not in allowed:
+            raise SchemaError(
+                f"design package {snapshot.name} contains unexpected artifact: {name!r}"
+            )
+        if not isinstance(expected_hash, str):
+            raise SchemaError(
+                f"design package {snapshot.name} artifact {name} has no hash"
+            )
+        source = snapshot / name
+        if not source.is_file() or hash_file(source) != expected_hash:
+            raise SchemaError(
+                f"design package {snapshot.name} artifact failed integrity check: {name}"
+            )
+        verified.append((name, source, expected_hash))
+        inventory.append({"path": name, "hash": expected_hash})
+
+    missing = sorted(set(DESIGN_PACKAGE_FILENAMES).difference(name for name, _, _ in verified))
+    if missing:
+        raise SchemaError(f"design package {snapshot.name} missing artifacts: {missing}")
+    if manifest.get("package_hash") != _package_hash(inventory):
+        raise SchemaError(f"design package {snapshot.name} package hash is invalid")
+
+    restored: list[str] = []
+    for name, source, expected_hash in verified:
+        target = feature_active / name
+        if target.is_file() and hash_file(target) == expected_hash:
+            continue
+        atomic_write(target, source.read_bytes())
+        restored.append(name)
+
+    # A handled abort can leave stage-owned preseed files behind. Once the
+    # canonical package is restored, those known temporaries are stale and
+    # must not influence the next stage.
+    for name in allowed:
+        (feature_active / f"{name}.tmp").unlink(missing_ok=True)
+    return snapshot, restored

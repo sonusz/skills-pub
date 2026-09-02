@@ -1,13 +1,9 @@
 """Synthesizer JSON schema (G15).
 
-The synthesizer is a PURE text-to-JSON extractor. It reads N reviewer
-markdown outputs and emits per-reviewer structured entries. It does NOT
-merge findings across reviewers, does NOT assign severity, and does NOT
-derive the overall verdict — those are either reviewer judgments
-(preserved verbatim) or harness-side deterministic computations.
-
-Schema: one entry per responding reviewer with that reviewer's verdict
-and findings as-they-stated-them.
+The synthesizer preserves every reviewer finding as its own structured
+record, then adds a semantic grouping layer. The harness validates cluster
+membership and derives release behavior mechanically; the synthesizer never
+drops or rewrites raw findings to create the grouping.
 """
 from __future__ import annotations
 
@@ -17,15 +13,18 @@ import json
 def synthesizer_output_schema() -> dict:
     """JSON Schema the synthesizer must conform to.
 
-    Pure per-reviewer extraction. Each responding reviewer gets one
-    entry listing their own verdict + their own findings. No cross-
-    reviewer merging — semantic overlap is preserved as-is; the stage
-    agent re-running against an amended PRD is what resolves divergence.
+    Each responding reviewer gets one entry listing their own verdict +
+    findings. ``issue_clusters`` references those findings by ID so semantic
+    duplicates count as one ticket without destroying the raw audit trail.
     """
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["per_reviewer"],
+        # OpenAI strict structured outputs require every declared object
+        # property to appear in ``required``.  Fields that are semantically
+        # optional therefore use explicit neutral values ([], "", or null)
+        # instead of being omitted.
+        "required": ["per_reviewer", "issue_clusters", "decision"],
         "properties": {
             "per_reviewer": {
                 "type": "array",
@@ -33,7 +32,7 @@ def synthesizer_output_schema() -> dict:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["vendor", "verdict", "findings"],
+                    "required": ["vendor", "verdict", "findings", "coverage"],
                     "properties": {
                         "vendor": {
                             "type": "string",
@@ -49,7 +48,17 @@ def synthesizer_output_schema() -> dict:
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
-                                "required": ["severity", "summary"],
+                                "required": [
+                                    "severity",
+                                    "priority",
+                                    "finding_id",
+                                    "summary",
+                                    "targets",
+                                    "category",
+                                    "evidence_refs",
+                                    "failure_class",
+                                    "missized_direction",
+                                ],
                                 "properties": {
                                     "severity": {
                                         "type": "string",
@@ -58,6 +67,15 @@ def synthesizer_output_schema() -> dict:
                                             "risk",
                                             "opinion",
                                         ],
+                                    },
+                                    "priority": {
+                                        "type": "string",
+                                        "enum": ["P0", "P1", "P2"],
+                                    },
+                                    "finding_id": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 100,
                                     },
                                     "summary": {
                                         "type": "string",
@@ -78,7 +96,7 @@ def synthesizer_output_schema() -> dict:
                                     # reviewer finding fields; the
                                     # synthesizer never infers them.
                                     "category": {
-                                        "type": "string",
+                                        "type": ["string", "null"],
                                         "enum": [
                                             "missing",
                                             "invented",
@@ -88,6 +106,7 @@ def synthesizer_output_schema() -> dict:
                                             "untestable",
                                             "underspecified-contract",
                                             "other",
+                                            None,
                                         ],
                                     },
                                     "evidence_refs": {
@@ -99,12 +118,12 @@ def synthesizer_output_schema() -> dict:
                                         },
                                     },
                                     "failure_class": {
-                                        "type": "string",
-                                        "enum": ["mainline", "edge"],
+                                        "type": ["string", "null"],
+                                        "enum": ["mainline", "edge", None],
                                     },
                                     "missized_direction": {
-                                        "type": "string",
-                                        "enum": ["coarse", "fine"],
+                                        "type": ["string", "null"],
+                                        "enum": ["coarse", "fine", None],
                                     },
                                 },
                             },
@@ -114,7 +133,7 @@ def synthesizer_output_schema() -> dict:
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
-                                "required": ["req_id", "status", "evidence"],
+                                "required": ["req_id", "status", "evidence", "notes"],
                                 "properties": {
                                     "req_id": {
                                         "type": "string",
@@ -146,39 +165,78 @@ def synthesizer_output_schema() -> dict:
                     },
                 },
             },
-            "decision": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["node", "outcome", "blocking", "severity", "summary"],
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "enum": ["design_review"],
-                    },
-                    "outcome": {
-                        "type": "string",
-                        "enum": ["pass", "retry_design", "halt_for_human"],
-                    },
-                    "blocking": {
-                        "type": "boolean",
-                    },
-                    "severity": {
-                        "type": "string",
-                        "enum": [
-                            "invariant_violation",
-                            "risk",
-                            "opinion",
-                        ],
-                    },
-                    "summary": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 1000,
-                    },
-                    "prd_targeted": {
-                        "type": "boolean",
+            "issue_clusters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "prior_cluster_id", "finding_ids", "summary",
+                    ],
+                    "properties": {
+                        # Reuse only an ID supplied in the prior-cluster
+                        # catalog. null means this is a new issue.
+                        "prior_cluster_id": {
+                            "type": ["string", "null"],
+                        },
+                        "finding_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 100,
+                            },
+                        },
+                        "summary": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 1000,
+                        },
                     },
                 },
+            },
+            "decision": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "node",
+                            "outcome",
+                            "blocking",
+                            "severity",
+                            "summary",
+                        ],
+                        "properties": {
+                            "node": {
+                                "type": "string",
+                                "enum": ["design_review"],
+                            },
+                            "outcome": {
+                                "type": "string",
+                                "enum": ["pass", "retry_design", "halt_for_human"],
+                            },
+                            "blocking": {
+                                "type": "boolean",
+                            },
+                            "severity": {
+                                "type": "string",
+                                "enum": [
+                                    "invariant_violation",
+                                    "risk",
+                                    "opinion",
+                                ],
+                            },
+                            "summary": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                            },
+                        },
+                    },
+                    {"type": "null"},
+                ],
             },
         },
     }

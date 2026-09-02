@@ -30,7 +30,8 @@ from pathlib import Path
 from autodev.artifacts.revision_state import (
     ALL_PANEL_GATES, GATE_FALLBACK_PRODUCER, L_MAX,
     PRD_TARGET_HALT_STREAK,
-    RevisionState, filename_to_producer, gate_for_layer, load_state,
+    RevisionState, consume_manual_rerun_credit, filename_to_producer,
+    gate_for_layer, load_state,
     producer_stage_for_layer, write_state,
 )
 from autodev.artifacts.verdict import PanelVerdict
@@ -68,9 +69,23 @@ def _gate_verdict_filename(gate: str) -> str:
 
 
 def _blocking_findings(v: PanelVerdict) -> list:
-    """Findings that drive rerun dispatch: invariant_violation + risk.
-    ``opinion`` findings' targets are ignored for rerun purposes."""
-    return [f for f in v.findings if f.severity in ("invariant_violation", "risk")]
+    """Findings that meet both severity and release-priority policy."""
+    return v.blocking_findings()
+
+
+def _claim_rerun_slot(state: RevisionState, gate: str) -> tuple[bool, bool]:
+    """Claim a normal L slot, or consume one human-authorized extra slot.
+
+    Returns ``(allowed, used_manual_credit)``.  Manual credits deliberately
+    do not increase ``L`` beyond its invariant-preserving cap.
+    """
+    current = state.L.get(gate, 0)
+    if current < L_MAX:
+        state.L[gate] = current + 1
+        return True, False
+    if consume_manual_rerun_credit(state, gate):
+        return True, True
+    return False, False
 
 
 def _extract_primary_filenames(findings) -> tuple[set[str], bool]:
@@ -205,6 +220,36 @@ def _dispatch_for_verdict(
     ))
 
 
+def producer_eligible_for_manual_rerun(
+    feature_active: Path, gate: str, verdict: PanelVerdict,
+) -> str | None:
+    """Return the producer blocked only by ``L_MAX``, else ``None``.
+
+    This is the non-mutating eligibility check used before issuing a manual
+    rerun credit.  It mirrors every halt condition that precedes the L cap so
+    a credit cannot attach to a PRD/human-only verdict and leak into a later,
+    unrelated correction.
+    """
+    if gate not in ALL_PANEL_GATES:
+        return None
+    state = load_state(feature_active)
+    if state.L.get(gate, 0) < L_MAX:
+        return None
+    if gate == "design-review" and verdict.decision is not None:
+        return "design" if verdict.decision.outcome == "retry_design" else None
+    dispatch = _dispatch_for_verdict(gate, verdict)
+    if dispatch.producer is None:
+        return None
+    if dispatch.prd_targeted and gate == "design-review":
+        next_streak = min(
+            PRD_TARGET_HALT_STREAK,
+            state.prd_target_streak.get(gate, 0) + 1,
+        )
+        if next_streak >= PRD_TARGET_HALT_STREAK:
+            return None
+    return dispatch.producer
+
+
 def handle_panel_verdict(
     feature_active: Path, gate: str, verdict: PanelVerdict,
 ) -> Decision:
@@ -236,7 +281,8 @@ def handle_panel_verdict(
             prd_targeted = bool(verdict.decision.prd_targeted)
             s.prd_target_streak[gate] = 1 if prd_targeted else 0
             l = s.L.get(gate, 0)
-            if l >= L_MAX:
+            allowed, used_manual = _claim_rerun_slot(s, gate)
+            if not allowed:
                 return Decision(
                     kind=DecisionKind.HALT_FOR_HUMAN,
                     gate=gate,
@@ -248,8 +294,11 @@ def handle_panel_verdict(
                     ),
                     would_rerun="design",
                 )
-            s.L[gate] = l + 1
             write_state(feature_active, s)
+            suffix = (
+                "; consumed human-authorized rerun credit"
+                if used_manual else ""
+            )
             return Decision(
                 kind=DecisionKind.LOCAL_REVISE,
                 gate=gate,
@@ -257,7 +306,10 @@ def handle_panel_verdict(
                 feedback_paths=[_gate_verdict_filename(gate)],
                 state=s,
                 would_rerun="design",
-                reason=f"canonical design_review retry_design; L[{gate}]={s.L[gate]}/{L_MAX}",
+                reason=(
+                    f"canonical design_review retry_design; "
+                    f"L[{gate}]={s.L[gate]}/{L_MAX}{suffix}"
+                ),
             )
         if outcome == "pass":
             return Decision(
@@ -299,7 +351,8 @@ def handle_panel_verdict(
 
     # L_MAX halt — the (L_MAX+1)th blocking verdict (L already at L_MAX) halts.
     l = s.L.get(gate, 0)
-    if l >= L_MAX:
+    allowed, used_manual = _claim_rerun_slot(s, gate)
+    if not allowed:
         return Decision(
             kind=DecisionKind.HALT_FOR_HUMAN, gate=gate, state=s,
             reason=(
@@ -313,13 +366,18 @@ def handle_panel_verdict(
     # Bump L[gate] and dispatch producer rerun. v3-core: pending_feedback
     # is no longer populated — orchestrator's CONTEXT_ARTIFACTS passes the
     # stage-relevant panel verdict to the re-run stage automatically.
-    s.L[gate] = l + 1
     write_state(feature_active, s)
+    suffix = (
+        "; consumed human-authorized rerun credit"
+        if used_manual else ""
+    )
     return Decision(
         kind=DecisionKind.LOCAL_REVISE, gate=gate,
         stage_to_rerun=producer, feedback_paths=[_gate_verdict_filename(gate)],
         state=s, would_rerun=producer,
-        reason=(f"{dispatch.reason}; L[{gate}]={s.L[gate]}/{L_MAX}"),
+        reason=(
+            f"{dispatch.reason}; L[{gate}]={s.L[gate]}/{L_MAX}{suffix}"
+        ),
     )
 
 
@@ -383,7 +441,8 @@ def route_to_layer(
     s = load_state(feature_active)
 
     l = s.L.get(gate, 0)
-    if l >= L_MAX:
+    allowed, used_manual = _claim_rerun_slot(s, gate)
+    if not allowed:
         return RouteDecision(
             kind=DecisionKind.HALT_FOR_HUMAN, layer=layer, state=s,
             reason=(
@@ -392,17 +451,21 @@ def route_to_layer(
             ),
         )
 
-    s.L[gate] = l + 1
     fb = [trigger_ref]
     # v3-core: pending_feedback no longer populated; build.json lives on
     # disk and is picked up by CONTEXT_ARTIFACTS during design re-run.
     write_state(feature_active, s)
+
+    suffix = (
+        "; consumed human-authorized rerun credit"
+        if used_manual else ""
+    )
 
     return RouteDecision(
         kind=DecisionKind.LOCAL_REVISE, layer=layer, state=s,
         stage_to_rerun=producer, feedback_paths=fb,
         reason=(
             f"route to {layer} (gate={gate}, L={s.L[gate]}/{L_MAX}); "
-            f"re-run {producer} with build-feedback"
+            f"re-run {producer} with build-feedback{suffix}"
         ),
     )

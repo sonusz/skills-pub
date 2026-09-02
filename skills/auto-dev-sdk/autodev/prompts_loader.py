@@ -30,7 +30,11 @@ def render_stage_prompt(
     primary_target: Path,
     extra_targets: list[Path],
     context_artifacts: list[str] | None = None,
+    invocation_bindings: dict[str, str | Path] | None = None,
+    writable_paths: list[Path] | None = None,
+    protected_paths: list[Path] | None = None,
     preseeded: bool = False,
+    continuation: bool = False,
 ) -> str:
     """Build the prompt string passed to the shared vendors adapter.
 
@@ -38,7 +42,21 @@ def render_stage_prompt(
     body, listing the concrete paths + hashes the subagent needs.
     """
     prompt_file = _prompt_file_for_stage(stage)
-    body = prompt_file.read_text(encoding="utf-8")
+    if continuation:
+        body = (
+            f"# Continue the existing `{stage}` agent session\n\n"
+            "Keep the role, invariants, output contract, and implementation "
+            "discipline established by the initial turn in this session. "
+            "The filesystem and hashes below are authoritative for this "
+            "turn: re-read changed feedback and targets, do not rely on stale "
+            "in-memory file contents, and continue by editing the current "
+            "working artifacts rather than restarting the assignment. If a "
+            "listed PROMPT_HASH changed, re-read PROMPT_FILE before acting. "
+            "If a previous turn failed or was interrupted, reconcile your "
+            "memory with the current files before acting.\n"
+        )
+    else:
+        body = prompt_file.read_text(encoding="utf-8")
 
     ctx_lines: list[str] = [
         "",
@@ -57,6 +75,28 @@ def render_stage_prompt(
         f"- PROMPT_FILE: `{prompt_file}`",
         f"- PROMPT_HASH: `{hash_file(prompt_file)}`",
     ]
+
+    # The harness enforces this contract after the subprocess returns. Put
+    # the exact same paths in both initial and continuation prompts so an
+    # agent never has to infer write scope from its cwd or stale session
+    # memory. Files are exact matches; directories include descendants.
+    effective_writable = writable_paths or [
+        primary_target, *extra_targets, feature_active / "scratch",
+    ]
+    effective_protected = protected_paths or []
+    ctx_lines.extend([
+        "- WRITABLE_PATHS:",
+        *[f"  - `{Path(path).resolve()}`" for path in effective_writable],
+        "- PROTECTED_PATHS:",
+        *(
+            [f"  - `{Path(path).resolve()}`" for path in effective_protected]
+            or ["  - `(none beyond paths outside WRITABLE_PATHS)`"]
+        ),
+        "- FILESYSTEM_RULE: Write only inside WRITABLE_PATHS. Everything "
+        "else is read-only for this stage. PROTECTED_PATHS stay read-only "
+        "even when nested under a broader writable directory. Do not chmod, "
+        "chown, remount, rename, delete, or replace a protected path.",
+    ])
 
     # Per-stage upstream artifacts + hashes. Spec is deliberately
     # code-first: it receives only the harness-authored implementation
@@ -81,10 +121,14 @@ def render_stage_prompt(
                 "IMPLEMENTATION_INDEX_HASH",
             ),
         ],
-        # ralph-review is deliberately context-isolated: code + trace only.
-        # No PRD/scope/build.json — it's a pure "does code match trace?"
-        # classification gear, not an intent-vs-impl judge.
+        # Ralph remains isolated from mutable build narration and the PRD,
+        # but independently checks the delivered code against both the
+        # trace rows and the accepted design package.
         "ralph-review": [
+            (feature_active / "design-packet.json", "DESIGN_PACKET_PATH", "DESIGN_PACKET_HASH"),
+            (feature_active / "accepted-design.json", "ACCEPTED_DESIGN_PATH", "ACCEPTED_DESIGN_HASH"),
+            (feature_active / "design.md",     "DESIGN_PATH",     "DESIGN_HASH"),
+            (feature_active / "scope.json",    "SCOPE_PATH",      "SCOPE_HASH"),
             (feature_active / "trace.md",      "TRACE_PATH",      "TRACE_HASH"),
         ],
     }
@@ -94,6 +138,17 @@ def render_stage_prompt(
             ctx_lines.append(f"- {hash_key}: `{hash_file(path)}`")
         else:
             ctx_lines.append(f"- {name_key}: `{path}` (MISSING — stage will abort)")
+
+    # Budget account: design and build size their work against the feature's
+    # remaining budget, not only their own context window. ralph-review stays
+    # context-isolated (pure code-vs-trace classifier) and spec is code-first,
+    # so neither receives it. Rendering must survive any metering failure.
+    if stage in ("design", "build"):
+        try:
+            from autodev.budget import format_budget_lines
+            ctx_lines.extend(format_budget_lines(feature_active))
+        except Exception:
+            pass
 
     # The design stage authors scope.json's `diff_base`. Surface the declared
     # base ref (architecture.md "## Base ref") so it has one source of truth
@@ -130,6 +185,13 @@ def render_stage_prompt(
     }
     for key, p in target_map.get(stage, []):
         ctx_lines.append(f"- {key}: `{p}`")
+
+    # Stage-specific, harness-authored pointers that do not belong to the
+    # canonical upstream/target maps.  Values stay as references in the
+    # prompt; file contents are never inlined.  Ralph uses this for the
+    # immutable previous-review link and the per-build Git-diff context.
+    for key, value in (invocation_bindings or {}).items():
+        ctx_lines.append(f"- {key}: `{value}`")
 
     # v3-core: CONTEXT_ARTIFACTS — stage-relevant feedback artifacts
     # (prior verdict for this stage, own previous output, route feedback,
@@ -177,7 +239,11 @@ def render_stage_prompt(
         render_iteration_history,
     )
 
-    history = build_iteration_history(feature_active)
+    # A human-invalidated design is a true rebaseline. Feeding its old event
+    # timeline back into an otherwise empty initial prompt would recreate the
+    # discarded design through a hidden context channel.
+    fresh_design = stage == "design" and not preseeded and not effective_context
+    history = [] if fresh_design else build_iteration_history(feature_active)
     if history:
         ctx_lines.append("")
         ctx_lines.append("## Iteration history (oldest → newest)")

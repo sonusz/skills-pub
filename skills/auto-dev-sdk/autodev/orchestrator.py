@@ -5,6 +5,7 @@ checks all gates, and invokes the vendor subprocess runner.
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -43,7 +44,7 @@ from autodev.state.hashing import hash_file
 from autodev.state.lock import Lock
 from autodev.state.log import JsonlLog
 from autodev.vendors.config import VendorsConfig
-from autodev.workspace import snapshot
+from autodev.workspace import snapshot, user_visible_changes
 
 # Mapping from cascade artifact names → gate names (R4 / R4e).
 ARTIFACT_TO_GATE = {
@@ -65,6 +66,8 @@ STAGE_OUTPUT_RETRY_MAX = 3
 # deleting downstream artifacts.
 ROUTE_FEEDBACK_FILENAME = ".route-feedback.json"
 BUILD_CHALLENGES_FILENAME = "build-challenges.md"
+RALPH_ITERATION_CONTEXT_FILENAME = "ralph-iteration-context.json"
+RALPH_PREVIOUS_REVIEW_FILENAME = "ralph-review.previous.json"
 
 # Position of each cascade artifact, used to express "stop the `run`
 # loop before the pipeline crosses into a later phase" (the --until
@@ -110,6 +113,103 @@ CODING_STAGE_ARTIFACT = {
     "build": "build.json",
     "spec": "implemented-spec.md",
 }
+
+# Semantic inputs that remain immutable while a stage runs. The write
+# allowlist catches everything outside a narrow stage workspace; this second
+# list matters for stages with a deliberately broad writable directory (build
+# needs the repository, spec may emit implemented-spec envelope files).
+_STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
+    "design": (
+        "prd.md",
+        "panel-design-review.json",
+        "panel-trace-review.json",
+        "panel-close-approval.json",
+        "build.json",
+    ),
+    "build": (
+        "prd.md",
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "design-changelog.json",
+        "design-packet.json",
+        "accepted-design.json",
+        "panel-design-review.json",
+        "panel-trace-review.json",
+    ),
+    "ralph-review": (
+        "design-packet.json",
+        "accepted-design.json",
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "ralph-iteration-context.json",
+        "ralph-review.previous.json",
+    ),
+    "spec": (
+        "implementation-index.json",
+        "prd.md",
+        "design.md",
+        "scope.json",
+        "trace.md",
+        "test-plan.md",
+        "build.json",
+    ),
+}
+
+
+def _stage_write_contract(
+    *,
+    repo_root: Path,
+    active: Path,
+    stage: str,
+    primary_target: Path,
+    extra_targets: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    """Return the writable and protected paths shown to and enforced on a stage.
+
+    Design and Ralph have fixed output sets, so grant only their concrete
+    targets plus scratch. Build must discover and change product files, so it
+    gets the repository with its reviewed inputs carved out as protected.
+    Spec may create optional ``implemented-spec-*.md`` envelope files, so it
+    gets the feature directory with its intent/evidence inputs protected.
+    """
+    owned = [primary_target, *extra_targets]
+    scratch = active / "scratch"
+    if stage == "build":
+        writable = [repo_root]
+    elif stage == "spec":
+        writable = [active]
+    else:
+        writable = [*owned, scratch]
+
+    owned_resolved = {path.resolve() for path in owned}
+    protected = [
+        active / name
+        for name in _STAGE_PROTECTED_NAMES.get(stage, ())
+        if (active / name).resolve() not in owned_resolved
+    ]
+    return writable, protected
+
+
+def _protect_context_inputs(
+    protected: list[Path],
+    *,
+    context_artifacts: list[str],
+    owned_outputs: list[Path],
+) -> list[Path]:
+    """Add every concrete context input while keeping owned outputs writable."""
+    owned = {path.resolve() for path in owned_outputs}
+    merged: list[Path] = []
+    seen: set[Path] = set()
+    for path in [*protected, *(Path(raw) for raw in context_artifacts)]:
+        resolved = path.resolve()
+        if resolved in owned or resolved in seen:
+            continue
+        seen.add(resolved)
+        merged.append(path)
+    return merged
 
 
 @dataclass
@@ -340,12 +440,193 @@ class Orchestrator:
                     detail={"gate": v.gate, "verdict": v.verdict,
                             "finding_count": len(v.findings)},
                 )
-                # Mechanism 2 (rigor-tier): fingerprint bookkeeping +
-                # stall diagnosis BEFORE the revision loop — a diagnosed
-                # round consumes no L[gate] and never dispatches a rerun.
-                diag = self._check_diagnosis(active, v.gate, v, logger, feature)
-                if diag is not None:
-                    raise GatePending(v.gate, diag.halt_reason)
+                # Fingerprints tune the next correction's trust region but
+                # never halt. The normal revision loop/L_MAX owns stopping.
+                self._prepare_panel_rework(active, v.gate, v, logger, feature)
+                decision = handle_panel_verdict(active, v.gate, v)
+                # When merging, override feedback_paths so the rerun
+                # agent reads BOTH verdict files.
+                if (
+                    merged_feedback_paths is not None
+                    and decision.kind == DecisionKind.LOCAL_REVISE
+                ):
+                    decision.feedback_paths = list(merged_feedback_paths)
+                logger.emit(stage="gate", event="revision-loop-triggered",
+                            feature=feature, detail={
+                                "gate": v.gate,
+                                "decision": decision.kind.value,
+                                "stage_to_rerun": decision.stage_to_rerun,
+                                "would_rerun": decision.would_rerun,
+                                "feedback_paths": decision.feedback_paths,
+                                "reason": decision.reason,
+                                "source": "pending-blocking-verdict",
+                            })
+                if decision.kind == DecisionKind.LOCAL_REVISE:
+                    return decision
+                if decision.kind == DecisionKind.HALT_FOR_HUMAN:
+                    logger.emit(stage="gate", event="revision-loop-halt",
+                                feature=feature, detail={
+                                    "gate": v.gate, "reason": decision.reason,
+                                    "source": "pending-blocking-verdict",
+                                })
+                    raise GatePending(v.gate, decision.reason)
+                raise GatePending(
+                    v.gate,
+                    f"blocking panel verdict on disk (verdict={v.verdict}, "
+                    f"{len(v.findings)} findings) — resolve before advancing"
+                )
+        return None
+
+    def _check_dirty_blocks(self, active: Path) -> None:
+        state = snapshot(self.cfg.repo_root)
+        if not state.is_dirty:
+            return
+        o = ov.load(active)
+        if o.has_active_dirty_ack():
+            return
+        raise DirtyWorkspace(
+            "workspace dirty — run `autodev acknowledge-dirty` "
+            "with a reason or clean via `git restore --worktree . && git clean -fd`"
+        )
+
+    def _advance_one(self, feature: str, active: Path, logger: JsonlLog) -> AdvanceResult:
+        if self._check_pause_sentinel(active):
+            logger.emit(stage="orchestrator", event="paused", feature=feature)
+            raise GatePending("pause", "run `autodev resume` to continue")
+
+        # v3-core: defense-in-depth for stale-verdict-skips-enforcement.
+        # Even if cascade considers a panel verdict fresh, a blocking
+        # verdict on disk must halt the pipeline. Cascade layer-1a
+        # catches most of these by invalidating on consulted-doc hash
+        # changes; this layer catches the rest.
+        pending_decision = self._enforce_pending_blocking_verdicts(
+            active, logger, feature,
+        )
+        if pending_decision is not None:
+            self._check_dirty_blocks(active)
+            if pending_decision.stage_to_rerun is not None:
+                return self._advance_coding(
+                    feature, active, pending_decision.stage_to_rerun, logger,
+                )
+            return AdvanceResult(
+                stage_name=f"panel-{pending_decision.gate}",
+                success=True,
+                detail=pending_decision.reason,
+            )
+
+        next_name = self._next_stage_name(active)
+        if next_name == "done":
+            logger.emit(stage="orchestrator", event="pipeline-done", feature=feature)
+            return AdvanceResult(stage_name="done", success=True)
+
+        self._check_dirty_blocks(active)
+
+        # Gate branches
+        if next_name in ARTIFACT_TO_GATE:
+            gate = ARTIFACT_TO_GATE[next_name]
+            return self._advance_gate(feature, active, gate, logger)
+
+        # Harness-authored design-loop artifacts
+        if next_name == "design_packet":
+            path = write_design_packet(active)
+            logger.emit(stage="design-packet", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="design_packet", success=True)
+        if next_name == "accepted_design":
+            path = write_accepted_design(
+                active,
+                active / "panel-design-review.json",
+                active / "panel-trace-review.json",
+            )
+            logger.emit(stage="accepted-design", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="accepted_design", success=True)
+        if next_name == "implementation_index":
+            path = write_implementation_index(active, repo_root=self.cfg.repo_root)
+            logger.emit(stage="implementation-index", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="implementation_index", success=True)
+        if next_name == "prd_checklist":
+            path = write_prd_checklist(active)
+            logger.emit(stage="prd-checklist", event="artifact-written",
+                        feature=feature, detail={"artifact": str(path)})
+            return AdvanceResult(stage_name="prd_checklist", success=True)
+
+        # Coding stage branches
+        if next_name in ("design", "scope", "trace", "test_plan"):
+            return self._advance_coding(feature, active, "design", logger)
+        if next_name in CODING_STAGES:
+            return self._advance_coding(feature, active, next_name, logger)
+
+        raise PreflightError(f"orchestrator does not know how to advance to {next_name!r}")
+
+    def _advance_gate(
+        self, feature: str, active: Path, gate: str, logger: JsonlLog,
+    ) -> AdvanceResult:
+        overrides = ov.load(active)
+        if overrides.has_active_skip_gate(gate):
+            logger.emit(stage="gate", event="skipped-by-override", feature=feature,
+                        detail={"gate": gate})
+            # Write a synthetic "skipped" verdict for cascade freshness.
+            self._write_skip_verdict(feature, active, gate, overrides)
+            return AdvanceResult(stage_name=f"panel-{gate}", success=True,
+                                 detail="skipped by override")
+
+        primary = self._gate_primary_artifact(active, gate)
+
+        current_hash = hash_file(primary)
+        existing = verdict_exists_and_valid(
+            feature_active=active, gate=gate, current_source_hash=current_hash,
+        )
+        if existing is None:
+            logger.emit(stage="gate", event="panel-start", feature=feature,
+                        detail={"gate": gate})
+            v = run_panel_gate(
+                gate=gate,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                feature=feature,
+                primary_artifact=primary,
+                panel_config=self.cfg.vendors.panel,
+                probe_config=self.cfg.vendors.probe,
+                log_emit=lambda d: logger.emit(
+                    stage=d.get("stage", "gate"),
+                    event=d.get("event", "panel"),
+                    feature=feature,
+                    detail=d,
+                ),
+            )
+        else:
+            v = existing
+        logger.emit(stage="gate", event="panel-done", feature=feature,
+                    detail={"gate": gate, "verdict": v.verdict,
+                            "invariant": v.has_invariant_violation()})
+
+        # Pause checkpoint: honor a `.pause` set WHILE the panel was
+        # running. The verdict is now durably on disk (run_panel_gate
+        # wrote it), but we have not yet called handle_panel_verdict —
+        # which bumps and persists L[gate] — nor dispatched a producer
+        # rerun. Halting here means a pause set mid-panel takes effect
+        # the moment the panel finishes, before the design agent revises,
+        # instead of one round later (the only earlier checks are at
+        # loop-top and _advance_one entry, both of which precede the
+        # panel run). On resume, _enforce_pending_blocking_verdicts
+        # re-reads this fresh verdict and dispatches the revision exactly
+        # once, so L[gate] is bumped exactly once — no double-count.
+        if self._check_pause_sentinel(active):
+            logger.emit(stage="orchestrator", event="paused", feature=feature)
+            raise GatePending("pause", "run `autodev resume` to continue")
+
+        if v.effectively_blocks():
+                logger.emit(
+                    stage="orchestrator", event="blocking-verdict-enforced",
+                    feature=feature,
+                    detail={"gate": v.gate, "verdict": v.verdict,
+                            "finding_count": len(v.findings)},
+                )
+                # Fingerprints tune the next correction's trust region but
+                # never halt. The normal revision loop/L_MAX owns stopping.
+                self._prepare_panel_rework(active, v.gate, v, logger, feature)
                 decision = handle_panel_verdict(active, v.gate, v)
                 # When merging, override feedback_paths so the rerun
                 # agent reads BOTH verdict files.
@@ -528,14 +809,35 @@ class Orchestrator:
             v_merged, merged_feedback_paths = self._merge_trace_into_design(active, v)
             if v_merged is not None:
                 v = v_merged
+            # Coverage/budget alternation bookkeeping: one outcome event
+            # per (packet, round type), consumed by
+            # autodev.budget.design_phase to decide the next round type
+            # and gate completion. Emitted on the MERGED verdict (trace
+            # findings count toward pass/fail), and deliberately BEFORE
+            # the pause checkpoint below: a first-round pause must not
+            # leave the feature with zero outcome events, which the
+            # legacy escape in design_gate_satisfied would read as
+            # pre-alternation and accept the gate without a budget
+            # round. Re-emission on a cached revisit is harmless — the
+            # replay dedups first-wins.
+            if v.skip_reason is None:
+                try:
+                    logger.emit(
+                        stage="gate", event="design-round-outcome",
+                        feature=feature, detail={
+                            "gate": gate,
+                            "round_key": v.source_hash,
+                            "round_type": getattr(v, "round_type", "coverage"),
+                            "passed": not v.effectively_blocks(),
+                        },
+                    )
+                except Exception:
+                    pass
 
         if v.effectively_blocks():
-            # Mechanism 2 (rigor-tier): fingerprint bookkeeping + stall
-            # diagnosis BEFORE the revision loop — a diagnosed round
-            # consumes no L[gate] and never dispatches a rerun.
-            diag = self._check_diagnosis(active, gate, v, logger, feature)
-            if diag is not None:
-                raise GatePending(gate, diag.halt_reason)
+            # Fingerprints tune the next correction's trust region but never
+            # halt. The normal revision loop/L_MAX owns stopping.
+            self._prepare_panel_rework(active, gate, v, logger, feature)
             # v3-core R4: revision loop picks a producer rerun based on
             # reviewer-emitted filename-qualified targets, or halts for
             # human when not auto-rerunnable / L_MAX reached.
@@ -587,39 +889,29 @@ class Orchestrator:
         (active / "rework-mode.json").unlink(missing_ok=True)
         return AdvanceResult(stage_name=f"panel-{gate}", success=True)
 
-    def _check_diagnosis(
+    def _prepare_panel_rework(
         self, active: Path, gate: str, v: PanelVerdict,
         logger: JsonlLog, feature: str,
-    ):
-        """Mechanism 2 pre-revision-loop hook (docs/proposals/rigor-tier.md).
+    ) -> None:
+        """Record finding telemetry and select the next rework mode.
 
-        Records the verdict's blocking-finding fingerprints; on
-        recurrence runs the stall classifier and returns a
-        DiagnosisResult (caller halts). Otherwise refreshes
-        rework-mode.json for the upcoming producer rerun and returns
-        None. Never raises — a bookkeeping failure must not take down
-        gate enforcement; it degrades to the pre-mechanism-2 path.
+        Never raises or halts. A bookkeeping failure degrades to the normal
+        revision loop without fingerprint-informed trust-region selection.
         """
         try:
-            from autodev.diagnosis import check_and_diagnose
-            diag = check_and_diagnose(active, gate, v)
+            from autodev.diagnosis import prepare_panel_rework
+            mode = prepare_panel_rework(active, gate, v)
         except Exception as e:  # pragma: no cover - defensive
-            logger.emit(stage="gate", event="diagnosis-error",
+            logger.emit(stage="gate", event="rework-mode-error",
                         feature=feature,
                         detail={"gate": gate, "error": str(e)[:300]})
-            return None
-        if diag is not None:
-            logger.emit(stage="gate", event="stall-diagnosed",
-                        feature=feature, detail={
-                            "gate": gate,
-                            "classification": diag.classification,
-                            "pivot_rs": diag.pivot_rs,
-                            "diagnosis": str(diag.diagnosis_path),
-                        })
-        return diag
+            return
+        logger.emit(stage="gate", event="rework-mode-selected",
+                    feature=feature, detail={"gate": gate, "mode": mode})
 
-    def _merge_trace_into_design(
-        self, active: Path, v_design: PanelVerdict,
+    @staticmethod
+    def merge_trace_into_design(
+        active: Path, v_design: PanelVerdict,
     ) -> tuple[PanelVerdict | None, list[str] | None]:
         """Return a merged design-review PanelVerdict if a fresh
         panel-trace-review.json exists referencing the same source as
@@ -644,10 +936,7 @@ class Orchestrator:
         # design-review group's verdict is not authoritative over the whole
         # design evaluation. Drop the decision in that case so handle_panel_verdict
         # falls back to filename-based dispatch on the merged findings list.
-        trace_has_blocking = any(
-            f.severity in ("invariant_violation", "risk")
-            for f in v_trace.findings
-        )
+        trace_has_blocking = bool(v_trace.blocking_findings())
         merged_decision = v_design.decision
         if (
             merged_decision is not None
@@ -655,10 +944,39 @@ class Orchestrator:
             and trace_has_blocking
         ):
             merged_decision = None
+        trace_findings = copy.deepcopy(v_trace.findings)
+        trace_id_map: dict[str, str] = {}
+        for index, finding in enumerate(trace_findings):
+            if finding.finding_id:
+                new_id = f"trace-review/{finding.finding_id}"
+                trace_id_map[finding.finding_id] = new_id
+                finding.finding_id = new_id
+            elif v_trace.issue_clusters:
+                # A clustered verdict should always carry IDs; preserve a
+                # conservative unique identity if loading older mixed data.
+                finding.finding_id = f"trace-review/legacy-{index}"
+        trace_clusters = copy.deepcopy(v_trace.issue_clusters)
+        for cluster in trace_clusters:
+            cluster.finding_ids = [
+                trace_id_map.get(i, f"trace-review/{i}")
+                for i in cluster.finding_ids
+            ]
+        merged_clusters = copy.deepcopy(v_design.issue_clusters)
+        by_cluster_id = {c.cluster_id: c for c in merged_clusters}
+        priority_rank = {"P0": 0, "P1": 1, "P2": 2}
+        for cluster in trace_clusters:
+            existing = by_cluster_id.get(cluster.cluster_id)
+            if existing is None:
+                merged_clusters.append(cluster)
+                by_cluster_id[cluster.cluster_id] = cluster
+                continue
+            existing.finding_ids.extend(cluster.finding_ids)
+            if priority_rank[cluster.priority] < priority_rank[existing.priority]:
+                existing.priority = cluster.priority
         merged = PanelVerdict(
             gate="design-review",
             verdict=_worst_verdict(v_design.verdict, v_trace.verdict),  # type: ignore[arg-type]
-            findings=list(v_design.findings) + list(v_trace.findings),
+            findings=list(v_design.findings) + trace_findings,
             source=v_design.source,
             source_hash=v_design.source_hash,
             prompt_file=v_design.prompt_file,
@@ -670,8 +988,19 @@ class Orchestrator:
             dropped_findings=list(v_design.dropped_findings) + list(v_trace.dropped_findings),
             coverage_map={**v_design.coverage_map, **v_trace.coverage_map},
             decision=merged_decision,
+            issue_clusters=merged_clusters,
+            release_threshold=v_design.release_threshold,
+            decision_overridden_by_rigor=v_design.decision_overridden_by_rigor,
+            decision_overridden_by_policy=v_design.decision_overridden_by_policy,
+            round_type=v_design.round_type,
         )
         return merged, ["panel-design-review.json", "panel-trace-review.json"]
+
+    def _merge_trace_into_design(
+        self, active: Path, v_design: PanelVerdict,
+    ) -> tuple[PanelVerdict | None, list[str] | None]:
+        """Compatibility wrapper for the effective design-gate merge."""
+        return self.merge_trace_into_design(active, v_design)
 
     def _apply_revision_invalidation(self, active: Path, decision: Decision) -> None:
         """Delete artifacts so cascade re-runs ``decision.stage_to_rerun``.
@@ -792,12 +1121,15 @@ class Orchestrator:
         extra_targets = [active / n for n in extra_names]
         stage_spec = self.cfg.vendors.resolve(stage)
 
-        # Determine allowed write paths (harness-owned; see R2a).
-        # scope/plan/spec/review → feature-root only.
-        # build → feature-root + repo src subtree (v2 default = whole repo root).
-        allowed_write_paths = [active]
-        if stage == "build":
-            allowed_write_paths.append(self.cfg.repo_root)
+        # One harness-owned contract drives both the prompt and the post-stage
+        # drift check. Agents no longer have to infer write scope from cwd.
+        allowed_write_paths, protected_write_paths = _stage_write_contract(
+            repo_root=self.cfg.repo_root,
+            active=active,
+            stage=stage,
+            primary_target=primary_target,
+            extra_targets=extra_targets,
+        )
 
         # On a design rerun the prior package is on disk; pre-fill the
         # subagent's .tmp working copies (see _run_stage_subprocess_checked)
@@ -812,7 +1144,9 @@ class Orchestrator:
         # harness appends <stage>-output-rejection.json (and the prior
         # artifacts) to CONTEXT_ARTIFACTS so the agent amends in place
         # rather than regenerating from scratch.
-        def render_prompt(extra_context: list[str]) -> str:
+        def render_prompt(
+            extra_context: list[str], continuation: bool = False,
+        ) -> str:
             merged = list(self._context_artifacts_for_stage(
                 active, stage, primary_target, extra_targets,
             ))
@@ -827,7 +1161,10 @@ class Orchestrator:
                 primary_target=primary_target,
                 extra_targets=extra_targets,
                 context_artifacts=merged,
+                writable_paths=allowed_write_paths,
+                protected_paths=protected_write_paths,
                 preseeded=preseeded,
+                continuation=continuation,
             )
 
         logger.emit(stage=stage, event="subprocess-dispatch", feature=feature,
@@ -846,6 +1183,7 @@ class Orchestrator:
                 primary_target=primary_target,
                 extra_targets=extra_targets,
                 allowed_write_paths=allowed_write_paths,
+                protected_write_paths=protected_write_paths,
             )
             archive_path = None
             if stage == "design":
@@ -868,6 +1206,7 @@ class Orchestrator:
             stage_spec=stage_spec,
             primary_target=primary_target,
             allowed_write_paths=allowed_write_paths,
+            protected_write_paths=protected_write_paths,
         )
 
     def _context_artifacts_for_stage(
@@ -879,6 +1218,7 @@ class Orchestrator:
     ) -> list[str]:
         """Return stage-relevant feedback/context artifacts for prompt rendering."""
         context_artifacts: list[str] = []
+        fresh_design = stage == "design" and not primary_target.exists()
 
         def append_once(path: Path) -> None:
             rendered = str(path)
@@ -934,25 +1274,27 @@ class Orchestrator:
             },
             "build": {"panel-close-approval.json"},
         }
-        for p in sorted(active.glob("panel-*.json")):
-            if p.name.endswith(".docs.json"):
-                continue
-            allowed_panels = panel_context_by_stage.get(stage, set())
-            if p.name in allowed_panels:
-                append_once(p)
+        if not fresh_design:
+            for p in sorted(active.glob("panel-*.json")):
+                if p.name.endswith(".docs.json"):
+                    continue
+                allowed_panels = panel_context_by_stage.get(stage, set())
+                if p.name in allowed_panels:
+                    append_once(p)
 
         # Existing own artifact lets a stage revise in place rather than
         # regenerate from scratch.
-        if primary_target.exists():
-            append_once(primary_target)
-        for extra in extra_targets:
-            if extra.exists():
-                append_once(extra)
+        if not fresh_design:
+            if primary_target.exists():
+                append_once(primary_target)
+            for extra in extra_targets:
+                if extra.exists():
+                    append_once(extra)
 
-        if stage == "design":
-            changelog_path = active / "design-changelog.json"
-            if changelog_path.exists():
-                append_once(changelog_path)
+            if stage == "design":
+                changelog_path = active / "design-changelog.json"
+                if changelog_path.exists():
+                    append_once(changelog_path)
 
         if stage == "build":
             # Build is inside the Ralph loop: each retry must see the latest
@@ -962,6 +1304,9 @@ class Orchestrator:
                 path = active / name
                 if path.exists():
                     append_once(path)
+            rejection = active / "build-output-rejection.json"
+            if rejection.exists():
+                append_once(rejection)
 
         # build.json if it exists. Do not hand it to spec: spec must see
         # only implementation-index.json so semantic build deviations do
@@ -993,10 +1338,12 @@ class Orchestrator:
         logger: JsonlLog,
         stage_spec,
         prompt: str,
+        resume_prompt: str | None,
         primary_target: Path,
         extra_targets: list[Path],
         allowed_write_paths: list[Path],
         pre_snap,
+        protected_write_paths: list[Path] | None = None,
     ):
         from autodev.artifacts.failure import FailureReport, write_failure
         from autodev.vendors.subprocess_runner import run_stage_subprocess
@@ -1004,16 +1351,20 @@ class Orchestrator:
         from datetime import datetime, timezone
         import os
         import shutil
+        from autodev.vendors.subprocess_runner import should_resume_transient_draft
 
         # Design reruns revise the prior package in place: pre-fill each
         # extra artifact's .tmp from its landed version so the subagent
         # edits only what changed. The runner pre-seeds the primary
         # (design.md) itself via preseed=True. A stale extra .tmp with no
         # landed source is dropped so it can't leak into the next round.
-        preseed = stage == "design"
+        preseed = stage == "design" and primary_target.exists()
         if preseed:
+            resume_transient_draft = should_resume_transient_draft(active, stage)
             for extra_target in extra_targets:
                 extra_tmp = extra_target.with_name(extra_target.name + ".tmp")
+                if resume_transient_draft and extra_tmp.exists():
+                    continue
                 if extra_target.exists():
                     try:
                         shutil.copyfile(extra_target, extra_tmp)
@@ -1037,12 +1388,21 @@ class Orchestrator:
                                            feature=feature, detail=d),
             probe_config=self.cfg.vendors.probe,
             preseed=preseed,
+            resume_prompt=resume_prompt,
         )
 
         if not result.ok:
             logger.emit(stage=stage, event="subprocess-failed", feature=feature,
                         detail={"kind": result.failure_kind,
                                 "detail": result.failure_detail})
+            if stage == "build" and result.failure_kind in {
+                "missing_artifact", "stale_artifact",
+            }:
+                raise StageOutputInvalid(
+                    stage,
+                    result.failure_kind,
+                    result.failure_detail,
+                )
             raise PreflightError(
                 f"stage {stage} failed: {result.failure_kind} — {result.failure_detail}"
             )
@@ -1092,16 +1452,23 @@ class Orchestrator:
                     f"(cascade would loop forever)",
                 )
 
-        post_snap = snapshot(self.cfg.repo_root)
+        post_snap = snapshot(
+            self.cfg.repo_root,
+            watched_paths=protected_write_paths,
+        )
         escapes = detect_out_of_scope_writes(
             pre_snap, post_snap,
             allowed_scope=allowed_write_paths,
             repo_root=self.cfg.repo_root,
+            protected_scope=protected_write_paths,
         )
         if escapes:
             fr = FailureReport(
                 stage=stage, kind="detected_out_of_scope_write",
-                detail=f"{len(escapes)} file(s) touched outside allowed paths: {escapes[:5]}",
+                detail=(
+                    f"{len(escapes)} file(s) touched outside writable paths "
+                    f"or inside protected paths: {escapes[:5]}"
+                ),
                 subprocess_exit=result.exit_code,
                 stderr_tail="",
                 ts=datetime.now(timezone.utc).isoformat(),
@@ -1109,7 +1476,7 @@ class Orchestrator:
             )
             write_failure(active / f"{stage}-failure.json", fr)
             raise PreflightError(
-                f"stage {stage} wrote outside allowed scope: {escapes}"
+                f"stage {stage} violated its write contract: {escapes}"
             )
         return result
 
@@ -1121,10 +1488,11 @@ class Orchestrator:
         stage: str,
         logger: JsonlLog,
         stage_spec,
-        render_prompt: Callable[[list[str]], str],
+        render_prompt: Callable[[list[str], bool], str],
         primary_target: Path,
         extra_targets: list[Path],
         allowed_write_paths: list[Path],
+        protected_write_paths: list[Path] | None = None,
     ):
         """Dispatch a coding stage, retrying on a deficient deliverable.
 
@@ -1162,7 +1530,11 @@ class Orchestrator:
                         extra_context.append(str(et))
                 extra_context.append(str(feedback_path))
             prompt = render_prompt(extra_context)
-            pre_snap = snapshot(self.cfg.repo_root)
+            resume_prompt = render_prompt(extra_context, True)
+            pre_snap = snapshot(
+                self.cfg.repo_root,
+                watched_paths=protected_write_paths,
+            )
             try:
                 result = self._run_stage_subprocess_checked(
                     feature=feature,
@@ -1171,10 +1543,12 @@ class Orchestrator:
                     logger=logger,
                     stage_spec=stage_spec,
                     prompt=prompt,
+                    resume_prompt=resume_prompt,
                     primary_target=primary_target,
                     extra_targets=extra_targets,
                     allowed_write_paths=allowed_write_paths,
                     pre_snap=pre_snap,
+                    protected_write_paths=protected_write_paths,
                 )
                 # Success — drop any rejection note from earlier attempts so
                 # a later dispatch does not mistake it for live feedback.
@@ -1248,6 +1622,130 @@ class Orchestrator:
             payload["missing_scope_ids"] = sorted(missing_ids)
         atomic_write(feedback_path, _json.dumps(payload, indent=2) + "\n")
 
+    def _prepare_ralph_iteration_context(self, active: Path) -> Path:
+        """Persist the pre-build Git ref and prior accepted Ralph output.
+
+        The same Ralph iteration can be re-entered after a quota pause,
+        subprocess failure, or process restart.  In that case the original
+        ``before_ref`` must survive so an amend/retry cannot erase the very
+        delta the reviewer needs to inspect.
+        """
+        import json
+        from datetime import datetime, timezone
+
+        from autodev.artifacts.implementation_index import _current_git_head
+        from autodev.state.atomic import atomic_write, atomic_write_json
+
+        state = ralph.load_ralph_state(active)
+        iteration = state.iter + 1
+        trace_hash = hash_file(active / "trace.md")
+        context_path = active / RALPH_ITERATION_CONTEXT_FILENAME
+        previous_path = active / RALPH_PREVIOUS_REVIEW_FILENAME
+
+        existing: dict = {}
+        if context_path.exists():
+            try:
+                candidate = json.loads(context_path.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    existing = candidate
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+
+        reuse = (
+            existing.get("schema") == 1
+            and existing.get("iteration") == iteration
+            and existing.get("trace_hash") == trace_hash
+            and isinstance(existing.get("before_ref"), str)
+        )
+        before_ref = (
+            existing["before_ref"]
+            if reuse
+            else (_current_git_head(self.cfg.repo_root) or "")
+        )
+
+        # On a new iteration, freeze the last accepted review under a
+        # different filename.  The live ralph-review.json target is replaced
+        # atomically by the upcoming reviewer turn, so handing that mutable
+        # path back would make output retries lose their real baseline.
+        if not reuse:
+            previous_path.unlink(missing_ok=True)
+            live_review = active / "ralph-review.json"
+            if state.iter > 0 and live_review.exists():
+                try:
+                    statuses = ralph.parse_review_statuses(live_review)
+                    ralph.validate_active_review_coverage(
+                        statuses, ralph.active_scope_ids(active / "scope.json")
+                    )
+                except (OSError, SchemaError):
+                    pass
+                else:
+                    atomic_write(previous_path, live_review.read_bytes())
+
+        previous_review = str(previous_path) if previous_path.exists() else None
+        previous_hash = hash_file(previous_path) if previous_path.exists() else None
+        atomic_write_json(context_path, {
+            "schema": 1,
+            "iteration": iteration,
+            "status": "build_pending",
+            "written_at": datetime.now(timezone.utc).isoformat(),
+            "repo_root": str(self.cfg.repo_root),
+            "trace_hash": trace_hash,
+            "before_ref": before_ref,
+            "after_ref": None,
+            "previous_ralph_review_path": previous_review,
+            "previous_ralph_review_hash": previous_hash,
+            "diff": None,
+        })
+        return context_path
+
+    def _finalize_ralph_iteration_context(self, context_path: Path) -> dict:
+        """Add the post-build ref and executable diff pointers."""
+        import json
+        from datetime import datetime, timezone
+
+        from autodev.artifacts.implementation_index import _current_git_head
+        from autodev.state.atomic import atomic_write_json
+
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise PreflightError(
+                f"cannot finalize {context_path.name}: {e}"
+            ) from e
+        if not isinstance(payload, dict) or payload.get("schema") != 1:
+            raise PreflightError(
+                f"cannot finalize {context_path.name}: invalid schema"
+            )
+
+        before_ref = payload.get("before_ref")
+        after_ref = _current_git_head(self.cfg.repo_root) or ""
+        refs_available = bool(before_ref and after_ref)
+        payload.update({
+            "status": "ready_for_review",
+            "written_at": datetime.now(timezone.utc).isoformat(),
+            "after_ref": after_ref,
+            "diff": {
+                "available": refs_available,
+                "patch_command": (
+                    [
+                        "git", "-C", str(self.cfg.repo_root), "diff",
+                        "--no-ext-diff", before_ref, after_ref, "--",
+                    ]
+                    if refs_available else []
+                ),
+                "changed_files_command": (
+                    [
+                        "git", "-C", str(self.cfg.repo_root), "diff",
+                        "--no-ext-diff", "--name-status",
+                        before_ref, after_ref, "--",
+                    ]
+                    if refs_available else []
+                ),
+            },
+        })
+        atomic_write_json(context_path, payload)
+        return payload
+
     def _stamp_build_sealed_ref(self, build_path: Path) -> None:
         """Augment the just-written build.json with the current git HEAD.
 
@@ -1285,6 +1783,7 @@ class Orchestrator:
         stage_spec,
         primary_target: Path,
         allowed_write_paths: list[Path],
+        protected_write_paths: list[Path] | None = None,
     ) -> AdvanceResult:
         self._reset_ralph_state_if_inputs_changed(active, logger, feature)
         while True:
@@ -1301,30 +1800,114 @@ class Orchestrator:
             from autodev.prompts_loader import render_stage_prompt
             from autodev.workspace import snapshot
 
-            prompt = render_stage_prompt(
-                stage="build",
-                feature=feature,
-                feature_active=active,
-                repo_root=self.cfg.repo_root,
-                primary_target=primary_target,
-                extra_targets=[],
-                context_artifacts=self._context_artifacts_for_stage(
+            ralph_context_path = self._prepare_ralph_iteration_context(active)
+
+            feedback_path = active / "build-output-rejection.json"
+            iteration_baseline = snapshot(self.cfg.repo_root)
+            result = None
+            for attempt in range(1, STAGE_OUTPUT_RETRY_MAX + 1):
+                build_context = self._context_artifacts_for_stage(
                     active, "build", primary_target, [],
-                ),
-            )
-            pre_snap = snapshot(self.cfg.repo_root)
-            result = self._run_stage_subprocess_checked(
-                feature=feature,
-                active=active,
-                stage="build",
-                logger=logger,
-                stage_spec=stage_spec,
-                prompt=prompt,
-                primary_target=primary_target,
-                extra_targets=[],
-                allowed_write_paths=allowed_write_paths,
-                pre_snap=pre_snap,
-            )
+                )
+                iteration_protected = _protect_context_inputs(
+                    protected_write_paths or [],
+                    context_artifacts=build_context,
+                    owned_outputs=[primary_target],
+                )
+                prompt = render_stage_prompt(
+                    stage="build",
+                    feature=feature,
+                    feature_active=active,
+                    repo_root=self.cfg.repo_root,
+                    primary_target=primary_target,
+                    extra_targets=[],
+                    context_artifacts=build_context,
+                    writable_paths=allowed_write_paths,
+                    protected_paths=iteration_protected,
+                )
+                resume_prompt = render_stage_prompt(
+                    stage="build",
+                    feature=feature,
+                    feature_active=active,
+                    repo_root=self.cfg.repo_root,
+                    primary_target=primary_target,
+                    extra_targets=[],
+                    context_artifacts=build_context,
+                    writable_paths=allowed_write_paths,
+                    protected_paths=iteration_protected,
+                    continuation=True,
+                )
+                pre_snap = snapshot(
+                    self.cfg.repo_root,
+                    watched_paths=iteration_protected,
+                )
+                try:
+                    result = self._run_stage_subprocess_checked(
+                        feature=feature,
+                        active=active,
+                        stage="build",
+                        logger=logger,
+                        stage_spec=stage_spec,
+                        prompt=prompt,
+                        resume_prompt=resume_prompt,
+                        primary_target=primary_target,
+                        extra_targets=[],
+                        allowed_write_paths=allowed_write_paths,
+                        pre_snap=pre_snap,
+                        protected_write_paths=iteration_protected,
+                    )
+                    residue = user_visible_changes(
+                        iteration_baseline,
+                        snapshot(self.cfg.repo_root),
+                    )
+                    if residue:
+                        raise StageOutputInvalid(
+                            "build",
+                            "uncommitted_product_changes",
+                            "Build exited before its product/test changes were "
+                            "fully committed. Wait synchronously for git commit "
+                            "and all hooks, then return with the iteration's "
+                            f"workspace baseline restored. Changes: {residue[:10]}",
+                        )
+                except StageOutputInvalid as e:
+                    self._write_output_rejection_feedback(
+                        feedback_path,
+                        stage="build",
+                        attempt=attempt,
+                        kind=e.kind,
+                        detail=e.detail,
+                        primary_target=primary_target,
+                        extra_targets=None,
+                        missing_ids=None,
+                    )
+                    if attempt >= STAGE_OUTPUT_RETRY_MAX:
+                        logger.emit(
+                            stage="build",
+                            event="output-rejected-exhausted",
+                            feature=feature,
+                            detail={
+                                "attempts": attempt,
+                                "kind": e.kind,
+                                "detail": str(e.detail)[:300],
+                            },
+                        )
+                        raise
+                    logger.emit(
+                        stage="build",
+                        event="output-rejected-retrying",
+                        feature=feature,
+                        detail={
+                            "attempt": attempt,
+                            "max": STAGE_OUTPUT_RETRY_MAX,
+                            "kind": e.kind,
+                            "detail": str(e.detail)[:300],
+                        },
+                    )
+                    continue
+                feedback_path.unlink(missing_ok=True)
+                break
+            if result is None:  # defensive: loop either sets it or raises
+                raise PreflightError("build output retry loop produced no result")
             # Stamp current git HEAD into build.json. Without this, a
             # rerun whose LLM-produced build.json is byte-identical to
             # the previous one (same test_results, same files_changed,
@@ -1334,9 +1917,23 @@ class Orchestrator:
             # Stamping HEAD here makes the per-rerun WIP commit (build
             # prompt's squash-as-you-go) propagate through the cascade.
             self._stamp_build_sealed_ref(primary_target)
+            ralph_context = self._finalize_ralph_iteration_context(
+                ralph_context_path
+            )
             logger.emit(stage="build", event="stage-complete", feature=feature,
                         detail={"artifact": str(primary_target),
                                 "elapsed_sec": result.elapsed_sec})
+            logger.emit(
+                stage="build", event="ralph-diff-context-ready",
+                feature=feature, detail={
+                    "iteration": ralph_context["iteration"],
+                    "before_ref": ralph_context["before_ref"],
+                    "after_ref": ralph_context["after_ref"],
+                    "previous_review": ralph_context[
+                        "previous_ralph_review_path"
+                    ],
+                },
+            )
 
             route = self._enforce_build_blocking(active, logger, feature)
             if route is not None:
@@ -1345,12 +1942,18 @@ class Orchestrator:
                     detail=f"routed: {route.reason}",
                 )
 
-            review_result = self._run_ralph_review(feature, active, logger)
+            review_result = self._run_ralph_review(
+                feature, active, logger,
+                iteration_context_path=ralph_context_path,
+                iteration_context=ralph_context,
+            )
             if review_result["complete"]:
                 return AdvanceResult(stage_name="build", success=True)
 
     def _run_ralph_review(
-        self, feature: str, active: Path, logger: JsonlLog,
+        self, feature: str, active: Path, logger: JsonlLog, *,
+        iteration_context_path: Path,
+        iteration_context: dict,
     ) -> dict[str, bool]:
         """Dispatch the per-iteration ralph classification, retrying on a
         deficient classification list.
@@ -1377,10 +1980,30 @@ class Orchestrator:
 
         review_target = active / "ralph-review.json"
         review_spec = self.cfg.vendors.resolve("review")
+        review_writable, review_protected = _stage_write_contract(
+            repo_root=self.cfg.repo_root,
+            active=active,
+            stage="ralph-review",
+            primary_target=review_target,
+            extra_targets=[],
+        )
         active_ids = ralph.active_scope_ids(active / "scope.json")
         feedback_path = active / "ralph-review-output-rejection.json"
         # A fresh iteration's first pass is not an amendment.
         feedback_path.unlink(missing_ok=True)
+
+        invocation_bindings: dict[str, str | Path] = {
+            "RALPH_ITERATION_CONTEXT_PATH": iteration_context_path,
+            "RALPH_ITERATION_CONTEXT_HASH": hash_file(iteration_context_path),
+            "BUILD_BEFORE_REF": iteration_context.get("before_ref") or "unavailable",
+            "BUILD_AFTER_REF": iteration_context.get("after_ref") or "unavailable",
+        }
+        previous_review = iteration_context.get("previous_ralph_review_path")
+        if previous_review and Path(previous_review).exists():
+            invocation_bindings["PREVIOUS_RALPH_REVIEW_PATH"] = previous_review
+            invocation_bindings["PREVIOUS_RALPH_REVIEW_HASH"] = hash_file(
+                Path(previous_review)
+            )
 
         statuses: dict[str, str] | None = None
         last_exc: SchemaError | None = None
@@ -1398,6 +2021,22 @@ class Orchestrator:
                 primary_target=review_target,
                 extra_targets=[],
                 context_artifacts=context_artifacts or None,
+                invocation_bindings=invocation_bindings,
+                writable_paths=review_writable,
+                protected_paths=review_protected,
+            )
+            resume_prompt = render_stage_prompt(
+                stage="ralph-review",
+                feature=feature,
+                feature_active=active,
+                repo_root=self.cfg.repo_root,
+                primary_target=review_target,
+                extra_targets=[],
+                context_artifacts=context_artifacts or None,
+                invocation_bindings=invocation_bindings,
+                writable_paths=review_writable,
+                protected_paths=review_protected,
+                continuation=True,
             )
             result = self._run_stage_subprocess_checked(
                 feature=feature,
@@ -1406,10 +2045,15 @@ class Orchestrator:
                 logger=logger,
                 stage_spec=review_spec,
                 prompt=prompt,
+                resume_prompt=resume_prompt,
                 primary_target=review_target,
                 extra_targets=[],
-                allowed_write_paths=[active],
-                pre_snap=snapshot(self.cfg.repo_root),
+                allowed_write_paths=review_writable,
+                pre_snap=snapshot(
+                    self.cfg.repo_root,
+                    watched_paths=review_protected,
+                ),
+                protected_write_paths=review_protected,
             )
             logger.emit(stage="ralph-review", event="stage-complete", feature=feature,
                         detail={"artifact": str(review_target),
@@ -1459,6 +2103,7 @@ class Orchestrator:
         state.source_hash = hash_file(active / "scope.json")
         state.trace_hash = hash_file(active / "trace.md")
         state.test_plan_hash = hash_file(active / "test-plan.md")
+        state.design_hash = hash_file(active / "design.md")
         state, _ = ralph.record_iter(state, statuses=statuses)
         ralph.write_ralph_state(active, state)
 
@@ -1495,19 +2140,24 @@ class Orchestrator:
         current_scope_hash = hash_file(active / "scope.json")
         current_trace_hash = hash_file(active / "trace.md")
         current_test_plan_hash = hash_file(active / "test-plan.md")
+        current_design_hash = hash_file(active / "design.md")
         if (
             state.source_hash == current_scope_hash
             and state.trace_hash == current_trace_hash
             and state.test_plan_hash == current_test_plan_hash
+            and state.design_hash == current_design_hash
         ):
             return
         ralph.clear_ralph_state(active)
         (active / "ralph-review.json").unlink(missing_ok=True)
+        (active / RALPH_PREVIOUS_REVIEW_FILENAME).unlink(missing_ok=True)
+        (active / RALPH_ITERATION_CONTEXT_FILENAME).unlink(missing_ok=True)
         logger.emit(stage="build", event="ralph-reset-on-input-change",
                     feature=feature, detail={
                         "scope_hash_changed": state.source_hash != current_scope_hash,
                         "trace_hash_changed": state.trace_hash != current_trace_hash,
                         "test_plan_hash_changed": state.test_plan_hash != current_test_plan_hash,
+                        "design_hash_changed": state.design_hash != current_design_hash,
                     })
 
     # G23: build-blocking halt. stage-implement prompt contracts that a
@@ -1609,31 +2259,6 @@ class Orchestrator:
             layer = dx["defective_layer"]
             trigger_ref = f"build.json#/deviations/{i}"
 
-            # Mechanism 4 deferral-bet settlement: the same scope items
-            # bouncing back from build across a design change means the
-            # interior deferral is falsified — halt with a depth-aware
-            # amendment draft instead of grinding L to the generic halt.
-            try:
-                from autodev.diagnosis import check_route_recurrence
-                scope_ids = sorted({
-                    str(d.get("scope_id"))
-                    for _, d, _dx in routable if d.get("scope_id")
-                })
-                route_diag = check_route_recurrence(
-                    active, layer, scope_ids, build_path,
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                logger.emit(stage="build", event="route-diagnosis-error",
-                            feature=feature, detail={"error": str(e)[:300]})
-                route_diag = None
-            if route_diag is not None:
-                logger.emit(stage="build", event="deferral-falsified",
-                            feature=feature, detail={
-                                "layer": layer,
-                                "pivot_rs": route_diag.pivot_rs,
-                            })
-                raise GatePending("build_blocking", route_diag.halt_reason)
-
             decision = route_to_layer(
                 active, layer, trigger_ref=trigger_ref,
             )
@@ -1691,8 +2316,8 @@ class Orchestrator:
         ids = ", ".join(blocking_ids) if blocking_ids else "(none listed)"
         raise GatePending(
             "build_blocking",
-            f"build.json.blocking=true; PRD amendment required for "
-            f"scope items: {ids}",
+            f"build.json.blocking=true; human resolution required for "
+            f"scope items: {ids}; inspect blocking deviations in build.json",
         )
 
     def _apply_route_invalidation(self, active: Path, layer: str) -> None:
@@ -1716,6 +2341,7 @@ class Orchestrator:
         for downstream in (
             "build.json", "implementation-index.json", "implemented-spec.md",
             "prd-checklist.json", "ralph-review.json", "panel-close-approval.json",
+            RALPH_PREVIOUS_REVIEW_FILENAME, RALPH_ITERATION_CONTEXT_FILENAME,
         ):
             (active / downstream).unlink(missing_ok=True)
         # Also drop ralph-state since upstream changed.

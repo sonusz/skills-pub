@@ -29,7 +29,7 @@ stages:
     vendor: codex
     model: gpt-5.6-sol
     probe_interval_sec: 1200
-    effort: max
+    effort: high
   build:
     vendor: codex
     model: gpt-5.6-terra
@@ -46,7 +46,10 @@ stages:
     probe_interval_sec: 900
     effort: high
 
-panel:
+  panel:
+  # Default transport quorum. An omitted reviewer must first fail a retry and
+  # then have quota exhaustion positively confirmed.
+  min_responding_reviewers: 2
   reviewers:
     - vendor: claude
       model: opus
@@ -104,10 +107,54 @@ Notes:
   schema, which works on `claude`, `grok`, and `codex`/`openai`. `agy` is not
   supported as a synthesizer because its CLI has no native schema
   enforcement.
+- Panel transport defaults to two responding reviewers. A failed reviewer is
+  retried once immediately. The harness then force-refreshes that vendor's
+  quota and permits omission only when exhaustion is positively confirmed;
+  unknown quota and ordinary transport failures still block. If confirmed
+  quota leaves fewer than `min_responding_reviewers`, the normal quota-pause
+  path is used instead of synthesizing an undersized panel.
 - `probe` configures the read-only idle-timeout LLM probe. It is not a
   product reviewer; it only decides whether a quiet subprocess looks
   wedged or should get more time, and it also routes through
   `shared/vendors` when invoked.
+
+## Persistent agent sessions
+
+The agents that revise the same work across pipeline iterations keep distinct
+provider-native sessions:
+
+- one design session per repo + feature;
+- one build session and one Ralph-review session per repo + feature; and
+- one panel-reviewer session per repo + feature + gate + configured reviewer
+  slot/vendor/model.
+
+Reviewer sessions are never shared with one another or across
+`design-review`, `trace-review`, and `close-approval`. On later turns the
+harness sends a compact continuation prompt containing current paths and
+hashes; the full role contract remains in the native session. Filesystem state
+and current hashes are always authoritative, so a resumed agent must re-read
+changed feedback rather than trust stale conversational memory.
+
+The `spec` producer, panel synthesizer, and idle probe remain stateless because
+they do not participate in iterative producer/reviewer revision. Session
+mappings are maintained by canonical `shared/vendors` in the user's state
+directory, outside the target repo, so they do not dirty feature worktrees.
+
+## Design revision navigation
+
+Every archived design package has a local, package-only Git ref at
+`refs/autodev/design/<feature>/package-NNN`. The commits contain only the
+archived design artifacts and changelog; they do not stage the user's index,
+capture unrelated worktree changes, move the checked-out branch, or push
+anything. Revision reviewers receive the previous/current refs and bounded
+`git diff` commands so they can inspect changes before selectively re-reading
+the authoritative current files.
+
+The current feature's harness-owned `docs/features/<feature>/active/**` files
+are excluded from the preflight dirty-worktree decision. Changes elsewhere in
+the repository still require `acknowledge-dirty`, and writes outside the
+allowed stage scope—including another feature's active directory—remain
+containment failures.
 
 ## Verify
 
@@ -147,8 +194,45 @@ autodev status myfeature
 tail docs/features/myfeature/active/log.jsonl
 ```
 
+When a blocking gate has exhausted its local revision budget, an operator can
+authorize one more producer correction without amending the PRD or bypassing
+review:
+
+```bash
+autodev grant-rerun myfeature design-review \
+  --reason "one narrow correction after reviewing the blocking verdict"
+autodev run myfeature
+```
+
+The grant is auditable and single-use. It leaves the counter capped, does not
+mark the gate passed, and another blocking verdict halts again.
+
 `run` has three pacings: end-to-end (`autodev run`), one stage at a time
 (`autodev next`), and phase-bounded (`autodev run --until design|build`).
+
+Persistent design/build/Ralph conversations can be restarted deliberately:
+
+```bash
+autodev pause myfeature
+autodev reset-session myfeature design
+```
+
+Reset refuses an active session lease; the agent's next turn starts a fresh
+provider-native conversation.
+
+The harness also rotates conversations automatically at successful-turn
+boundaries: design keeps at most 15 turns, build at most 3, and Ralph review plus
+each panel reviewer at most 5. Turn 16 for design, turn 4 for build, and turn 6
+for Ralph review and panel reviewers start fresh with the full current artifact
+packet.
+Failures and handled interruptions do not advance the count.
+
+If an interrupted or mistaken invalidation removed the active design package,
+restore the latest hash-verified archive while the feature remains paused:
+
+```bash
+autodev restore-design myfeature
+```
 `--until design` is the common "design, then let me look before we
 build" checkpoint — it does not stop one stage at a time, it carries the
 whole design phase to completion (including the gate) and halts before
@@ -188,11 +272,16 @@ budget for *semantic* reruns) and from hard subprocess failures or
 out-of-scope writes, which still halt immediately. Watch the
 `output-rejected-retrying` / `output-rejected-exhausted` log events.
 
-Each panel runs its configured claude + grok + agy + codex/openai reviewers independently,
-then a synthesizer merges their findings into a single verdict.
-Blocking findings (`invariant_violation` or `risk`) either dispatch
-a producer rerun (bumping the gate's L counter, cap L_MAX=3) or
-halt for human decision.
+Each panel runs its configured claude + grok + agy + codex/openai reviewers
+independently. The synthesizer preserves every raw finding and adds semantic
+issue clusters; the harness validates membership and counts clusters, rather
+than repeated reviewer wording, as tickets. Every finding also has an
+independent `P0` / `P1` / `P2` release priority. PRDs default to
+`Release threshold: P1` (historical behavior) and may select `P0` so P1/P2
+findings remain auditable without dispatching redesign. Blocking clusters
+either dispatch a producer rerun (bumping the gate's L counter) or halt for
+human decision. Cross-round recurrence first reuses synthesizer cluster IDs
+and falls back to structural identity that deliberately ignores summary prose.
 For `design-review`, a blocking finding that targets `prd.md` first
 reruns the design stage so the design agent can try to remove the
 apparent PRD conflict. A second consecutive PRD-targeted design-review

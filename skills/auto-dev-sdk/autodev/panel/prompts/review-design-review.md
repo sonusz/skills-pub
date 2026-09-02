@@ -123,6 +123,19 @@ trace-review panel's job; do not audit them here.
    `design_ref` fields on items resolve to real design.md
    sections.
 
+## Verify findings before reporting
+
+When subagents are available in your CLI (some reviewer CLIs have
+them; if yours does not, skip this section), use them to fact-check
+each finding you intend to report: the cited clause as it literally
+appears in the anchor document, the code or artifact fact the claim
+depends on, the evidence the finding points to. Drop or downgrade a
+finding whose evidence does not survive the check. Dispatch
+fact-checkers on a mid-tier, medium-effort model (for the claude
+CLI, `model: sonnet` on the Agent tool). Fact-checkers are
+read-only: subagents must not edit code or any artifact, and you
+remain the author of every reported finding.
+
 ## Finding categories
 
 - **MISSING** — a PRD `### R<N>:` requirement has no scope
@@ -150,6 +163,18 @@ trace-review panel's job; do not audit them here.
 - `risk` — genuine failure mode not addressed; blocks.
 - `opinion` — style, phrasing, or preference; informational,
   never blocks.
+
+## Release priority (independent from severity)
+
+- `P0` — blocks the core release path: data loss/security, a required mainline
+  cannot run, or the release's explicitly highest-rigor acceptance event would
+  fail.
+- `P1` — important correctness or maintainability work that can be deferred
+  without breaking that core release path.
+- `P2` — polish, optional hardening, or low-cost follow-up.
+
+Assign exactly one priority to every finding. Do not promote an issue merely
+because several reviewers might notice it.
 
 ## Rigor calibration (PRD `## Assurance` map)
 
@@ -284,6 +309,7 @@ guarantee that finding-writing is exhaustive across R<n>s.
 Per finding state:
 
 - `severity`: `invariant_violation` / `risk` / `opinion`
+- `priority`: `P0` / `P1` / `P2`
 - `summary`: one sentence naming the category (MISSING /
   INVENTED / AMBIGUOUS / UNDELIVERED / MISSIZED / UNTESTABLE /
   UNDERSPECIFIED-CONTRACT) and the specific defect

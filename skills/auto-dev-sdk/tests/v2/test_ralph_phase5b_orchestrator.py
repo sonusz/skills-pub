@@ -47,6 +47,7 @@ def _write_fake_vendor(path: Path) -> Path:
             import json
             import os
             import re
+            import subprocess
             import sys
             from pathlib import Path
 
@@ -65,14 +66,17 @@ def _write_fake_vendor(path: Path) -> Path:
                 return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
             def bump(active: Path, stage: str) -> int:
-                counter = active / f".{stage}.count"
+                counter = active / "scratch" / f".{stage}.count"
+                counter.parent.mkdir(parents=True, exist_ok=True)
                 n = int(counter.read_text() or "0") if counter.exists() else 0
                 n += 1
                 counter.write_text(str(n), encoding="utf-8")
                 return n
 
             def log_prompt(active: Path, stage: str, n: int, prompt: str) -> None:
-                (active / f".{stage}.{n}.prompt").write_text(prompt, encoding="utf-8")
+                scratch = active / "scratch"
+                scratch.mkdir(parents=True, exist_ok=True)
+                (scratch / f".{stage}.{n}.prompt").write_text(prompt, encoding="utf-8")
 
             def render_ralph_review(statuses: dict[str, str], scope_hash: str) -> str:
                 # v3-core: ralph-review.json (strict JSON schema)
@@ -87,6 +91,10 @@ def _write_fake_vendor(path: Path) -> Path:
                 return json.dumps({
                     "classifications": classifications,
                     "summary": counts,
+                    "design_conformance": {
+                        "verdict": "Aligned",
+                        "findings": [],
+                    },
                 }, indent=2) + "\\n"
 
             stdin_prompt = sys.stdin.read()
@@ -115,6 +123,37 @@ def _write_fake_vendor(path: Path) -> Path:
             if tgt_build:
                 n = bump(active, "build")
                 log_prompt(active, "build", n, prompt)
+                if (
+                    os.environ.get("AUTODEV_PHASE5B_MISSING_BUILD_ONCE") == "1"
+                    and n == 1
+                ):
+                    sys.exit(0)
+                if os.environ.get("AUTODEV_PHASE5B_DIRTY_ONCE") == "1":
+                    changed = Path.cwd() / "src" / "interrupted.py"
+                    if n == 1:
+                        changed.parent.mkdir(parents=True, exist_ok=True)
+                        changed.write_text("VALUE = 1\\n", encoding="utf-8")
+                        subprocess.run(
+                            ["git", "add", "--", str(changed.relative_to(Path.cwd()))],
+                            cwd=Path.cwd(), check=True,
+                        )
+                    elif n == 2:
+                        subprocess.run(
+                            ["git", "commit", "-q", "-m", "finish interrupted build"],
+                            cwd=Path.cwd(), check=True,
+                        )
+                if os.environ.get("AUTODEV_PHASE5B_AMEND_BUILD") == "1":
+                    changed = Path.cwd() / "src" / "amended.py"
+                    changed.parent.mkdir(parents=True, exist_ok=True)
+                    changed.write_text(f"VALUE = {n}\\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "add", "--", str(changed.relative_to(Path.cwd()))],
+                        cwd=Path.cwd(), check=True,
+                    )
+                    subprocess.run(
+                        ["git", "commit", "-q", "--amend", "--no-edit"],
+                        cwd=Path.cwd(), check=True,
+                    )
                 scope_hash = hash_file(active / "scope.json")
                 route_at = int(os.environ.get("AUTODEV_PHASE5B_ROUTE_AT", "0") or "0")
                 route_layer = os.environ.get("AUTODEV_PHASE5B_ROUTE_LAYER", "")
@@ -319,7 +358,7 @@ def _seed_feature(active: Path, *, ids: list[str]) -> None:
 
 
 def _count(active: Path, stage: str) -> int:
-    p = active / f".{stage}.count"
+    p = active / "scratch" / f".{stage}.count"
     return int(p.read_text()) if p.exists() else 0
 
 
@@ -352,22 +391,202 @@ def test_build_loops_until_all_active_items_fully(git_repo, feature_active, monk
     assert (feature_active / "ralph-review.json").exists()
     assert (feature_active / "review.json").read_text(encoding="utf-8") == "close approval decoy\n"
 
-    prompt = (feature_active / ".ralph-review.1.prompt").read_text(encoding="utf-8")
-    # v3-core update: ralph-review is context-isolated (trace+code only).
-    # No PRD/scope/build.json/spec in its inputs.
+    prompt = (
+        feature_active / "scratch" / ".ralph-review.1.prompt"
+    ).read_text(encoding="utf-8")
+    # Ralph gets accepted design + trace, but remains isolated from
+    # PRD/build/spec narration.
+    assert "DESIGN_PACKET_PATH:" in prompt
+    assert "ACCEPTED_DESIGN_PATH:" in prompt
+    assert "DESIGN_PATH:" in prompt
+    assert "SCOPE_PATH:" in prompt
     assert "TRACE_PATH:" in prompt
     assert "TARGET_RALPH_REVIEW:" in prompt
     assert "BUILD_JSON_PATH:" not in prompt
-    assert "SCOPE_PATH:" not in prompt
     assert "SPEC_PATH:" not in prompt
     assert "PRD_PATH:" not in prompt
     assert "TARGET_REVIEW:" not in prompt
 
-    first_build_prompt = (feature_active / ".build.1.prompt").read_text(encoding="utf-8")
-    second_build_prompt = (feature_active / ".build.2.prompt").read_text(encoding="utf-8")
+    context_path = feature_active / "ralph-iteration-context.json"
+    previous_path = feature_active / "ralph-review.previous.json"
+    first_review_prompt = prompt
+    second_review_prompt = (
+        feature_active / "scratch" / ".ralph-review.2.prompt"
+    ).read_text(encoding="utf-8")
+    assert str(context_path) in first_review_prompt
+    assert "- BUILD_BEFORE_REF:" in first_review_prompt
+    assert "- BUILD_AFTER_REF:" in first_review_prompt
+    assert f"- PREVIOUS_RALPH_REVIEW_PATH: `{previous_path}`" not in first_review_prompt
+    assert f"- PREVIOUS_RALPH_REVIEW_PATH: `{previous_path}`" in second_review_prompt
+    assert previous_path.exists()
+    previous = json.loads(previous_path.read_text(encoding="utf-8"))
+    assert {
+        item["scope_id"]: item["classification"]
+        for item in previous["classifications"]
+    } == {"t-1": "Partial", "t-2": "Missing"}
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    assert context["iteration"] == 2
+    assert context["status"] == "ready_for_review"
+    assert context["previous_ralph_review_path"] == str(previous_path)
+    assert context["diff"]["available"] is True
+
+    first_build_prompt = (
+        feature_active / "scratch" / ".build.1.prompt"
+    ).read_text(encoding="utf-8")
+    second_build_prompt = (
+        feature_active / "scratch" / ".build.2.prompt"
+    ).read_text(encoding="utf-8")
     assert str(feature_active / "ralph-review.json") not in first_build_prompt
     assert str(feature_active / "ralph-review.json") in second_build_prompt
     assert str(feature_active / "ralph-state.json") in second_build_prompt
+
+
+def test_ralph_diff_context_preserves_amended_commit_delta(
+    git_repo, feature_active, monkeypatch,
+):
+    """The captured pre-build SHA remains diffable after build amends HEAD."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+    before = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
+
+    monkeypatch.setenv("AUTODEV_PHASE5B_AMEND_BUILD", "1")
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    context_path = feature_active / "ralph-iteration-context.json"
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    after = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
+    assert before != after
+    assert context["before_ref"] == before
+    assert context["after_ref"] == after
+    assert context["diff"]["patch_command"][-3:] == [before, after, "--"]
+
+    patch_result = subprocess.run(
+        context["diff"]["patch_command"],
+        cwd=str(git_repo), text=True, capture_output=True, check=True,
+    )
+    assert "src/amended.py" in patch_result.stdout
+    review_prompt = (
+        feature_active / "scratch" / ".ralph-review.1.prompt"
+    ).read_text(encoding="utf-8")
+    assert f"- BUILD_BEFORE_REF: `{before}`" in review_prompt
+    assert f"- BUILD_AFTER_REF: `{after}`" in review_prompt
+    assert f"- RALPH_ITERATION_CONTEXT_PATH: `{context_path}`" in review_prompt
+
+
+def test_build_retries_until_product_changes_are_committed(
+    git_repo, feature_active, monkeypatch,
+):
+    """A Build may not hand Ralph a staged tree while its commit is pending."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+    before = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
+
+    monkeypatch.setenv("AUTODEV_PHASE5B_DIRTY_ONCE", "1")
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 2
+    assert _count(feature_active, "ralph-review") == 1
+    assert not (feature_active / "build-output-rejection.json").exists()
+    assert subprocess.check_output(
+        ["git", "status", "--short", "--", "src/interrupted.py"],
+        cwd=str(git_repo), text=True,
+    ) == ""
+
+    context_path = feature_active / "ralph-iteration-context.json"
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    assert context["before_ref"] == before
+    assert context["before_ref"] != context["after_ref"]
+    patch_result = subprocess.run(
+        context["diff"]["patch_command"],
+        cwd=str(git_repo), text=True, capture_output=True, check=True,
+    )
+    assert "src/interrupted.py" in patch_result.stdout
+
+    retry_prompt = (
+        feature_active / "scratch" / ".build.2.prompt"
+    ).read_text(encoding="utf-8")
+    assert str(feature_active / "build-output-rejection.json") in retry_prompt
+    assert any(
+        event.get("stage") == "build"
+        and event.get("event") == "output-rejected-retrying"
+        and event.get("detail", {}).get("kind") == "uncommitted_product_changes"
+        for event in _read_log(feature_active)
+    )
+
+
+def test_build_retries_when_a_successful_turn_writes_no_artifact(
+    git_repo, feature_active, monkeypatch,
+):
+    """Exit 0 without this turn's build.json must not launch an empty Ralph."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    orch = _orch(git_repo, vendor_bin)
+
+    monkeypatch.setenv("AUTODEV_PHASE5B_MISSING_BUILD_ONCE", "1")
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 2
+    assert _count(feature_active, "ralph-review") == 1
+    assert not (feature_active / "build-output-rejection.json").exists()
+    retry_prompt = (
+        feature_active / "scratch" / ".build.2.prompt"
+    ).read_text(encoding="utf-8")
+    assert str(feature_active / "build-output-rejection.json") in retry_prompt
+    assert any(
+        event.get("stage") == "build"
+        and event.get("event") == "output-rejected-retrying"
+        and event.get("detail", {}).get("kind") == "missing_artifact"
+        for event in _read_log(feature_active)
+    )
+
+
+def test_ralph_diff_context_reuses_original_before_ref_on_reentry(
+    git_repo, feature_active,
+):
+    """An interrupted iteration keeps its first pre-build pointer."""
+    _seed_feature(feature_active, ids=["t-1"])
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    context_path = orch._prepare_ralph_iteration_context(feature_active)
+    original = json.loads(context_path.read_text(encoding="utf-8"))
+
+    changed = git_repo / "src" / "reentered.py"
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "src/reentered.py"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--amend", "--no-edit"],
+        cwd=git_repo, check=True,
+    )
+
+    same_path = orch._prepare_ralph_iteration_context(feature_active)
+    reentered = json.loads(same_path.read_text(encoding="utf-8"))
+    assert same_path == context_path
+    assert reentered["iteration"] == 1
+    assert reentered["before_ref"] == original["before_ref"]
+    assert reentered["after_ref"] is None
 
 
 def test_malformed_ralph_review_retries_then_amends_and_succeeds(
@@ -402,9 +621,58 @@ def test_malformed_ralph_review_retries_then_amends_and_succeeds(
 
     # The retry prompt must hand the agent the prior review + the
     # structured rejection so it amends rather than reclassifies blind.
-    retry_prompt = (feature_active / ".ralph-review.2.prompt").read_text(encoding="utf-8")
+    retry_prompt = (
+        feature_active / "scratch" / ".ralph-review.2.prompt"
+    ).read_text(encoding="utf-8")
     assert "CONTEXT_ARTIFACTS" in retry_prompt
     assert str(feature_active / "ralph-review.json") in retry_prompt
+    assert str(feature_active / "ralph-review-output-rejection.json") in retry_prompt
+
+
+def test_output_retry_keeps_previous_accepted_review_file(
+    git_repo, feature_active, monkeypatch,
+):
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    prior = {
+        "classifications": [{
+            "req_id": "t-1.r1", "scope_id": "t-1",
+            "classification": "Partial", "evidence": "src/old.py:1",
+        }],
+        "summary": {
+            "Fully": 0, "Partial": 1, "Missing": 0,
+            "Deviated": 0, "Deferred": 0,
+        },
+        "design_conformance": {
+            "verdict": "Aligned", "findings": [],
+        },
+    }
+    (feature_active / "ralph-review.json").write_text(
+        json.dumps(prior) + "\n", encoding="utf-8",
+    )
+    ralph.write_ralph_state(feature_active, ralph.RalphState(
+        source=str(feature_active / "scope.json"),
+        source_hash=hash_file(feature_active / "scope.json"),
+        trace_hash=hash_file(feature_active / "trace.md"),
+        test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
+        iter=1,
+        fully_history=[set(), set()],
+        statuses_history=[{}, {"t-1": "Partial"}],
+    ))
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    monkeypatch.setenv("AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]))
+    monkeypatch.setenv("AUTODEV_PHASE5B_MALFORMED_AT", "1")
+
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    previous_path = feature_active / "ralph-review.previous.json"
+    assert json.loads(previous_path.read_text(encoding="utf-8")) == prior
+    retry_prompt = (
+        feature_active / "scratch" / ".ralph-review.2.prompt"
+    ).read_text(encoding="utf-8")
+    assert f"- PREVIOUS_RALPH_REVIEW_PATH: `{previous_path}`" in retry_prompt
     assert str(feature_active / "ralph-review-output-rejection.json") in retry_prompt
 
 
@@ -483,6 +751,7 @@ def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), {"t-1"}],
         statuses_history=[{}, {"t-1": "Fully"}],
@@ -505,6 +774,8 @@ def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
     assert not (feature_active / "test-plan.md").exists()
     assert not (feature_active / "ralph-state.json").exists()
     assert not (feature_active / "ralph-review.json").exists()
+    assert not (feature_active / "ralph-review.previous.json").exists()
+    assert not (feature_active / "ralph-iteration-context.json").exists()
     assert not (feature_active / "build.json").exists()
 
     # The selected build diagnosis survives downstream invalidation and is
@@ -584,6 +855,33 @@ def test_missing_pending_feedback_fails_closed(git_repo, feature_active):
         )
 
 
+def test_fresh_design_does_not_rehydrate_discarded_design_context(
+    git_repo, feature_active,
+):
+    """Invalidating design.md is a true rebaseline, not history replay."""
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    extras = [
+        feature_active / "scope.json",
+        feature_active / "trace.md",
+        feature_active / "test-plan.md",
+        feature_active / "design-changelog.json",
+    ]
+    for path in extras:
+        path.write_text("discarded prior design\n", encoding="utf-8")
+    (feature_active / "panel-design-review.json").write_text(
+        "discarded prior verdict\n", encoding="utf-8",
+    )
+
+    context = orch._context_artifacts_for_stage(
+        feature_active,
+        "design",
+        feature_active / "design.md",
+        extras,
+    )
+
+    assert context == []
+
+
 def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature_active):
     _seed_feature(feature_active, ids=["t-1", "t-2"])
     (feature_active / "build.json").write_text(
@@ -609,12 +907,16 @@ def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature
              "classification": "Fully", "evidence": "x"},
         ],
         "summary": {"Fully": 1, "Partial": 0, "Missing": 0, "Deviated": 0, "Deferred": 0},
+        "design_conformance": {
+            "verdict": "Aligned", "findings": [],
+        },
     }))
     ralph.write_ralph_state(feature_active, ralph.RalphState(
         source=str(feature_active / "scope.json"),
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), {"t-1"}],
         statuses_history=[{}, {"t-1": "Fully"}],
@@ -630,12 +932,16 @@ def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature
              "classification": "Fully", "evidence": "x"},
         ],
         "summary": {"Fully": 2, "Partial": 0, "Missing": 0, "Deviated": 0, "Deferred": 0},
+        "design_conformance": {
+            "verdict": "Aligned", "findings": [],
+        },
     }))
     ralph.write_ralph_state(feature_active, ralph.RalphState(
         source=str(feature_active / "scope.json"),
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=2,
         fully_history=[set(), {"t-1"}, {"t-1", "t-2"}],
         statuses_history=[{}, {"t-1": "Fully"}, {"t-1": "Fully", "t-2": "Fully"}],
@@ -654,6 +960,7 @@ def test_resume_reruns_partially_persisted_iteration(git_repo, feature_active, m
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=1,
         fully_history=[set(), set()],
         statuses_history=[{}, {"t-1": "Missing"}],
@@ -689,6 +996,7 @@ def test_upstream_change_resets_only_ralph_state_and_restarts_iter_one(
         source_hash=hash_file(feature_active / "scope.json"),
         trace_hash=hash_file(feature_active / "trace.md"),
         test_plan_hash=hash_file(feature_active / "test-plan.md"),
+        design_hash=hash_file(feature_active / "design.md"),
         iter=2,
         fully_history=[set(), set(), set()],
         statuses_history=[{}, {"t-1": "Missing"}, {"t-1": "Partial"}],

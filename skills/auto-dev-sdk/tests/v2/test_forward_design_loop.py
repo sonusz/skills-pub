@@ -543,7 +543,12 @@ def test_canonical_design_review_pass_persists_decision_and_projection(git_repo,
     fake = _write_fake_panel_script(
         tmp_path,
         synth_payload={
-            "per_reviewer": [{"vendor": "claude", "verdict": "pass", "findings": []}],
+            "per_reviewer": [
+                {"vendor": "claude", "verdict": "pass", "findings": []},
+                {"vendor": "agy", "verdict": "pass", "findings": []},
+                {"vendor": "codex", "verdict": "pass", "findings": []},
+            ],
+            "issue_clusters": [],
             "decision": {
                 "node": "design_review",
                 "outcome": "pass",
@@ -583,13 +588,26 @@ def test_first_prd_targeted_canonical_halt_normalizes_then_second_halts(git_repo
                 "verdict": "fail",
                 "findings": [
                     {
+                        "finding_id": "claude:1",
                         "severity": "risk",
+                        "priority": "P1",
                         "summary": "PRD contradiction",
                         "targets": ["anchor.prd.md"],
+                        "category": "ambiguous",
+                        "evidence_refs": ["prd:R1"],
+                        "failure_class": "mainline",
+                        "missized_direction": None,
                     }
                 ],
-            }
+            },
+            {"vendor": "agy", "verdict": "pass", "findings": []},
+            {"vendor": "codex", "verdict": "pass", "findings": []},
         ],
+        "issue_clusters": [{
+            "prior_cluster_id": None,
+            "finding_ids": ["claude:1"],
+            "summary": "PRD contradiction",
+        }],
         "decision": {
             "node": "design_review",
             "outcome": "halt_for_human",
@@ -645,13 +663,26 @@ def test_invalid_anchor_architecture_target_is_rejected_before_persistence(git_r
                     "verdict": "fail",
                     "findings": [
                         {
+                            "finding_id": "claude:1",
                             "severity": "risk",
+                            "priority": "P1",
                             "summary": "architecture contradiction",
                             "targets": ["anchor.architecture-proposal.md"],
+                            "category": "ambiguous",
+                            "evidence_refs": [],
+                            "failure_class": "mainline",
+                            "missized_direction": None,
                         }
                     ],
-                }
+                },
+                {"vendor": "agy", "verdict": "pass", "findings": []},
+                {"vendor": "codex", "verdict": "pass", "findings": []},
             ],
+            "issue_clusters": [{
+                "prior_cluster_id": None,
+                "finding_ids": ["claude:1"],
+                "summary": "architecture contradiction",
+            }],
             "decision": {
                 "node": "design_review",
                 "outcome": "halt_for_human",

@@ -22,7 +22,6 @@ VENDOR_ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
         "--effort",                # min/low/medium/high/xhigh/max — behavior tuning
         "--max-budget-usd",        # cost cap
         "--model",                 # allow explicit CLI-level model override
-        "--no-session-persistence",
     ),
     "codex": (
         "--disable",               # feature flags off

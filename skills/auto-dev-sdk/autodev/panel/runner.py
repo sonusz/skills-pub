@@ -5,15 +5,16 @@ Flow:
      file manifest with paths + hashes for the artifact and consulted docs).
   2. Dispatch the configured reviewers (for example claude / grok / codex,
      vendors.yml panel config) in parallel.
-  3. Invoke the configured synthesizer with the three reviewer
+  3. Invoke the configured synthesizer with the responding reviewer
      outputs under a pinned synthesize.md prompt and the pinned JSON
      schema. Parse structured output.
   4. Build PanelVerdict (with per_vendor_raw audit field) and write
      panel-verdict.json atomically.
 
 Failure modes and their handling:
-  - Reviewer timeout / empty output → cache successful reviewer outputs,
-    halt with GatePending, and retry only missing reviewers on restart.
+  - Reviewer timeout / empty output → retry once, force-refresh quota, then
+    either use the configured response quorum for confirmed exhaustion or
+    cache successes and halt for unknown/non-quota failures.
   - Synthesizer timeout / non-JSON / schema-invalid output → write a
     harness-authored audit verdict and halt instead of routing a content
     revision.
@@ -24,15 +25,19 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import shlex
 import subprocess
+import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from autodev import __version__ as HARNESS_VERSION
 from autodev.artifacts.revision_state import load_state
 from autodev.artifacts.verdict import (
+    IssueCluster,
     NO_RESPONSE_PREFIX,
     PanelFinding,
     PanelVerdict,
@@ -41,6 +46,7 @@ from autodev.artifacts.verdict import (
     panel_verdict_transport_incomplete,
     write_verdict,
 )
+from autodev.artifacts.fingerprint_history import prior_cluster_catalog
 from autodev.errors import ConfigError, GatePending, QuotaHalt, SchemaError
 from autodev.panel.anchor_filter import filter_anchor_findings
 from autodev.panel.rigor_filter import (
@@ -58,6 +64,8 @@ from autodev.vendors.config import (
     PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
 )
 from autodev.vendors.fallback import build_candidates, resolve_candidate
+from autodev.vendors.quota import get_remaining as get_quota_remaining
+from autodev.vendors.session_keys import DEFAULT_SESSION_MAX_TURNS
 from autodev.vendors.shared_call import SHARED_VENDORS_DIR, call_shared_vendor
 from autodev.vendors.subprocess_runner import (
     _build_idle_callback,
@@ -108,12 +116,14 @@ DESIGN_REVIEW_GROUPS: tuple[dict, ...] = (
     },
 )
 
-# The panel gate is only valid when every configured reviewer has produced a
-# review. Missing reviewers are panel transport failures, not content
-# findings, so the harness caches successful reviewer outputs and halts until
-# the operator restarts the gate. The restart dispatches only the missing
-# reviewers.
+# Reviewer transport failures get one immediate retry. A panel may proceed with
+# its configured response quorum only when every omitted reviewer is positively
+# confirmed quota-exhausted; unknown and non-quota failures remain blocking.
+# Successful responses and quota-skip audit are cached for exact panel inputs;
+# only successful responses are reusable on a later run.
 REVIEWER_CACHE_SCHEMA_VERSION = 1
+REVIEWER_ATTEMPTS_PER_RUN = 2
+QUOTA_SKIPPED_PREFIX = "[SKIPPED: quota confirmed"
 
 DOCTOR_SCRIPT = SHARED_VENDORS_DIR / "scripts" / "doctor.sh"
 
@@ -137,12 +147,14 @@ def _finding_from_synth(vendor: str, f: dict) -> PanelFinding:
         evidence_refs=[str(x) for x in f.get("evidence_refs", [])],
         failure_class=f.get("failure_class"),
         missized_direction=f.get("missized_direction"),
+        priority=f.get("priority"),
+        finding_id=f.get("finding_id"),
     )
 
 
 def _apply_rigor_to_findings(
     findings: list[PanelFinding], *, feature_active: Path,
-) -> RigorFilterResult:
+) -> tuple[RigorFilterResult, str]:
     """Load the Assurance map (prd.md) + scope.json tolerantly and run
     the rigor filter. Any load failure degrades to the all-strict
     no-op (== current behavior), never to a crash inside verdict
@@ -166,7 +178,113 @@ def _apply_rigor_to_findings(
             scope = load_scope(scope_path)
     except Exception:
         scope = None
-    return apply_rigor_filter(findings, assurance, scope)
+    return apply_rigor_filter(findings, assurance, scope), assurance.release_threshold
+
+
+def _build_issue_clusters(
+    findings: list[PanelFinding], payload: dict, *, feature_active: Path,
+    gate: str,
+) -> list[IssueCluster]:
+    """Validate synthesizer clustering without making semantic judgments."""
+    ids = [f.finding_id for f in findings]
+    if any(not finding_id for finding_id in ids):
+        raise SchemaError("synthesizer finding missing finding_id")
+    if len(set(ids)) != len(ids):
+        raise SchemaError("synthesizer finding_id values are not unique")
+    by_id = {f.finding_id: f for f in findings}
+    raw_clusters = payload.get("issue_clusters")
+    if not isinstance(raw_clusters, list):
+        raise SchemaError("synthesizer output missing issue_clusters array")
+    prior_ids = {
+        c["cluster_id"] for c in prior_cluster_catalog(feature_active, gate)
+        if isinstance(c.get("cluster_id"), str)
+    }
+    assigned: set[str] = set()
+    reused: set[str] = set()
+    result: list[IssueCluster] = []
+    priority_rank = {"P0": 0, "P1": 1, "P2": 2}
+    for index, raw in enumerate(raw_clusters):
+        member_ids = raw.get("finding_ids") if isinstance(raw, dict) else None
+        if not isinstance(member_ids, list) or not member_ids:
+            raise SchemaError(f"issue_clusters[{index}] has no finding_ids")
+        if len(set(member_ids)) != len(member_ids):
+            raise SchemaError(f"issue_clusters[{index}] repeats a finding_id")
+        unknown = set(member_ids) - set(by_id)
+        if unknown:
+            raise SchemaError(
+                f"issue_clusters[{index}] references unknown finding ids "
+                f"{sorted(unknown)!r}"
+            )
+        duplicate = set(member_ids) & assigned
+        if duplicate:
+            raise SchemaError(
+                f"findings assigned to multiple issue clusters: {sorted(duplicate)!r}"
+            )
+        prior_id = raw.get("prior_cluster_id")
+        if prior_id is not None:
+            if prior_id not in prior_ids:
+                raise SchemaError(
+                    f"issue_clusters[{index}] reuses unknown prior cluster "
+                    f"{prior_id!r}"
+                )
+            if prior_id in reused:
+                raise SchemaError(f"prior cluster {prior_id!r} reused more than once")
+            cluster_id = prior_id
+            reused.add(prior_id)
+        else:
+            identity = json.dumps({
+                "summary": raw.get("summary", "").strip().lower(),
+                "members": sorted(member_ids),
+            }, sort_keys=True, separators=(",", ":"))
+            cluster_id = "issue-" + hashlib.sha256(
+                identity.encode("utf-8")
+            ).hexdigest()[:16]
+        members = [by_id[i] for i in member_ids]
+        priority = min(
+            (f.effective_priority() for f in members),
+            key=priority_rank.__getitem__,
+        )
+        summary = raw.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise SchemaError(f"issue_clusters[{index}] summary is empty")
+        result.append(IssueCluster(
+            cluster_id=cluster_id,
+            finding_ids=list(member_ids),
+            summary=summary.strip(),
+            priority=priority,
+        ))
+        assigned.update(member_ids)
+    missing = set(by_id) - assigned
+    if missing:
+        raise SchemaError(
+            "issue_clusters must assign every raw finding exactly once; "
+            f"missing {sorted(missing)!r}"
+        )
+    if len({c.cluster_id for c in result}) != len(result):
+        raise SchemaError("issue cluster IDs are not unique")
+    return result
+
+
+def _trim_issue_clusters(
+    clusters: list[IssueCluster], findings: list[PanelFinding],
+) -> list[IssueCluster]:
+    """Remove anchor-dropped members while retaining validated grouping."""
+    by_id = {f.finding_id: f for f in findings if f.finding_id}
+    rank = {"P0": 0, "P1": 1, "P2": 2}
+    trimmed: list[IssueCluster] = []
+    for cluster in clusters:
+        member_ids = [i for i in cluster.finding_ids if i in by_id]
+        if not member_ids:
+            continue
+        priority = min(
+            (by_id[i].effective_priority() for i in member_ids),
+            key=rank.__getitem__,
+        )
+        trimmed.append(IssueCluster(
+            cluster_id=cluster.cluster_id, finding_ids=member_ids,
+            summary=cluster.summary, priority=priority,
+        ))
+    return trimmed
 
 
 def _doctor_hint() -> str:
@@ -187,6 +305,10 @@ class ReviewerResult:
     output: str
     elapsed_sec: float
     failure_detail: str = ""
+    attempt_count: int = 1
+    failure_history: tuple[str, ...] = ()
+    quota_skipped: bool = False
+    quota_confirmation: dict | None = None
 
 
 def review_prompt_path(gate: str) -> Path:
@@ -224,17 +346,26 @@ def _reviewer_cache_metadata(
     prompt_file_for_audit: Path,
     reviewer_prompt: str,
     consulted_docs: list[dict],
+    round_type: str = "coverage",
+    source_hash: str | None = None,
 ) -> dict:
+    # round_type separates cache identities of a coverage round and a
+    # budget round over the SAME packet — the coverage/budget cadence
+    # runs both on one unchanged packet, and a budget round must never be
+    # served the coverage round's cached reviews. source_hash may be
+    # passed in to reuse a hash already computed for the round decision
+    # (a second read could diverge if the packet were rewritten between).
     return {
         "kind": "panel-reviewer-cache",
         "schema_version": REVIEWER_CACHE_SCHEMA_VERSION,
         "gate": gate_label,
         "source": str(primary_artifact),
-        "source_hash": hash_file(primary_artifact),
+        "source_hash": source_hash or hash_file(primary_artifact),
         "prompt_file": str(prompt_file_for_audit),
         "prompt_hash": hash_file(prompt_file_for_audit),
         "reviewer_prompt_hash": _hash_text(reviewer_prompt),
         "consulted_docs": consulted_docs,
+        "round_type": round_type,
     }
 
 
@@ -252,7 +383,13 @@ def _cache_matches(payload: dict, metadata: dict) -> bool:
     ):
         if payload.get(key) != metadata.get(key):
             return False
-    return True
+    # Compared with a default: every cache written before round types
+    # existed was a coverage round, and strict equality would discard all
+    # pre-upgrade caches of in-flight rounds (a full reviewer re-run each).
+    return (
+        payload.get("round_type", "coverage")
+        == metadata.get("round_type", "coverage")
+    )
 
 
 def _load_reviewer_cache(
@@ -262,11 +399,11 @@ def _load_reviewer_cache(
     reviewer_specs: tuple[PanelReviewerSpec, ...],
     metadata: dict,
 ) -> tuple[list[ReviewerResult], dict[str, dict]]:
-    """Load reusable successful reviewer outputs for this exact panel input.
+    """Load reusable successful reviewer slots for this exact panel input.
 
-    Returns (cached_results, failure_audit). Failure audit is only for
-    preserving diagnostics in the next cache write; failed reviewers are never
-    reused.
+    Failures and quota skips remain audit-only and are retried on the next run.
+    In particular, a quota skip cannot stay settled after ``quota-resume`` has
+    confirmed recovery.
     """
     path = _reviewer_cache_path(feature_active, gate_label)
     payload: dict = {}
@@ -305,6 +442,8 @@ def _load_reviewer_cache(
                     ok=True,
                     output=output.strip(),
                     elapsed_sec=float(entry.get("elapsed_sec") or 0.0),
+                    attempt_count=int(entry.get("attempt_count") or 1),
+                    failure_history=tuple(entry.get("failure_history") or ()),
                 )
             )
 
@@ -377,6 +516,7 @@ def _write_reviewer_cache(
 ) -> None:
     specs_by_vendor = {spec.vendor: spec for spec in reviewer_specs}
     reviewers: dict[str, dict] = {}
+    quota_skipped: dict[str, dict] = {}
     failures: dict[str, dict] = {}
     now = datetime.now(timezone.utc).isoformat()
     for result in reviewer_results:
@@ -389,6 +529,19 @@ def _write_reviewer_cache(
                 "model": spec.model,
                 "output": result.output.strip(),
                 "elapsed_sec": result.elapsed_sec,
+                "attempt_count": result.attempt_count,
+                "failure_history": list(result.failure_history),
+                "run_ts": now,
+            }
+        elif result.quota_skipped and result.quota_confirmation:
+            quota_skipped[result.vendor] = {
+                "vendor": result.vendor,
+                "model": spec.model,
+                "failure_detail": result.failure_detail,
+                "elapsed_sec": result.elapsed_sec,
+                "attempt_count": result.attempt_count,
+                "failure_history": list(result.failure_history),
+                "quota_confirmation": result.quota_confirmation,
                 "run_ts": now,
             }
         else:
@@ -397,14 +550,25 @@ def _write_reviewer_cache(
                 "model": spec.model,
                 "failure_detail": result.failure_detail,
                 "elapsed_sec": result.elapsed_sec,
+                "attempt_count": result.attempt_count,
+                "failure_history": list(result.failure_history),
                 "run_ts": now,
             }
     for vendor, failure in prior_failures.items():
-        if vendor not in failures and vendor not in reviewers:
+        if (
+            vendor not in failures
+            and vendor not in reviewers
+            and vendor not in quota_skipped
+        ):
             failures[vendor] = failure
     atomic_write_json(
         _reviewer_cache_path(feature_active, gate_label),
-        {**metadata, "reviewers": reviewers, "failures": failures},
+        {
+            **metadata,
+            "reviewers": reviewers,
+            "quota_skipped": quota_skipped,
+            "failures": failures,
+        },
     )
 
 
@@ -412,8 +576,12 @@ def _missing_reviewers(
     reviewer_specs: tuple[PanelReviewerSpec, ...],
     reviewer_results: list[ReviewerResult],
 ) -> list[PanelReviewerSpec]:
-    ok_vendors = {r.vendor for r in reviewer_results if r.ok and r.output.strip()}
-    return [spec for spec in reviewer_specs if spec.vendor not in ok_vendors]
+    settled_vendors = {
+        r.vendor
+        for r in reviewer_results
+        if (r.ok and r.output.strip()) or r.quota_skipped
+    }
+    return [spec for spec in reviewer_specs if spec.vendor not in settled_vendors]
 
 
 def _panel_incomplete_message(
@@ -421,19 +589,23 @@ def _panel_incomplete_message(
     gate_label: str,
     reviewer_specs: tuple[PanelReviewerSpec, ...],
     reviewer_results: list[ReviewerResult],
+    min_responding_reviewers: int,
 ) -> str:
     ok_vendors = [r.vendor for r in reviewer_results if r.ok and r.output.strip()]
     missing = _missing_reviewers(reviewer_specs, reviewer_results)
+    quota_skipped = [r.vendor for r in reviewer_results if r.quota_skipped]
     details = {
         r.vendor: r.failure_detail
         for r in reviewer_results
         if not r.ok and r.failure_detail
     }
     return (
-        f"panel {gate_label} incomplete: {len(ok_vendors)} of "
-        f"{len(reviewer_specs)} reviewers responded; missing "
-        f"{[m.vendor for m in missing]!r}. Successful reviewers are cached; "
-        "restart the run to retry only the missing reviewer(s). "
+        f"panel {gate_label} incomplete: {len(ok_vendors)} reviewers responded "
+        f"(quorum={min_responding_reviewers}, configured={len(reviewer_specs)}); "
+        f"unsettled={[m.vendor for m in missing]!r}; "
+        f"quota_skipped={quota_skipped!r}. Each unsettled reviewer was retried "
+        f"at least once in this run. Successful reviewers are cached; restart "
+        "the run to retry only unsettled reviewer(s). "
         f"Debug: {_doctor_hint()}. Details: {details!r}"
     )
 
@@ -445,23 +617,99 @@ def _file_ref_line(*, label: str, path: Path, hash_value: str | None = None) -> 
     return f"- {label}: `{path}` hash=`{h}` size_bytes={size}"
 
 
+def _design_revision_delta_block(
+    *, gate: str, feature_active: Path | None, repo_root: Path | None,
+) -> str:
+    """Render package Git refs as revision-navigation input for reviewers."""
+    if (
+        gate not in {"design-review", "trace-review"}
+        or feature_active is None
+        or repo_root is None
+    ):
+        return ""
+    from autodev.artifacts.design_package_history import (
+        latest_design_revision_refs,
+    )
+
+    revision = latest_design_revision_refs(feature_active)
+    if revision is None:
+        return ""
+    current_ref = revision["current_ref"]
+    previous_ref = revision["previous_ref"]
+    out = "\n## Design revision delta\n\n"
+    out += f"- CURRENT_DESIGN_PACKAGE: `{revision['current_package']}`\n"
+    out += f"- CURRENT_DESIGN_REF: `{current_ref}`\n"
+    if not previous_ref:
+        out += "- PREVIOUS_DESIGN_REF: `(none — initial package)`\n"
+        return out
+
+    out += f"- PREVIOUS_DESIGN_REF: `{previous_ref}`\n"
+    active_rel = feature_active.resolve().relative_to(repo_root.resolve())
+    names = (
+        ("design.md", "scope.json", "design-changelog.json")
+        if gate == "design-review"
+        else ("trace.md", "test-plan.md", "design-changelog.json")
+    )
+    paths = [(active_rel / name).as_posix() for name in names]
+    base = [
+        "git", "-C", str(repo_root), "diff", "--no-ext-diff",
+        "--find-renames", str(previous_ref), str(current_ref), "--",
+        *paths,
+    ]
+    stat = base[:4] + ["--stat", *base[4:]]
+    out += f"- DIFF_STAT_COMMAND: `{shlex.join(stat)}`\n"
+    out += f"- DIFF_COMMAND: `{shlex.join(base)}`\n"
+    out += (
+        "\nRead the revision diff first. Use it to navigate to the changed "
+        "current sections, then inspect enough unchanged current context to "
+        "check cross-section consistency. The diff is navigation evidence, "
+        "not a substitute for judging the authoritative current files.\n"
+    )
+    return out
+
+
 def _compose_reviewer_prompt(
     *, gate: str, artifact_path: Path, consulted_docs: list[dict],
     feature_active: Path | None = None, repo_root: Path | None = None,
+    continuation: bool = False,
 ) -> str:
-    """Build the full prompt sent to each reviewer.
+    """Build an initial or continuation prompt sent to each reviewer.
 
     Large review inputs are passed by file reference, not inlined. The
     verdict records the same paths + hashes, so the harness can invalidate
     stale panel results without relying on prompt-sized document snapshots.
     """
-    prompt_text = review_prompt_path(gate).read_text(encoding="utf-8")
+    if continuation:
+        prompt_text = (
+            f"# Continue the existing `{gate}` reviewer session\n\n"
+            "Keep the review role, severity rules, output contract, and "
+            "independence established by the initial turn. Re-read the "
+            "referenced files: their current hashes and contents are "
+            "authoritative. Review the current revision afresh, retain "
+            "unresolved findings, and do not repeat findings that the files "
+            "now resolve. If REVIEW_PROMPT_HASH changed, re-read "
+            "REVIEW_PROMPT_FILE before judging. Return a complete reviewer "
+            "response for this turn. When a Design revision delta is provided "
+            "below, use it before re-reading affected current sections; do not "
+            "spend context re-reading unchanged files wholesale unless needed "
+            "to validate a cross-section invariant."
+        )
+    else:
+        prompt_text = review_prompt_path(gate).read_text(encoding="utf-8")
     prompt_text += "\n\n---\n\n## Orchestrator context\n\n"
     if feature_active is not None:
         prompt_text += f"- FEATURE_ACTIVE: `{feature_active}`\n"
     if repo_root is not None:
         prompt_text += f"- REPO_ROOT: `{repo_root}`\n"
     prompt_text += f"- GATE: `{gate}`\n"
+    prompt_file = review_prompt_path(gate)
+    prompt_text += f"- REVIEW_PROMPT_FILE: `{prompt_file}`\n"
+    prompt_text += f"- REVIEW_PROMPT_HASH: `{hash_file(prompt_file)}`\n"
+    prompt_text += _design_revision_delta_block(
+        gate=gate,
+        feature_active=feature_active,
+        repo_root=repo_root,
+    )
     prompt_text += "\n## Required file inputs\n\n"
     prompt_text += (
         "The files you must judge are listed below as paths (with hash and "
@@ -491,6 +739,9 @@ def _invoke_reviewer(
     feature_active: Path | None = None,
     probe_config: ProbeConfig | None = None,
     log_emit: Callable[[dict], None] | None = None,
+    session_key: str | None = None,
+    resume_prompt: str | None = None,
+    force_quota: bool = False,
 ) -> ReviewerResult:
     """Run one reviewer CLI. Captures stdout; empty on failure.
 
@@ -517,6 +768,7 @@ def _invoke_reviewer(
             logger=(lambda m: log_emit({"event": "quota", "role": "reviewer", "msg": m}))
             if log_emit
             else None,
+            force=force_quota,
         )
         spec = PanelReviewerSpec(
             vendor=_cand.vendor, model=_cand.model, effort=_cand.effort
@@ -572,7 +824,21 @@ def _invoke_reviewer(
                     if feature_active is not None else None
                 ),
                 process_label=f"panel-reviewer:{spec.vendor}",
+                session_key=session_key,
+                session_max_turns=(
+                    DEFAULT_SESSION_MAX_TURNS
+                    if session_key is not None else None
+                ),
+                resume_prompt=resume_prompt,
             )
+            if getattr(result, "session_auto_reset", False) and log_emit is not None:
+                log_emit({
+                    "event": "session-auto-reset",
+                    "role": "reviewer",
+                    "vendor": spec.vendor,
+                    "turn": getattr(result, "session_turn", None),
+                    "max_turns": getattr(result, "session_max_turns", None),
+                })
             elapsed = time.monotonic() - t0
             if result.returncode != 0:
                 detail = (
@@ -627,15 +893,442 @@ def _invoke_reviewer(
         )
 
 
+def _quota_halt_confirmation(exc: QuotaHalt) -> dict:
+    """Turn a quota preflight halt into a positive/unknown audit record."""
+    diagnostics = [d for d in exc.diagnostics if isinstance(d, dict)]
+    confirmed = bool(diagnostics) and all(
+        isinstance(d.get("remaining_pct"), (int, float))
+        and not isinstance(d.get("remaining_pct"), bool)
+        and isinstance(d.get("min_quota_pct"), (int, float))
+        and not isinstance(d.get("min_quota_pct"), bool)
+        and float(d["remaining_pct"]) < float(d["min_quota_pct"])
+        for d in diagnostics
+    )
+    return {
+        "confirmed": confirmed,
+        "source": "quota-preflight",
+        "diagnostics": diagnostics,
+        "resume_at": exc.resume_at.isoformat() if exc.resume_at else None,
+    }
+
+
+def _quota_floor_for_result(
+    spec: PanelReviewerSpec, result: ReviewerResult,
+) -> float:
+    """Return the configured floor for the candidate that actually ran."""
+    for candidate in build_candidates(spec):
+        if candidate.vendor == result.vendor and candidate.model == result.model:
+            return float(candidate.min_quota_pct or 0.0)
+    return float(spec.min_quota_pct or 0.0)
+
+
+def _confirm_quota_after_failures(
+    spec: PanelReviewerSpec, result: ReviewerResult,
+) -> dict:
+    """Force-refresh quota after a real retry; unknown never means confirmed."""
+    configured_floor = _quota_floor_for_result(spec, result)
+    # Ungated reviewers still need a positive recovery threshold in a quota
+    # pause record; otherwise 0% would satisfy ``remaining >= 0`` immediately.
+    recovery_floor = configured_floor if configured_floor > 0.0 else 0.000001
+    quota = get_quota_remaining(result.vendor, result.model, force=True)
+    remaining = quota.remaining_pct
+    confirmed = remaining is not None and float(remaining) < recovery_floor
+    return {
+        "confirmed": confirmed,
+        "source": "post-retry-quota-refresh",
+        "vendor": result.vendor,
+        "model": result.model,
+        "remaining_pct": remaining,
+        "min_quota_pct": recovery_floor,
+        "configured_min_quota_pct": configured_floor,
+        "resets_at": quota.resets_at.isoformat() if quota.resets_at else None,
+        "fetched_at": quota.fetched_at.isoformat(),
+        "detail": quota.detail,
+        "error": quota.error,
+    }
+
+
+def _prior_failure_audit(prior_failure: dict | None) -> tuple[int, list[str]]:
+    if not prior_failure:
+        return 0, []
+    raw_count = prior_failure.get("attempt_count", 1)
+    count = raw_count if isinstance(raw_count, int) and raw_count >= 0 else 1
+    history = prior_failure.get("failure_history")
+    if isinstance(history, list):
+        return count, [str(item) for item in history]
+    detail = prior_failure.get("failure_detail")
+    return count, [str(detail)] if detail else []
+
+
+def _invoke_reviewer_with_retry(
+    spec: PanelReviewerSpec,
+    prompt: str,
+    probe_interval_sec: int,
+    *,
+    prior_failure: dict | None = None,
+    cwd: Path | None = None,
+    feature_active: Path | None = None,
+    probe_config: ProbeConfig | None = None,
+    log_emit: Callable[[dict], None] | None = None,
+    session_key: str | None = None,
+    resume_prompt: str | None = None,
+) -> ReviewerResult:
+    """Try a reviewer twice, then omit it only on confirmed quota exhaustion."""
+    prior_attempts, history = _prior_failure_audit(prior_failure)
+    elapsed = 0.0
+    last_result: ReviewerResult | None = None
+
+    for attempt in range(1, REVIEWER_ATTEMPTS_PER_RUN + 1):
+        try:
+            result = _invoke_reviewer(
+                spec,
+                prompt,
+                probe_interval_sec,
+                cwd=cwd,
+                feature_active=feature_active,
+                probe_config=probe_config,
+                log_emit=log_emit,
+                session_key=session_key,
+                resume_prompt=resume_prompt,
+                force_quota=attempt > 1,
+            )
+        except QuotaHalt as exc:
+            confirmation = _quota_halt_confirmation(exc)
+            history.append(
+                f"attempt {attempt}: quota preflight halted "
+                f"(confirmed={confirmation['confirmed']})"
+            )
+            if (
+                confirmation["confirmed"]
+                and attempt == REVIEWER_ATTEMPTS_PER_RUN
+            ):
+                return ReviewerResult(
+                    vendor=spec.vendor,
+                    model=spec.model,
+                    ok=False,
+                    output="",
+                    elapsed_sec=elapsed,
+                    failure_detail="quota exhausted before reviewer launch",
+                    attempt_count=prior_attempts + attempt,
+                    failure_history=tuple(history),
+                    quota_skipped=True,
+                    quota_confirmation=confirmation,
+                )
+            if attempt < REVIEWER_ATTEMPTS_PER_RUN:
+                continue
+            return ReviewerResult(
+                vendor=spec.vendor,
+                model=spec.model,
+                ok=False,
+                output="",
+                elapsed_sec=elapsed,
+                failure_detail=(
+                    "reviewer quota could not be positively confirmed; "
+                    "quota remained unknown after retry"
+                ),
+                attempt_count=prior_attempts + attempt,
+                failure_history=tuple(history),
+            )
+
+        elapsed += result.elapsed_sec
+        if result.ok and result.output.strip():
+            result.elapsed_sec = elapsed
+            result.attempt_count = prior_attempts + attempt
+            result.failure_history = tuple(history)
+            return result
+
+        last_result = result
+        history.append(f"attempt {attempt}: {result.failure_detail or 'no output'}")
+        if attempt < REVIEWER_ATTEMPTS_PER_RUN:
+            continue
+
+    assert last_result is not None
+    confirmation = _confirm_quota_after_failures(spec, last_result)
+    return ReviewerResult(
+        vendor=last_result.vendor,
+        model=last_result.model,
+        ok=False,
+        output="",
+        elapsed_sec=elapsed,
+        failure_detail=last_result.failure_detail,
+        attempt_count=prior_attempts + REVIEWER_ATTEMPTS_PER_RUN,
+        failure_history=tuple(history),
+        quota_skipped=bool(confirmation["confirmed"]),
+        quota_confirmation=confirmation,
+    )
+
+
+def _reviewer_session_key_for_spec(
+    *,
+    feature_active: Path,
+    gate: str,
+    reviewer_specs: Sequence[PanelReviewerSpec],
+    spec: PanelReviewerSpec,
+) -> str:
+    """Return the stable session key for a configured reviewer slot."""
+
+    from autodev.vendors.session_keys import reviewer_session_key
+
+    for slot, configured in enumerate(reviewer_specs):
+        if configured == spec:
+            return reviewer_session_key(
+                feature_active,
+                gate=gate,
+                slot=slot,
+                configured_vendor=configured.vendor,
+                configured_model=configured.model,
+            )
+    raise ValueError(f"reviewer spec is not present in panel config: {spec!r}")
+
+
+def _design_round_plan(
+    *,
+    feature_active: Path,
+    panel_config: PanelConfig,
+    round_key: str,
+    base_prompt: str,
+    base_resume_prompt: str,
+    gate_label: str,
+    log_emit: Callable[[dict], None] | None,
+) -> tuple[str, dict[str, tuple[str, str]] | None]:
+    """Resolve this design-review round's type and prompt overrides.
+
+    Coverage and budget (minimality) rounds follow the six-round cadence; the gate
+    completes only when both types have passed on the same packet (see
+    autodev.budget.design_phase — replayed from log events, no state
+    file). "complete" should not reach dispatch (freshness checks accept
+    the gate first); it degrades to a coverage round. On a budget round
+    every reviewer's prompt replaces the coverage body with the
+    minimality body, keeping the shared orchestrator context and file
+    manifest; the resume prompt keeps the role-agnostic continuation
+    preamble plus the body. Any failure degrades to a coverage round —
+    the panel must never be blocked by this mechanism.
+    """
+    try:
+        from autodev.budget import design_phase, minimality_review_body
+
+        round_type = design_phase(feature_active, round_key)
+        if round_type != "budget":
+            return "coverage", None
+        if log_emit is not None:
+            try:
+                log_emit({
+                    "event": "budget-round",
+                    "stage": "gate",
+                    "gate": gate_label,
+                    "round_key": round_key,
+                })
+            except Exception:
+                pass
+        body = minimality_review_body(feature_active)
+        marker = "\n\n---\n\n## Orchestrator context"
+        cut = base_prompt.find(marker)
+        context_part = base_prompt[cut:] if cut >= 0 else ""
+        initial = body + context_part
+        resume = base_resume_prompt + "\n\n---\n\n" + body
+        return "budget", {
+            spec.vendor: (initial, resume)
+            for spec in panel_config.reviewers
+        }
+    except Exception:
+        return "coverage", None
+
+
+def _dispatch_reviewer_slots(
+    *,
+    gate_label: str,
+    reviewer_prompt: str,
+    reviewer_resume_prompt: str,
+    reviewer_results: list[ReviewerResult],
+    prior_failures: dict[str, dict],
+    panel_config: PanelConfig,
+    feature_active: Path,
+    vendor_cwd: Path,
+    probe_config: ProbeConfig | None,
+    log_emit: Callable[[dict], None] | None,
+    per_vendor_prompts: dict[str, tuple[str, str]] | None = None,
+) -> None:
+    """Dispatch unsettled slots in parallel; each slot owns its retry.
+
+    ``per_vendor_prompts`` maps a vendor to its own ``(prompt,
+    resume_prompt)`` pair, REPLACING the shared prompts for that vendor
+    (shrink rounds hand every reviewer a dedicated minimality-review
+    prompt, not the coverage prompt plus an addendum). It is
+    deliberately excluded from the reviewer-cache metadata hash: the
+    round's cache identity is the shared base prompt, and the shrink
+    cadence is round-key-stable, so a resumed round re-issues the same
+    role.
+    """
+    to_run = _missing_reviewers(panel_config.reviewers, reviewer_results)
+    if not to_run:
+        return
+    overrides = per_vendor_prompts or {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(len(to_run), 1),
+        thread_name_prefix=f"panel-{gate_label}",
+    ) as pool:
+        futures = [
+            pool.submit(
+                _invoke_reviewer_with_retry,
+                spec,
+                overrides.get(spec.vendor, (reviewer_prompt, ""))[0],
+                panel_config.reviewer_probe_interval_sec,
+                prior_failure=prior_failures.get(spec.vendor),
+                cwd=vendor_cwd,
+                feature_active=feature_active,
+                probe_config=probe_config,
+                log_emit=log_emit,
+                session_key=_reviewer_session_key_for_spec(
+                    feature_active=feature_active,
+                    gate=gate_label,
+                    reviewer_specs=panel_config.reviewers,
+                    spec=spec,
+                ),
+                resume_prompt=overrides.get(
+                    spec.vendor, ("", reviewer_resume_prompt),
+                )[1],
+            )
+            for spec in to_run
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            reviewer_results.append(result)
+            # Panel calls never pass through the stage-subprocess path, so
+            # they would otherwise be invisible to budget metering
+            # (autodev.budget reads these events back from log.jsonl).
+            # elapsed_sec is accumulated only by real _invoke_reviewer
+            # attempts — a preflight quota skip carries 0 and drops out
+            # here, while a skip confirmed AFTER failed attempts keeps the
+            # genuine attempt time and is metered.
+            if log_emit is not None and result.elapsed_sec > 0:
+                try:
+                    log_emit({
+                        "event": "panel-vendor-elapsed",
+                        "stage": "gate",
+                        "gate": gate_label,
+                        "role": "reviewer",
+                        "vendor": result.vendor,
+                        "elapsed_sec": result.elapsed_sec,
+                    })
+                except Exception:
+                    pass
+
+
+def _quota_skip_raw(result: ReviewerResult) -> str:
+    confirmation = result.quota_confirmation or {}
+    source = confirmation.get("source", "quota-check")
+    return (
+        f"{QUOTA_SKIPPED_PREFIX} after {result.attempt_count} dispatch "
+        f"attempt(s); source={source}]"
+    )
+
+
+def _per_vendor_raw(reviewer_results: list[ReviewerResult]) -> dict[str, str]:
+    raw = {r.vendor: r.output for r in reviewer_results if r.ok}
+    for result in reviewer_results:
+        if result.quota_skipped:
+            raw[result.vendor] = _quota_skip_raw(result)
+        elif not result.ok:
+            raw[result.vendor] = (
+                f"{NO_RESPONSE_PREFIX} — {result.failure_detail}]"
+            )
+    return raw
+
+
+def _quota_halt_from_skips(
+    gate_label: str, skipped: list[ReviewerResult],
+) -> QuotaHalt:
+    diagnostics: list[dict] = []
+    reset_times: list[datetime] = []
+    for result in skipped:
+        confirmation = result.quota_confirmation or {}
+        nested = confirmation.get("diagnostics")
+        if isinstance(nested, list):
+            diagnostics.extend(d for d in nested if isinstance(d, dict))
+        else:
+            diagnostics.append({
+                "vendor": result.vendor,
+                "model": result.model,
+                "min_quota_pct": confirmation.get("min_quota_pct", 0.0),
+                "remaining_pct": confirmation.get("remaining_pct"),
+                "resets_at": confirmation.get("resets_at"),
+                "error": confirmation.get("error"),
+            })
+        for value in (
+            confirmation.get("resume_at"), confirmation.get("resets_at"),
+        ):
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                reset_times.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                pass
+    return QuotaHalt(
+        role=f"panel-reviewers:{gate_label}",
+        diagnostics=diagnostics,
+        resume_at=min(reset_times) if reset_times else None,
+    )
+
+
+def _require_panel_quorum(
+    *,
+    gate_label: str,
+    reviewer_results: list[ReviewerResult],
+    panel_config: PanelConfig,
+    log_emit: Callable[[dict], None] | None,
+) -> None:
+    responded = [
+        r for r in reviewer_results if r.ok and r.output.strip()
+    ]
+    skipped = [r for r in reviewer_results if r.quota_skipped]
+    missing = _missing_reviewers(panel_config.reviewers, reviewer_results)
+    if missing:
+        if log_emit is not None:
+            log_emit({
+                "event": "panel-incomplete",
+                "stage": "gate",
+                "gate": gate_label,
+                "responded": len(responded),
+                "quorum": panel_config.min_responding_reviewers,
+                "missing_reviewers": [spec.vendor for spec in missing],
+            })
+        raise GatePending(
+            f"panel-{gate_label}",
+            _panel_incomplete_message(
+                gate_label=gate_label,
+                reviewer_specs=panel_config.reviewers,
+                reviewer_results=reviewer_results,
+                min_responding_reviewers=panel_config.min_responding_reviewers,
+            ),
+        )
+    if len(responded) < panel_config.min_responding_reviewers:
+        # Every absent slot is positively quota-confirmed, but the transport
+        # quorum is still not met. Preserve quota-pause semantics so the
+        # orchestrator can resume after a reset instead of asking for content
+        # changes or treating this as a manual panel failure.
+        raise _quota_halt_from_skips(gate_label, skipped)
+    if skipped and log_emit is not None:
+        log_emit({
+            "event": "panel-quorum",
+            "stage": "gate",
+            "gate": gate_label,
+            "responded": len(responded),
+            "quorum": panel_config.min_responding_reviewers,
+            "quota_skipped_reviewers": [r.vendor for r in skipped],
+        })
+
+
 def _compose_synthesizer_prompt(
     *, gate: str, artifact_path: Path, reviewer_results: list[ReviewerResult],
     feature_active: Path | None = None,
 ) -> str:
     """Build the prompt for the synthesizer given reviewer outputs."""
-    del feature_active  # retained for call-site compatibility
     base = synthesize_prompt_path().read_text(encoding="utf-8")
     responded = [r.vendor for r in reviewer_results if r.ok]
-    missing = [r.vendor for r in reviewer_results if not r.ok]
+    quota_skipped = [r.vendor for r in reviewer_results if r.quota_skipped]
+    missing = [
+        r.vendor for r in reviewer_results if not r.ok and not r.quota_skipped
+    ]
 
     out = base + "\n\n---\n\n"
     out += f"## Context for this synthesis\n\n"
@@ -646,14 +1339,32 @@ def _compose_synthesizer_prompt(
     out += f"- **Reviewers who responded**: {', '.join(responded) if responded else '(none)'}\n"
     if missing:
         out += f"- **Reviewers who did NOT respond**: {', '.join(missing)}\n"
+    if quota_skipped:
+        out += (
+            "- **Reviewers omitted after retry + confirmed quota exhaustion**: "
+            f"{', '.join(quota_skipped)}\n"
+        )
+    catalog: list[dict] = []
+    if feature_active is not None:
+        catalog = prior_cluster_catalog(feature_active, gate)
+    out += "\n## Prior semantic issue clusters\n\n"
+    if catalog:
+        out += (
+            "Reuse a `cluster_id` below only when a current finding is the "
+            "same underlying issue. Otherwise use null.\n\n```json\n"
+            + json.dumps(catalog, sort_keys=True, indent=2)
+            + "\n```\n"
+        )
+    else:
+        out += "No prior clusters exist for this gate; use null for every prior_cluster_id.\n"
     out += (
-        "\nThe synthesizer is an extractor, not a reviewer. Do not re-review "
-        "the artifact and do not add findings absent from reviewer outputs.\n"
+        "\nThe synthesizer extracts and clusters; it is not a reviewer. Do not "
+        "re-review the artifact and do not add or drop findings.\n"
     )
     for r in reviewer_results:
         if r.ok:
             out += f"### Reviewer: {r.vendor} ({r.model})\n\n{r.output}\n\n"
-        else:
+        elif not r.quota_skipped:
             out += f"### Reviewer: {r.vendor} — NO RESPONSE ({r.failure_detail})\n\n"
     return out
 
@@ -759,6 +1470,7 @@ def _invoke_synthesizer(
             if probe_config is not None
             else probe_interval_sec
         )
+        synth_started = time.monotonic()
         result = call_shared_vendor(
             vendor=spec.vendor,
             model=spec.model,
@@ -776,6 +1488,19 @@ def _invoke_synthesizer(
             ),
             process_label=f"panel-synthesizer:{spec.vendor}",
         )
+        if log_emit is not None:
+            # Synthesizer spend is metered the same way as reviewer spend
+            # (autodev.budget reads these events back from log.jsonl).
+            try:
+                log_emit({
+                    "event": "panel-vendor-elapsed",
+                    "stage": "gate",
+                    "role": "synthesizer",
+                    "vendor": spec.vendor,
+                    "elapsed_sec": time.monotonic() - synth_started,
+                })
+            except Exception:
+                pass
         if result.returncode != 0:
             if result.timed_out:
                 return False, None, f"timeout after {timeout_sec}s"
@@ -999,6 +1724,7 @@ def _synthesize_and_build_verdict(
     vendor_cwd: Path,
     probe_config: ProbeConfig | None,
     log_emit: Callable[[dict], None] | None,
+    round_type: str = "coverage",
 ) -> tuple[PanelVerdict, Path, str | None]:
     """Run the synthesizer for a single reviewer group and build the
     PanelVerdict. Returns (verdict, output_path, synth_infra_error_or_None).
@@ -1025,32 +1751,60 @@ def _synthesize_and_build_verdict(
     )
 
     findings: list[PanelFinding] = []
+    issue_clusters: list[IssueCluster] = []
     coverage_map: dict[str, list[dict]] = {}
     decision: ReviewDecision | None = None
     synth_infra_error: str | None = None
     if synth_ok and synth_parsed:
-        per_reviewer = synth_parsed.get("per_reviewer", [])
-        per_vendor_verdicts: list[str] = []
-        for entry in per_reviewer:
-            vendor = entry.get("vendor", "unknown")
-            per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
-            if entry.get("coverage"):
-                coverage_map[vendor] = list(entry.get("coverage", []))
-            for f in entry.get("findings", []):
-                findings.append(_finding_from_synth(vendor, f))
-        if gate_label == "design-review" and isinstance(synth_parsed.get("decision"), dict):
-            decision = _normalize_design_review_decision(
-                feature_active=feature_active,
-                decision_payload=synth_parsed["decision"],
-                findings=findings,
+        try:
+            per_reviewer = synth_parsed.get("per_reviewer", [])
+            expected_reviewers = Counter(
+                r.vendor for r in reviewer_results if r.ok
             )
-            verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
-        else:
+            actual_reviewers = Counter(
+                entry.get("vendor") for entry in per_reviewer
+                if isinstance(entry, dict)
+            )
+            if actual_reviewers != expected_reviewers:
+                raise SchemaError(
+                    "synthesizer per_reviewer must exactly match responding "
+                    f"reviewers: expected {dict(expected_reviewers)!r}, "
+                    f"got {dict(actual_reviewers)!r}"
+                )
+            per_vendor_verdicts: list[str] = []
+            for entry in per_reviewer:
+                vendor = entry.get("vendor", "unknown")
+                per_vendor_verdicts.append(entry.get("verdict", "needs_revision"))
+                if entry.get("coverage"):
+                    coverage_map[vendor] = list(entry.get("coverage", []))
+                for f in entry.get("findings", []):
+                    findings.append(_finding_from_synth(vendor, f))
+            issue_clusters = _build_issue_clusters(
+                findings, synth_parsed, feature_active=feature_active,
+                gate=gate_label,
+            )
             verdict_str = _derive_overall_verdict(per_vendor_verdicts)
-    else:
+        except (SchemaError, TypeError, ValueError) as exc:
+            synth_ok = False
+            synth_detail = f"invalid synthesized issue structure: {exc}"
+            findings = []
+            issue_clusters = []
+            coverage_map = {}
+            decision = None
+    if (synth_ok and synth_parsed and gate_label == "design-review"
+            and isinstance(synth_parsed.get("decision"), dict)):
+        decision = _normalize_design_review_decision(
+            feature_active=feature_active,
+            decision_payload=synth_parsed["decision"],
+            findings=findings,
+        )
+        verdict_str = _decision_outcome_to_legacy_verdict(decision.outcome)
+    if not synth_ok or not synth_parsed:
         findings = [
             PanelFinding(
                 severity="invariant_violation",
+                priority="P0",
+                finding_id="harness:synthesizer-failed",
                 vendor="harness",
                 summary=(
                     f"synthesizer_failed: {synth_detail[:300]}. The "
@@ -1074,6 +1828,7 @@ def _synthesize_and_build_verdict(
     kept_findings, dropped = filter_anchor_findings(
         findings, warn=warnings.append,
     )
+    issue_clusters = _trim_issue_clusters(issue_clusters, kept_findings)
     if decision is not None:
         _validate_design_review_targets(kept_findings + [  # keep invariant after audit-only filtering
             PanelFinding(
@@ -1095,7 +1850,8 @@ def _synthesize_and_build_verdict(
     # `severity_reported`. No-op when the PRD has no Assurance section
     # (all-strict default == pre-rigor behavior).
     decision_overridden_by_rigor: dict | None = None
-    rigor_result = _apply_rigor_to_findings(
+    decision_overridden_by_policy: dict | None = None
+    rigor_result, release_threshold = _apply_rigor_to_findings(
         kept_findings, feature_active=feature_active,
     )
     for e in rigor_result.events:
@@ -1111,18 +1867,55 @@ def _synthesize_and_build_verdict(
 
     if synth_ok and synth_parsed and decision is None:
         verdict_str = (
-            "needs_revision" if has_effective_blocking(kept_findings)
+            "needs_revision" if has_effective_blocking(
+                kept_findings, release_threshold,
+            )
             else "pass"
         )
-    elif decision is not None and rigor_result.downgraded:
-        # Decision reconciliation: blocking must stay a deterministic
-        # function of effective severities. If the canonical decision
-        # said retry_design but nothing effectively blocks after the
-        # filter, override to pass (audited). halt_for_human is NEVER
-        # overridden — fail closed toward human attention.
-        if (decision.outcome == "retry_design"
-                and not has_effective_blocking(kept_findings)):
-            decision_overridden_by_rigor = decision.to_dict()
+    elif decision is not None:
+        blocks = has_effective_blocking(kept_findings, release_threshold)
+        # A canonical decision cannot bypass explicit release policy. The
+        # original decision remains in the audit fields. Under the legacy P1
+        # threshold, halt_for_human retains its historical fail-closed rule.
+        policy_override = (
+            not blocks and decision.outcome != "pass"
+            and release_threshold != "P1"
+        )
+        rigor_override = (
+            not blocks and decision.outcome == "retry_design"
+            and rigor_result.downgraded > 0
+        )
+        finding_override = blocks and decision.outcome == "pass"
+        if finding_override:
+            original = decision.to_dict()
+            decision_overridden_by_policy = {
+                **original,
+                "release_threshold": release_threshold,
+                "reason": "blocking findings override pass decision",
+            }
+            decision = ReviewDecision(
+                node=decision.node, outcome="retry_design", blocking=False,
+                severity=decision.severity, summary=decision.summary,
+                prd_targeted=decision.prd_targeted,
+            )
+            verdict_str = _decision_outcome_to_legacy_verdict("retry_design")
+            feature_log.emit(
+                stage="gate", event="release-policy-decision-override",
+                feature=feature_active.parent.name,
+                detail={
+                    "gate": gate_label, "from_outcome": "pass",
+                    "to_outcome": "retry_design",
+                    "release_threshold": release_threshold,
+                },
+            )
+        elif policy_override or rigor_override:
+            original = decision.to_dict()
+            if policy_override:
+                decision_overridden_by_policy = {
+                    **original, "release_threshold": release_threshold,
+                }
+            if rigor_override:
+                decision_overridden_by_rigor = original
             decision = ReviewDecision(
                 node=decision.node, outcome="pass", blocking=False,
                 severity=decision.severity, summary=decision.summary,
@@ -1130,12 +1923,12 @@ def _synthesize_and_build_verdict(
             )
             verdict_str = _decision_outcome_to_legacy_verdict("pass")
             feature_log.emit(
-                stage="gate", event="rigor-filter-decision-override",
+                stage="gate", event="release-policy-decision-override",
                 feature=feature_active.parent.name,
                 detail={
-                    "gate": gate_label,
-                    "from_outcome": "retry_design", "to_outcome": "pass",
-                    "downgraded": rigor_result.downgraded,
+                    "gate": gate_label, "from_outcome": original["outcome"],
+                    "to_outcome": "pass", "downgraded": rigor_result.downgraded,
+                    "release_threshold": release_threshold,
                 },
             )
 
@@ -1154,6 +1947,10 @@ def _synthesize_and_build_verdict(
         coverage_map=coverage_map,
         decision=decision,
         decision_overridden_by_rigor=decision_overridden_by_rigor,
+        issue_clusters=issue_clusters,
+        release_threshold=release_threshold,  # type: ignore[arg-type]
+        decision_overridden_by_policy=decision_overridden_by_policy,
+        round_type=round_type,
     )
     out_path = feature_active / f"panel-{gate_label}.json"
     return v, out_path, synth_infra_error
@@ -1170,20 +1967,40 @@ def _run_one_group_pipeline(
     probe_config: ProbeConfig | None,
     log_emit: Callable[[dict], None] | None,
 ) -> tuple[PanelVerdict, Path, str | None]:
-    """Run one reviewer group's complete pipeline: 3 reviewers in parallel,
-    then synthesize once every reviewer has responded.
+    """Run one reviewer group: retried reviewers, quorum, then synthesis.
 
     Returns (verdict, output_path, synth_infra_error_or_None). The caller
     writes the verdict (kept out of this helper so dual-group orchestration
     can decide error-handling policy across groups).
     """
     cfg = panel_config
+    # Coverage/budget alternation: the design-review group's round type is
+    # decided BEFORE the cache identity is built (round_type is part of
+    # it — a budget round over the same packet must not be served the
+    # coverage round's cached reviews). The trace-review group and the
+    # close-approval gate always review as "coverage" — scope minimality
+    # is judged where scope.json is on the review surface.
+    round_key = hash_file(primary_artifact)
+    round_type = "coverage"
+    per_vendor_prompts: dict[str, tuple[str, str]] | None = None
+    if group_spec["name"] == "design-review":
+        round_type, per_vendor_prompts = _design_round_plan(
+            feature_active=feature_active,
+            panel_config=cfg,
+            round_key=round_key,
+            base_prompt=group_spec["reviewer_prompt"],
+            base_resume_prompt=group_spec["reviewer_resume_prompt"],
+            gate_label=group_spec["name"],
+            log_emit=log_emit,
+        )
     metadata = _reviewer_cache_metadata(
         gate_label=group_spec["name"],
         primary_artifact=primary_artifact,
         prompt_file_for_audit=group_spec["prompt_file_for_audit"],
         reviewer_prompt=group_spec["reviewer_prompt"],
         consulted_docs=group_spec["consulted_docs"],
+        round_type=round_type,
+        source_hash=round_key,
     )
     reviewer_results, prior_failures = _load_reviewer_cache(
         feature_active=feature_active,
@@ -1191,40 +2008,45 @@ def _run_one_group_pipeline(
         reviewer_specs=cfg.reviewers,
         metadata=metadata,
     )
-    to_run = _missing_reviewers(cfg.reviewers, reviewer_results)
 
-    # Dispatch only reviewers that are not already cached for this exact
-    # artifact/prompt hash. This makes restart retry the failed panel slots
-    # without spending more calls on successful reviewers.
-    if to_run:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(len(to_run), 1),
-            thread_name_prefix=f"panel-{group_spec['name']}",
-        ) as pool:
-            futs = [
-                pool.submit(
-                    _invoke_reviewer,
-                    r,
-                    group_spec["reviewer_prompt"],
-                    cfg.reviewer_probe_interval_sec,
-                    cwd=vendor_cwd,
-                    feature_active=feature_active,
-                    probe_config=probe_config,
-                    log_emit=log_emit,
-                )
-                for r in to_run
-            ]
-            for fut in concurrent.futures.as_completed(futs):
-                reviewer_results.append(fut.result())
+    if group_spec["name"] == "design-review":
+        if log_emit is not None and _missing_reviewers(
+            cfg.reviewers, reviewer_results,
+        ):
+            # One event per (round, dispatch attempt) that actually sends
+            # reviewers out; budget metering dedups on round_key so
+            # logical rounds are counted, not attempts or precheck
+            # refusals (which never reach this point).
+            try:
+                log_emit({
+                    "event": "panel-review-round",
+                    "stage": "gate",
+                    "gate": group_spec["name"],
+                    "round_key": round_key,
+                    "round_type": round_type,
+                })
+            except Exception:
+                pass
+
+    _dispatch_reviewer_slots(
+        gate_label=group_spec["name"],
+        reviewer_prompt=group_spec["reviewer_prompt"],
+        reviewer_resume_prompt=group_spec["reviewer_resume_prompt"],
+        reviewer_results=reviewer_results,
+        prior_failures=prior_failures,
+        panel_config=cfg,
+        feature_active=feature_active,
+        vendor_cwd=vendor_cwd,
+        probe_config=probe_config,
+        log_emit=log_emit,
+        per_vendor_prompts=per_vendor_prompts,
+    )
 
     # Sort by configured vendor order for stable audit output.
     order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
     reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
 
-    per_vendor_raw = {r.vendor: r.output for r in reviewer_results if r.ok}
-    for r in reviewer_results:
-        if not r.ok:
-            per_vendor_raw[r.vendor] = f"{NO_RESPONSE_PREFIX} — {r.failure_detail}]"
+    per_vendor_raw = _per_vendor_raw(reviewer_results)
 
     out_path = feature_active / group_spec["verdict_file"]
     _write_reviewer_cache(
@@ -1235,27 +2057,17 @@ def _run_one_group_pipeline(
         reviewer_results=reviewer_results,
         prior_failures=prior_failures,
     )
-    missing = _missing_reviewers(cfg.reviewers, reviewer_results)
-    if missing:
-        if log_emit is not None:
-            log_emit({
-                "event": "panel-incomplete",
-                "stage": "gate",
-                "gate": group_spec["name"],
-                "missing_reviewers": [m.vendor for m in missing],
-            })
-        raise GatePending(
-            f"panel-{group_spec['name']}",
-            _panel_incomplete_message(
-                gate_label=group_spec["name"],
-                reviewer_specs=cfg.reviewers,
-                reviewer_results=reviewer_results,
-            ),
-        )
+    _require_panel_quorum(
+        gate_label=group_spec["name"],
+        reviewer_results=reviewer_results,
+        panel_config=cfg,
+        log_emit=log_emit,
+    )
 
     # Healthy → synthesize immediately (no barrier waiting for other group).
     return _synthesize_and_build_verdict(
         gate_label=group_spec["name"],
+        round_type=round_type,
         reviewer_results=reviewer_results,
         primary_artifact=primary_artifact,
         prompt_file_for_audit=group_spec["prompt_file_for_audit"],
@@ -1283,7 +2095,7 @@ def _run_dual_group_design_review(
     """Run the design-review gate as two reviewer groups (design-review +
     trace-review) sharing one primary_artifact (design-packet.json).
 
-    Each group runs its own pipeline (3 reviewers → synthesizer) concurrently
+    Each group runs its own pipeline (reviewer quorum → synthesizer) concurrently
     and independently. Whichever group's reviewers finish first immediately
     starts its synthesizer; neither group waits on the other. Writes BOTH
     verdict files; returns the design-review group's PanelVerdict. The
@@ -1307,6 +2119,14 @@ def _run_dual_group_design_review(
                 consulted_docs=group_docs,
                 feature_active=feature_active,
                 repo_root=repo_root,
+            ),
+            "reviewer_resume_prompt": _compose_reviewer_prompt(
+                gate=group["name"],
+                artifact_path=primary_artifact,
+                consulted_docs=group_docs,
+                feature_active=feature_active,
+                repo_root=repo_root,
+                continuation=True,
             ),
         })
 
@@ -1420,6 +2240,11 @@ def run_panel_gate_internal(
         gate=gate, artifact_path=primary_artifact, consulted_docs=consulted_docs,
         feature_active=feature_active, repo_root=repo_root,
     )
+    reviewer_resume_prompt = _compose_reviewer_prompt(
+        gate=gate, artifact_path=primary_artifact, consulted_docs=consulted_docs,
+        feature_active=feature_active, repo_root=repo_root,
+        continuation=True,
+    )
     vendor_cwd = repo_root or feature_active
     metadata = _reviewer_cache_metadata(
         gate_label=gate,
@@ -1434,34 +2259,23 @@ def run_panel_gate_internal(
         reviewer_specs=cfg.reviewers,
         metadata=metadata,
     )
-    to_run = _missing_reviewers(cfg.reviewers, reviewer_results)
-    if to_run:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(len(to_run), 1)
-        ) as pool:
-            futs = {
-                pool.submit(
-                    _invoke_reviewer,
-                    r,
-                    reviewer_prompt,
-                    cfg.reviewer_probe_interval_sec,
-                    cwd=vendor_cwd,
-                    feature_active=feature_active,
-                    probe_config=probe_config,
-                    log_emit=log_emit,
-                ): r
-                for r in to_run
-            }
-            for fut in concurrent.futures.as_completed(futs):
-                reviewer_results.append(fut.result())
+    _dispatch_reviewer_slots(
+        gate_label=gate,
+        reviewer_prompt=reviewer_prompt,
+        reviewer_resume_prompt=reviewer_resume_prompt,
+        reviewer_results=reviewer_results,
+        prior_failures=prior_failures,
+        panel_config=cfg,
+        feature_active=feature_active,
+        vendor_cwd=vendor_cwd,
+        probe_config=probe_config,
+        log_emit=log_emit,
+    )
     # Preserve reviewer order as declared in config (stable audit).
     order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
     reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
 
-    per_vendor_raw = {r.vendor: r.output for r in reviewer_results if r.ok}
-    for r in reviewer_results:
-        if not r.ok:
-            per_vendor_raw[r.vendor] = f"{NO_RESPONSE_PREFIX} — {r.failure_detail}]"
+    per_vendor_raw = _per_vendor_raw(reviewer_results)
 
     _write_reviewer_cache(
         feature_active=feature_active,
@@ -1471,23 +2285,12 @@ def run_panel_gate_internal(
         reviewer_results=reviewer_results,
         prior_failures=prior_failures,
     )
-    missing = _missing_reviewers(cfg.reviewers, reviewer_results)
-    if missing:
-        if log_emit is not None:
-            log_emit({
-                "event": "panel-incomplete",
-                "stage": "gate",
-                "gate": gate,
-                "missing_reviewers": [m.vendor for m in missing],
-            })
-        raise GatePending(
-            f"panel-{gate}",
-            _panel_incomplete_message(
-                gate_label=gate,
-                reviewer_specs=cfg.reviewers,
-                reviewer_results=reviewer_results,
-            ),
-        )
+    _require_panel_quorum(
+        gate_label=gate,
+        reviewer_results=reviewer_results,
+        panel_config=cfg,
+        log_emit=log_emit,
+    )
 
     v, out_path, synth_infra_error = _synthesize_and_build_verdict(
         gate_label=gate,

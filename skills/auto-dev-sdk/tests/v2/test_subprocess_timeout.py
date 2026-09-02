@@ -145,3 +145,172 @@ def test_stage_effort_field_passed_to_shared_vendor(
 
     assert result.ok
     assert captured["effort"] == "xhigh"
+
+
+def test_existing_unchanged_artifact_does_not_satisfy_a_new_stage_turn(
+    git_repo, feature_active, tmp_path, monkeypatch,
+):
+    artifact = feature_active / "build.json"
+    artifact.write_text('{"old": true}\n', encoding="utf-8")
+
+    def fake_call_shared_vendor(**kwargs):
+        return SharedVendorResult(
+            vendor=kwargs["vendor"],
+            output_id=kwargs["output_id"],
+            returncode=0,
+            output="exited without writing this turn's output",
+            log="",
+            status={"exit_code": "0"},
+            summary_stdout="",
+            summary_stderr="",
+            elapsed_sec=0.01,
+            output_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
+    spec = StageSpec(
+        stage="build", vendor="claude", model="fake", probe_interval_sec=30,
+    )
+
+    result = run_stage_subprocess(
+        stage="build",
+        stage_spec=spec,
+        prompt="test stale output",
+        artifact_target=artifact,
+        feature_active=feature_active,
+        allowed_write_paths=[feature_active],
+        cwd=git_repo,
+    )
+
+    assert not result.ok
+    assert result.failure_kind == "stale_artifact"
+    assert "pre-existing build.json was unchanged" in result.failure_detail
+    assert artifact.read_text(encoding="utf-8") == '{"old": true}\n'
+
+
+def test_changed_direct_target_remains_a_supported_stage_output(
+    git_repo, feature_active, tmp_path, monkeypatch,
+):
+    artifact = feature_active / "build.json"
+    artifact.write_text('{"old": true}\n', encoding="utf-8")
+
+    def fake_call_shared_vendor(**kwargs):
+        artifact.write_text('{"fresh": true}\n', encoding="utf-8")
+        return SharedVendorResult(
+            vendor=kwargs["vendor"],
+            output_id=kwargs["output_id"],
+            returncode=0,
+            output="wrote target directly",
+            log="",
+            status={"exit_code": "0"},
+            summary_stdout="",
+            summary_stderr="",
+            elapsed_sec=0.01,
+            output_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
+    spec = StageSpec(
+        stage="build", vendor="claude", model="fake", probe_interval_sec=30,
+    )
+
+    result = run_stage_subprocess(
+        stage="build",
+        stage_spec=spec,
+        prompt="test direct output",
+        artifact_target=artifact,
+        feature_active=feature_active,
+        allowed_write_paths=[feature_active],
+        cwd=git_repo,
+    )
+
+    assert result.ok
+    assert artifact.read_text(encoding="utf-8") == '{"fresh": true}\n'
+
+
+def test_claude_529_retries_in_place_and_keeps_draft(
+    git_repo, feature_active, tmp_path, monkeypatch,
+):
+    from autodev.vendors.shared_call import SharedVendorResult
+
+    artifact = feature_active / "design.md"
+    artifact.write_text("old\n", encoding="utf-8")
+    artifact_tmp = feature_active / "design.md.tmp"
+    calls = 0
+
+    def fake_call_shared_vendor(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            artifact_tmp.write_text("useful partial draft\n", encoding="utf-8")
+            return SharedVendorResult(
+                vendor="claude", output_id="design", returncode=1,
+                output="API Error: 529 Overloaded.", log="",
+                status={"exit_code": "1", "session_mode": "resume"},
+                summary_stdout="", summary_stderr="", elapsed_sec=0.01,
+                output_dir=tmp_path,
+            )
+        assert artifact_tmp.read_text(encoding="utf-8") == "useful partial draft\n"
+        artifact_tmp.write_text("completed draft\n", encoding="utf-8")
+        return SharedVendorResult(
+            vendor="claude", output_id="design", returncode=0,
+            output="done", log="",
+            status={"exit_code": "0", "session_mode": "resume"},
+            summary_stdout="", summary_stderr="", elapsed_sec=0.01,
+            output_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
+    monkeypatch.setattr(subprocess_runner.time, "sleep", lambda _seconds: None)
+    spec = StageSpec(
+        stage="design", vendor="claude", model="fake", probe_interval_sec=30,
+    )
+
+    result = run_stage_subprocess(
+        stage="design", stage_spec=spec, prompt="continue",
+        artifact_target=artifact, feature_active=feature_active,
+        allowed_write_paths=[feature_active], cwd=git_repo, preseed=True,
+    )
+    assert result.ok
+    assert calls == 2
+    assert artifact.read_text(encoding="utf-8") == "completed draft\n"
+
+
+def test_retry_after_claude_529_resumes_prior_tmp_across_invocations(
+    git_repo, feature_active, tmp_path, monkeypatch,
+):
+    from autodev.vendors.shared_call import SharedVendorResult
+
+    artifact = feature_active / "design.md"
+    artifact.write_text("old landed design\n", encoding="utf-8")
+    artifact_tmp = feature_active / "design.md.tmp"
+    artifact_tmp.write_text("partial design worth keeping\n", encoding="utf-8")
+    (feature_active / "design-failure.json").write_text(
+        '{"kind":"exit_nonzero","detail":"transient provider overload '
+        'after 3 attempt(s)"}\n',
+        encoding="utf-8",
+    )
+
+    def fake_call_shared_vendor(**kwargs):
+        assert artifact_tmp.read_text(encoding="utf-8") == (
+            "partial design worth keeping\n"
+        )
+        artifact_tmp.write_text("resumed and completed\n", encoding="utf-8")
+        return SharedVendorResult(
+            vendor="claude", output_id="design", returncode=0,
+            output="done", log="", status={"exit_code": "0"},
+            summary_stdout="", summary_stderr="", elapsed_sec=0.01,
+            output_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(subprocess_runner, "call_shared_vendor", fake_call_shared_vendor)
+    spec = StageSpec(
+        stage="design", vendor="claude", model="fake", probe_interval_sec=30,
+    )
+    result = run_stage_subprocess(
+        stage="design", stage_spec=spec, prompt="resume",
+        artifact_target=artifact, feature_active=feature_active,
+        allowed_write_paths=[feature_active], cwd=git_repo, preseed=True,
+    )
+    assert result.ok
+    assert artifact.read_text(encoding="utf-8") == "resumed and completed\n"

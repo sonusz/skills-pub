@@ -247,7 +247,8 @@ See implemented-spec.md.
   "classifications": [
     {"req_id": "t-1.r1", "scope_id": "t-1", "classification": "Fully", "evidence": "fake_vendor output"}
   ],
-  "summary": {"Fully": 1, "Partial": 0, "Missing": 0, "Deviated": 0, "Deferred": 0}
+  "summary": {"Fully": 1, "Partial": 0, "Missing": 0, "Deviated": 0, "Deferred": 0},
+  "design_conformance": {"verdict": "Aligned", "findings": []}
 }
 """)
         return 0

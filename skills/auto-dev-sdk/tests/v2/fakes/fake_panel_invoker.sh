@@ -73,10 +73,10 @@ if [[ "$role" == "synthesizer" ]]; then
     synth_pass|reviewers_all_pass)
       cat <<'EOF'
 {"per_reviewer":[
-  {"vendor":"claude","verdict":"pass","findings":[]},
-  {"vendor":"agy","verdict":"pass","findings":[]},
-  {"vendor":"codex","verdict":"pass","findings":[]}
-]}
+  {"vendor":"claude","verdict":"pass","findings":[],"coverage":[]},
+  {"vendor":"agy","verdict":"pass","findings":[],"coverage":[]},
+  {"vendor":"codex","verdict":"pass","findings":[],"coverage":[]}
+],"issue_clusters":[],"decision":{"node":"design_review","outcome":"pass","blocking":false,"severity":"opinion","summary":"pass"}}
 EOF
       exit 0
       ;;
@@ -84,24 +84,24 @@ EOF
       cat <<'EOF'
 {"per_reviewer":[
   {"vendor":"claude","verdict":"fail","findings":[
-    {"severity":"invariant_violation","summary":"R3 vs R7 contradiction"}
-  ]},
+    {"finding_id":"claude:1","severity":"invariant_violation","priority":"P0","summary":"R3 vs R7 contradiction","targets":[],"category":"ambiguous","evidence_refs":[],"failure_class":null,"missized_direction":null}
+  ],"coverage":[]},
   {"vendor":"agy","verdict":"fail","findings":[
-    {"severity":"invariant_violation","summary":"requirement 3 cannot coexist with requirement 7"}
-  ]},
-  {"vendor":"codex","verdict":"pass","findings":[]}
-]}
+    {"finding_id":"agy:1","severity":"invariant_violation","priority":"P0","summary":"requirement 3 cannot coexist with requirement 7","targets":[],"category":"ambiguous","evidence_refs":[],"failure_class":null,"missized_direction":null}
+  ],"coverage":[]},
+  {"vendor":"codex","verdict":"pass","findings":[],"coverage":[]}
+],"issue_clusters":[{"prior_cluster_id":null,"finding_ids":["claude:1","agy:1"],"summary":"R3 conflicts with R7"}],"decision":{"node":"design_review","outcome":"retry_design","blocking":false,"severity":"invariant_violation","summary":"resolve contradiction"}}
 EOF
       exit 0
       ;;
     synth_needs_revision|reviewers_one_empty)
       cat <<'EOF'
 {"per_reviewer":[
-  {"vendor":"claude","verdict":"pass","findings":[]},
+  {"vendor":"claude","verdict":"pass","findings":[],"coverage":[]},
   {"vendor":"codex","verdict":"needs_revision","findings":[
-    {"severity":"risk","summary":"unclear scope boundary"}
-  ]}
-]}
+    {"finding_id":"codex:1","severity":"risk","priority":"P1","summary":"unclear scope boundary","targets":[],"category":"ambiguous","evidence_refs":[],"failure_class":"mainline","missized_direction":null}
+  ],"coverage":[]}
+],"issue_clusters":[{"prior_cluster_id":null,"finding_ids":["codex:1"],"summary":"unclear scope boundary"}],"decision":{"node":"design_review","outcome":"retry_design","blocking":false,"severity":"risk","summary":"clarify scope"}}
 EOF
       exit 0
       ;;
@@ -117,8 +117,8 @@ EOF
       # default: pass
       cat <<'EOF'
 {"per_reviewer":[
-  {"vendor":"claude","verdict":"pass","findings":[]}
-]}
+  {"vendor":"claude","verdict":"pass","findings":[],"coverage":[]}
+],"issue_clusters":[],"decision":{"node":"design_review","outcome":"pass","blocking":false,"severity":"opinion","summary":"pass"}}
 EOF
       exit 0
       ;;

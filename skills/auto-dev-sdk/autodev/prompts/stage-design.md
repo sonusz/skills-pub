@@ -33,6 +33,15 @@ You do NOT implement code. You produce the bridge between "what the
 user wants" (PRD) and "what must be built + how it must be verified"
 (design + scope + trace + test-plan).
 
+Repo reconnaissance and fact-verification parallelize well: when
+subagents are available, dispatch them to read existing source and
+prior specs, to verify each trace row and test-plan case against the
+code facts it relies on, and to run the exit self-check with fresh
+eyes. Dispatch such workers on a mid-tier, medium-effort model (for
+the claude CLI, `model: sonnet` on the Agent tool); they gather facts
+and check claims — architectural commitments, decomposition, and
+altitude decisions stay with you. Subagents must not edit any file.
+
 ## Input contract
 
 - `PRD_PATH`: path to the feature's PRD (read-only to you for
@@ -49,6 +58,10 @@ user wants" (PRD) and "what must be built + how it must be verified"
 - `TARGET_CHANGELOG`: path to write design-changelog.json (same tmp
   pattern). Append-only history of design rounds — see "Maintaining
   design-changelog.json" below.
+- `WRITABLE_PATHS`: exact files/directories this stage may write. The
+  five TARGET paths and `SCRATCH_DIR` are the complete write surface.
+- `PROTECTED_PATHS`: immutable inputs called out explicitly by the
+  harness. They remain read-only even if a broader parent is writable.
 - `DIFF_BASE`: branch or commit to diff against during build
   validation.
 - `CONTEXT_ARTIFACTS`: list of paths to on-disk artifacts relevant to
@@ -67,6 +80,14 @@ user wants" (PRD) and "what must be built + how it must be verified"
     this round. See "Maintaining design-changelog.json" below.
   - `build.json` if a build halt routed back here: inspect
     `deviations[]` entries and address each one's `evidence` pointer
+
+On an initial run (`CONTEXT_ARTIFACTS: []`), derive the design only from the
+current PRD, current source tree, and current architecture/reference inputs
+named by the harness. Do not inspect `design-package-history`, scratch files,
+deleted prior design artifacts, or Git history of those artifacts. Do not
+preserve old `ra-*` IDs. This is a real rebaseline, not a reconstruction of a
+discarded design. Existing implementation code remains valid evidence, but it
+does not make a component required when the PRD does not require it.
 
 ## Why this stage exists
 
@@ -637,4 +658,6 @@ Before writing the four `.tmp` files:
 - Exit 0 on success; non-zero on fatal error (failure to read
   PRD, etc.).
 - Stdout: free-form logging. Not parsed by orchestrator.
+- Stay inside `WRITABLE_PATHS`. Treat every other path as read-only;
+  never chmod, rename, delete, or replace anything in `PROTECTED_PATHS`.
 - Never modify the PRD. Never commit or push.

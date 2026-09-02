@@ -100,7 +100,8 @@ def test_build_blocking_true_halts_with_scope_ids(git_repo, feature_active):
     assert "t-3" in err.detail
     assert "t-7" in err.detail
     assert "t-9" not in err.detail
-    assert "PRD amendment" in err.detail
+    assert "human resolution required" in err.detail
+    assert "inspect blocking deviations in build.json" in err.detail
 
     # Audit event emitted.
     events = [json.loads(line) for line in
@@ -124,4 +125,4 @@ def test_status_surfaces_build_blocking(git_repo, feature_active, capsys,
     out = capsys.readouterr().out
     assert "build blocking" in out
     assert "t-5" in out
-    assert "PRD amendment required" in out
+    assert "inspect build.json deviations" in out

@@ -6,6 +6,8 @@ logged for debugging, not parsed as the stage result.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -39,6 +41,8 @@ STDERR_TAIL_BYTES = 4096
 IDLE_POLL_INTERVAL_SEC = 5
 HARD_BACKSTOP_MULTIPLIER = 5
 HARD_BACKSTOP_FLOOR_SEC = 28800  # 8 hours
+TRANSIENT_PROVIDER_MAX_ATTEMPTS = 3
+TRANSIENT_PROVIDER_BACKOFF_SEC = (2, 5)
 
 
 def _hard_backstop_sec(probe_interval_sec: int) -> int:
@@ -71,6 +75,62 @@ def _exit_code_from_status(status: dict[str, str], fallback: int) -> int:
         return fallback
 
 
+def _artifact_identity(path: Path) -> tuple[int, int, int, int, str] | None:
+    """Return enough identity to distinguish a fresh direct write from residue.
+
+    The normal stage contract writes ``<target>.tmp``.  A small compatibility
+    path still accepts agents that write the target directly, but an already
+    landed target must not make an exit-0 turn with no output look successful.
+    Include metadata as well as bytes so an intentional identical-content
+    rewrite is still recognized as a fresh direct write.
+    """
+    try:
+        stat_result = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return (
+        stat_result.st_mode,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        digest,
+    )
+
+
+def _is_claude_overloaded(vendor: str, result) -> bool:
+    if vendor.strip().lower() not in {"claude", "anthropic"}:
+        return False
+    text = "\n".join((
+        result.output or "", result.log or "",
+        result.summary_stdout or "", result.summary_stderr or "",
+    )).lower()
+    return "529 overloaded" in text or "api error: 529" in text
+
+
+def should_resume_transient_draft(feature_active: Path, stage: str) -> bool:
+    """True only for a draft left by a known transient provider overload."""
+    failure_path = Path(feature_active) / f"{stage}-failure.json"
+    try:
+        raw = json.loads(failure_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if raw.get("kind") != "exit_nonzero":
+        return False
+    detail = str(raw.get("detail", "")).lower()
+    if "transient provider overload" in detail:
+        return True
+    # Backward compatibility for failure reports written before the explicit
+    # taxonomy existed. Restrict the fallback to the matching stage log.
+    try:
+        prior_output = (
+            Path(feature_active) / f".{stage}.stdout.log"
+        ).read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return False
+    return "529 overloaded" in prior_output or "api error: 529" in prior_output
+
+
 def run_stage_subprocess(
     *,
     stage: str,
@@ -85,6 +145,7 @@ def run_stage_subprocess(
     extra_stdin: str = "",
     probe_config: ProbeConfig | None = None,
     preseed: bool = False,
+    resume_prompt: str | None = None,
 ) -> StageRunResult:
     """Execute a single stage subprocess end-to-end.
 
@@ -115,18 +176,26 @@ def run_stage_subprocess(
     )
 
     artifact_tmp = artifact_target.with_name(artifact_target.name + ".tmp")
-    # Clean any stale tmp from a prior attempt, then optionally pre-seed.
-    if artifact_tmp.exists():
+    artifact_before = _artifact_identity(artifact_target)
+    # A known transient overload may leave useful in-place work. Resume that
+    # exact draft; all other stale tmp files are discarded before pre-seeding.
+    resume_transient_draft = (
+        artifact_tmp.exists()
+        and should_resume_transient_draft(feature_active, stage)
+    )
+    if artifact_tmp.exists() and not resume_transient_draft:
         try:
             artifact_tmp.unlink()
         except OSError:
             pass
-    if preseed and artifact_target.exists():
+    if preseed and artifact_target.exists() and not artifact_tmp.exists():
         import shutil
         try:
             shutil.copyfile(artifact_target, artifact_tmp)
         except OSError:
             pass
+    if resume_transient_draft and log_emit:
+        log_emit({"event": "transient-draft-resumed", "stage": stage})
 
     stdout_path = feature_active / f".{stage}.stdout.log"
     stderr_path = feature_active / f".{stage}.stderr.log"
@@ -135,6 +204,16 @@ def run_stage_subprocess(
     effort = chosen.effort or flags_effort
     model = model_override or chosen.model
     vendor = chosen.vendor
+    session_key: str | None = None
+    session_max_turns: int | None = None
+    if stage in {"design", "build", "ralph-review"}:
+        from autodev.vendors.session_keys import (
+            feature_session_key,
+            session_max_turns_for_role,
+        )
+
+        session_key = feature_session_key(feature_active, stage)
+        session_max_turns = session_max_turns_for_role(stage)
 
     probe_enabled = probe_config is not None
     hard_backstop_sec = (
@@ -155,6 +234,9 @@ def run_stage_subprocess(
     exit_code: int | None = None
     failure_kind: str | None = None
     failure_detail = ""
+    session_mode: str | None = None
+    session_turn: int | None = None
+    session_auto_reset = False
 
     idle_callback = (
         _build_idle_callback(
@@ -170,35 +252,58 @@ def run_stage_subprocess(
         else None
     )
     try:
-        result = call_shared_vendor(
-            vendor=vendor,
-            model=model,
-            prompt=prompt + (extra_stdin or ""),
-            output_id=stage,
-            timeout_sec=hard_backstop_sec,
-            cwd=cwd,
-            effort=effort,
-            yolo=True,
-            native_args=native_args,
-            env_overrides=env_overrides,
-            idle_callback=idle_callback,
-            idle_check_interval_sec=IDLE_POLL_INTERVAL_SEC,
-            process_registry=registry_path(feature_active),
-            process_label=stage,
-        )
+        attempts = 0
+        attempt_outputs: list[str] = []
+        attempt_logs: list[str] = []
+        while True:
+            attempts += 1
+            result = call_shared_vendor(
+                vendor=vendor,
+                model=model,
+                prompt=prompt + (extra_stdin or ""),
+                output_id=stage,
+                timeout_sec=hard_backstop_sec,
+                cwd=cwd,
+                effort=effort,
+                yolo=True,
+                native_args=native_args,
+                env_overrides=env_overrides,
+                idle_callback=idle_callback,
+                idle_check_interval_sec=IDLE_POLL_INTERVAL_SEC,
+                process_registry=registry_path(feature_active),
+                process_label=stage,
+                session_key=session_key,
+                session_max_turns=session_max_turns,
+                resume_prompt=resume_prompt if session_key is not None else None,
+            )
+            attempt_outputs.append(
+                result.output
+                + ("\n\n--- shared vendors summary ---\n" + result.summary_stdout
+                   if result.summary_stdout else "")
+            )
+            attempt_logs.append(
+                result.log
+                + ("\n\n--- shared vendors stderr ---\n" + result.summary_stderr
+                   if result.summary_stderr else "")
+            )
+            current_exit = _exit_code_from_status(result.status, result.returncode)
+            overloaded = current_exit != 0 and _is_claude_overloaded(vendor, result)
+            if not overloaded or attempts >= TRANSIENT_PROVIDER_MAX_ATTEMPTS:
+                break
+            if log_emit:
+                log_emit({
+                    "event": "transient-provider-retrying", "stage": stage,
+                    "vendor": vendor, "attempt": attempts,
+                    "max_attempts": TRANSIENT_PROVIDER_MAX_ATTEMPTS,
+                    "reason": "529 Overloaded",
+                })
+            time.sleep(TRANSIENT_PROVIDER_BACKOFF_SEC[attempts - 1])
+        session_mode = result.session_mode
+        session_turn = result.session_turn
+        session_auto_reset = result.session_auto_reset
         exit_code = _exit_code_from_status(result.status, result.returncode)
-        stdout_path.write_text(
-            result.output
-            + ("\n\n--- shared vendors summary ---\n" + result.summary_stdout
-               if result.summary_stdout else ""),
-            encoding="utf-8",
-        )
-        stderr_path.write_text(
-            result.log
-            + ("\n\n--- shared vendors stderr ---\n" + result.summary_stderr
-               if result.summary_stderr else ""),
-            encoding="utf-8",
-        )
+        stdout_path.write_text("\n\n".join(attempt_outputs), encoding="utf-8")
+        stderr_path.write_text("\n\n".join(attempt_logs), encoding="utf-8")
         if result.timed_out:
             failure_kind = "timeout"
             failure_detail = (
@@ -224,7 +329,13 @@ def run_stage_subprocess(
     if failure_kind is None:
         if exit_code != 0:
             failure_kind = "exit_nonzero"
-            failure_detail = f"shared vendor call exited {exit_code}"
+            if _is_claude_overloaded(vendor, result):
+                failure_detail = (
+                    "transient provider overload after "
+                    f"{attempts} attempt(s); shared vendor call exited {exit_code}"
+                )
+            else:
+                failure_detail = f"shared vendor call exited {exit_code}"
         elif not artifact_tmp.exists() and not artifact_target.exists():
             failure_kind = "missing_artifact"
             failure_detail = f"neither {artifact_tmp.name} nor {artifact_target.name} after exit 0"
@@ -235,8 +346,14 @@ def run_stage_subprocess(
             except OSError as e:
                 failure_kind = "missing_artifact"
                 failure_detail = f"rename failed: {e}"
-        # If artifact_target already exists (vendor wrote directly, skipping
-        # our .tmp convention), we accept but flag a warning in log.
+        elif artifact_before is not None and _artifact_identity(artifact_target) == artifact_before:
+            failure_kind = "stale_artifact"
+            failure_detail = (
+                f"{artifact_tmp.name} was not produced and the pre-existing "
+                f"{artifact_target.name} was unchanged after exit 0"
+            )
+        # If artifact_target changed (vendor wrote directly, skipping our
+        # .tmp convention), retain the compatibility path.
         if failure_kind is None:
             ok = True
 
@@ -261,7 +378,10 @@ def run_stage_subprocess(
     if log_emit:
         log_emit({"event": "subprocess-end", "stage": stage, "ok": ok,
                   "exit_code": exit_code, "failure_kind": failure_kind,
-                  "elapsed_sec": elapsed, "reaped": subprocess_reaped})
+                  "elapsed_sec": elapsed, "reaped": subprocess_reaped,
+                  "session_mode": session_mode,
+                  "session_turn": session_turn,
+                  "session_auto_reset": session_auto_reset})
 
     return StageRunResult(
         ok=ok,

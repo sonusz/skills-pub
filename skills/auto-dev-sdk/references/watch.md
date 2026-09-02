@@ -1,6 +1,8 @@
-# Push alerts via `--watch`
+# Harness-owned watch heartbeat and alerts
 
-Use this when launching `autodev run` (or `autodev next`) in the background and you want push-style alerts on key state transitions instead of polling status.
+Use this for every background `autodev run` or `autodev next`. The harness owns
+the heartbeat cadence and terminal outcome markers; outer agents subscribe to
+one fixed protocol instead of inventing polling per feature.
 
 ## How
 
@@ -8,7 +10,25 @@ Use this when launching `autodev run` (or `autodev next`) in the background and 
 autodev run <feature> --watch
 ```
 
-Run via `Bash(run_in_background: true)` so the bash output stream is monitorable. The flag sets `AUTODEV_WATCH=1`; `autodev.state.log.JsonlLog.emit` adds a stdout line for each whitelisted transition. The JSONL log on disk is unaffected.
+Run in the background so stdout is monitorable. `--watch` sets
+`AUTODEV_WATCH=1`, starts a 60-second heartbeat, emits selected JSONL
+transitions, and guarantees one terminal marker for every ordinary return path.
+The JSONL log on disk is unaffected. `AUTODEV_WATCH_HEARTBEAT_SEC` may override
+the interval for tests or unusual operator environments; wrappers should use
+the advertised value rather than set their own cadence.
+
+## Lifecycle markers
+
+```text
+[autodev:watch] started protocol=1 feature=<f> verb=run heartbeat_sec=60
+[autodev:watch] heartbeat protocol=1 feature=<f> verb=run elapsed_sec=<n>
+[autodev:watch] terminal protocol=1 feature=<f> verb=run outcome=<outcome> exit_code=<n> elapsed_sec=<n>
+```
+
+Terminal outcomes are `complete`, `gate_pending`, `error`, or `lock_conflict`.
+The marker is emitted for success and failure, so process EOF is never the only
+signal available on an ordinary exit. A hard kill cannot emit from the dead
+process; that is why the Monitor must enforce heartbeat absence.
 
 ## Whitelisted alerts
 
@@ -25,16 +45,26 @@ Only these transitions emit a stdout line. Every other event stays silent.
 
 Routine progress (`subprocess-dispatch`, `subprocess-start`, `artifact-written`, `iteration-recorded`, intermediate `stage-complete`) is intentionally suppressed — those would drown the outer agent in notifications.
 
-## Combining with Monitor and the deadman wakeup
+## Required Monitor contract
 
 1. Start the run in background with `--watch`.
-2. (Optional) attach a `Monitor` task to the bash output so each alert line wakes the outer agent instantly. Without Monitor, alerts are visible only when the bash command finally exits.
-3. Keep the periodic `ScheduleWakeup` running as a 10-min sliding deadman (R5 rule 4). Each alert resets the deadman; if no alert arrives for 10 min, the wakeup fires and the agent does a `autodev status` to confirm progress or surface a stall.
+2. Attach one Monitor to stdout. Without it, background PTY output is buffered
+   and cannot wake the outer agent.
+3. Read `heartbeat_sec` from `started`. Reset the silence deadline on every
+   watch marker. Do not forward routine heartbeats to the user.
+4. If two heartbeat intervals pass without any marker, wake immediately, run
+   `autodev status`, and surface the missing-heartbeat alert.
+5. On `terminal outcome=complete`, report completion and stop. On any other
+   terminal outcome, wake immediately, run `autodev status`, and surface the
+   gate/error/lock state.
+
+Do not add `sleep` loops, cron entries, or a second status poller. This contract
+is identical for every feature.
 
 ## When NOT to use `--watch`
 
 - Foreground `autodev run` invocations the user is watching live (the alerts add no signal).
-- Tests / CI (the JSONL log is the source of truth there).
+- Tests / CI unless they are explicitly testing this protocol.
 
 ## Alert format
 
@@ -42,10 +72,12 @@ Routine progress (`subprocess-dispatch`, `subprocess-start`, `artifact-written`,
 [autodev:<stage>] <event> [<key>=<value> …]
 ```
 
-Surfaced detail keys, in priority order: `verdict`, `gate`, `kind`, `vendor`, `model`, `reason`. Long string values (`reason`) are truncated to 80 chars.
+Transition alerts surface detail keys in priority order: `verdict`, `gate`,
+`kind`, `vendor`, `model`, `reason`. Long reasons are truncated to 80 chars.
 
 ## Implementation pointers
 
 - Whitelist + formatter: `autodev/state/log.py` (`_ALERT_EVENT_KEYS`, `_ALERT_EVENT_NAMES`, `_format_alert`).
-- CLI flag: `autodev/cli.py` (`run`, `next` parsers; `cmd_run`/`cmd_next` set `AUTODEV_WATCH=1`).
-- Tests: `tests/v2/test_log_watch.py`.
+- Heartbeat + terminal protocol: `autodev/watch.py`.
+- CLI integration: `autodev/cli.py` (`_dispatch_with_watch`).
+- Tests: `tests/v2/test_log_watch.py`, `tests/v2/test_watch_heartbeat.py`.

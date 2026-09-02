@@ -63,6 +63,56 @@ def test_basic_parse_default_and_rows():
     assert m.level_for("R2") == "core"
     assert m.level_for("R3") == "loose"      # falls to default
     assert m.rationale["R1"] == "core algorithm"
+    assert m.release_threshold == "P1"
+
+
+def test_release_threshold_parse_and_amendment_latest_wins():
+    text = PRD_BASE + ASSURANCE_OK.replace(
+        "Default: loose", "Default: loose\nRelease threshold: P1",
+    ) + "\n## Amendment 2026-08-05\n\nRelease threshold: P0\n"
+    m, errors = parse_assurance(text)
+    assert errors == []
+    assert m.release_threshold == "P0"
+
+
+def test_bad_release_threshold_errors_and_falls_back():
+    text = PRD_BASE + "\n## Assurance\n\nDefault: strict\nRelease threshold: urgent\n"
+    m, errors = parse_assurance(text)
+    assert any("Release threshold" in e for e in errors)
+    assert m.release_threshold == "P1"
+
+
+def test_release_threshold_in_unrelated_prose_or_fence_is_ignored():
+    text = PRD_BASE + """
+
+## Notes
+
+Release threshold: P0
+
+```yaml
+Release threshold: P0
+```
+"""
+    m, errors = parse_assurance(text)
+    assert errors == []
+    assert m.present is False
+    assert m.release_threshold == "P1"
+
+
+def test_release_threshold_in_fenced_amendment_example_is_ignored():
+    text = PRD_BASE + """
+
+## Amendment 2026-08-05
+
+This amendment documents an example only:
+
+```markdown
+Release threshold: P0
+```
+"""
+    m, errors = parse_assurance(text)
+    assert errors == []
+    assert m.release_threshold == "P1"
 
 
 def test_missing_default_line_errors():
@@ -156,6 +206,36 @@ def test_prd_intake_rejects_malformed_assurance():
     res = validate_prd_text(text)
     assert not res.ok
     assert any("R9" in e for e in res.errors)
+
+
+def test_prd_intake_accepts_new_requirement_in_dated_amendment():
+    text = PRD_BASE + """
+
+## Amendment 2026-08-06
+
+### R4: Dated release rehearsal
+
+Run the live dev rehearsal.
+
+Assurance: R4 -> strict
+"""
+    res = validate_prd_text(text)
+    assert res.ok, res.errors
+    assert res.requirement_markers == ["R1", "R2", "R3", "R4"]
+
+
+def test_prd_intake_ignores_fenced_requirement_example_in_amendment():
+    text = PRD_BASE + """
+
+## Amendment 2026-08-06
+
+```markdown
+### R4: Example only
+```
+"""
+    res = validate_prd_text(text)
+    assert res.ok, res.errors
+    assert res.requirement_markers == ["R1", "R2", "R3"]
 
 
 def test_assurance_map_default_ctor_is_strict():

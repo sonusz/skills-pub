@@ -21,10 +21,19 @@ from autodev.errors import SchemaError
 # ---- ralph-review.json parser (v3-core) ----------------------------
 
 
-def _write_ralph_review(path: Path, classifications: list[dict]) -> None:
+def _write_ralph_review(
+    path: Path,
+    classifications: list[dict],
+    *,
+    design_conformance: dict | None = None,
+) -> None:
     path.write_text(json.dumps({
         "classifications": classifications,
         "summary": {},
+        "design_conformance": design_conformance or {
+            "verdict": "Aligned",
+            "findings": [],
+        },
     }))
 
 
@@ -78,6 +87,75 @@ def test_parser_missing_classifications_rejects(tmp_path):
     p = tmp_path / "ralph-review.json"
     p.write_text('{"summary": {}}')
     with pytest.raises(SchemaError, match="classifications"):
+        ralph.parse_review_statuses(p)
+
+
+def test_parser_missing_design_conformance_rejects(tmp_path):
+    p = tmp_path / "ralph-review.json"
+    p.write_text(json.dumps({
+        "classifications": [{
+            "req_id": "t-1.r1", "scope_id": "t-1",
+            "classification": "Fully", "evidence": "src/x.py:1",
+        }],
+        "summary": {},
+    }))
+    with pytest.raises(SchemaError, match="design_conformance"):
+        ralph.parse_review_statuses(p)
+
+
+def test_blocking_design_drift_caps_affected_scope_at_deviated(tmp_path):
+    p = tmp_path / "ralph-review.json"
+    _write_ralph_review(p, [{
+        "req_id": "t-1.r1", "scope_id": "t-1",
+        "classification": "Fully", "evidence": "src/x.py:1",
+    }], design_conformance={
+        "verdict": "Deviated",
+        "findings": [{
+            "scope_ids": ["t-1"],
+            "design_ref": "design.md:10-14",
+            "evidence": "src/x.py:1-9",
+            "difference": "Uses a second authority path",
+            "correction": "Remove the unaccepted path",
+        }],
+    })
+    assert ralph.parse_review_statuses(p) == {"t-1": "Deviated"}
+
+
+def test_design_conformance_rejects_inconsistent_verdict(tmp_path):
+    p = tmp_path / "ralph-review.json"
+    _write_ralph_review(p, [{
+        "req_id": "t-1.r1", "scope_id": "t-1",
+        "classification": "Fully", "evidence": "src/x.py:1",
+    }], design_conformance={
+        "verdict": "Aligned",
+        "findings": [{
+            "scope_ids": ["t-1"],
+            "design_ref": "design.md:10-14",
+            "evidence": "src/x.py:1-9",
+            "difference": "Uses method B instead of method A",
+            "correction": "Realign the implementation",
+        }],
+    })
+    with pytest.raises(SchemaError, match="inconsistent"):
+        ralph.parse_review_statuses(p)
+
+
+def test_design_conformance_rejects_unknown_scope(tmp_path):
+    p = tmp_path / "ralph-review.json"
+    _write_ralph_review(p, [{
+        "req_id": "t-1.r1", "scope_id": "t-1",
+        "classification": "Fully", "evidence": "src/x.py:1",
+    }], design_conformance={
+        "verdict": "Deviated",
+        "findings": [{
+            "scope_ids": ["t-ghost"],
+            "design_ref": "design.md:10-14",
+            "evidence": "src/x.py:1-9",
+            "difference": "Uses method B instead of method A",
+            "correction": "Realign the implementation",
+        }],
+    })
+    with pytest.raises(SchemaError, match="not present in classifications"):
         ralph.parse_review_statuses(p)
 
 
@@ -203,6 +281,7 @@ def test_ralph_state_roundtrip(tmp_path):
         regressions=[],
         trace_hash="sha256:trace",
         test_plan_hash="sha256:testplan",
+        design_hash="sha256:design",
         started_at="2026-04-20T00:00:00Z",
         last_iter_at="2026-04-20T00:05:00Z",
     )
@@ -213,6 +292,7 @@ def test_ralph_state_roundtrip(tmp_path):
     assert loaded.statuses_history[-1] == {"t-1": "Fully", "t-2": "Fully"}
     assert loaded.trace_hash == "sha256:trace"
     assert loaded.test_plan_hash == "sha256:testplan"
+    assert loaded.design_hash == "sha256:design"
 
 
 def test_ralph_state_absent_returns_empty(tmp_path):
