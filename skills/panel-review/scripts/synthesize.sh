@@ -12,6 +12,9 @@ PROMPT_FILE="${1:-}"
 VENDORS_YAML="${2:-$SCRIPT_DIR/../vendors.yaml}"
 RUN_DIR="${3:-}"
 SYNTHESIS_CALL_TIMEOUT="${SYNTHESIS_CALL_TIMEOUT:-300}"
+# At the timeout deadline, keep waiting in windows of this many seconds while
+# the vendor is still producing output; kill only after a silent window.
+SYNTHESIS_CALL_TIMEOUT_EXTEND="${SYNTHESIS_CALL_TIMEOUT_EXTEND:-300}"
 
 if [ -z "$PROMPT_FILE" ] || [ -z "$RUN_DIR" ]; then
   printf "Usage: synthesize.sh <prompt_file> <vendors_yaml> <run_dir>\n" >&2
@@ -115,6 +118,7 @@ if "$PANEL_VENDOR_CALL" \
   "${CALL_ARGS[@]}" \
   --id "$SYNTHESIS_ID" \
   --timeout "$SYNTHESIS_CALL_TIMEOUT" \
+  --timeout-extend "$SYNTHESIS_CALL_TIMEOUT_EXTEND" \
   --prompt-file "$SYNTHESIS_PROMPT" \
   --output-dir "$RUN_DIR" \
   --min-success 1 > "$SYNTHESIS_CALL_LOG" 2>&1; then

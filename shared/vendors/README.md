@@ -66,6 +66,9 @@ Common arguments:
   prompt that is sent only after an existing native session is found
 - `--min-success N` to set how many selected vendors must succeed
 - `--timeout SECONDS` to stop a hanging vendor call
+- `--timeout-extend SECONDS` to extend the deadline in SECONDS-long windows
+  while the vendor's stream output keeps growing; the call is killed only
+  after a full window with no new output (`0` disables, the default)
 - `--native-arg ARG` for a selected vendor's raw CLI-specific escape hatch
 - `--env NAME=VALUE` for per-call environment overrides
 - `--schema-file FILE` to constrain the response to a JSON Schema. Output lands

@@ -35,10 +35,14 @@ One of:
 
 - **Vendor CLI not installed / not on PATH.** Run
   `shared/vendors/scripts/doctor.sh`.
-- **Vendor took longer than the call timeout** (default 5 min). Broader file
-  manifests take longer to inspect. Narrow Phase 1 to files the doc names, or
-  split Phase 2 into subsystem/path-based rounds; do not paste or trim file
-  bodies. Raise `PANEL_CALL_TIMEOUT` only for an already-focused round.
+- **Vendor stalled past the call timeout** (default 5 min). A vendor that
+  is still streaming output at the deadline is not killed — panel-review
+  extends it in 5-minute windows (`PANEL_CALL_TIMEOUT_EXTEND`, default 300)
+  and only kills after a silent window, so a timeout here means the vendor
+  produced nothing for a full window. Broader file manifests take longer to
+  inspect. Narrow Phase 1 to files the doc names, or split Phase 2 into
+  subsystem/path-based rounds; do not paste or trim file bodies. Raise
+  `PANEL_CALL_TIMEOUT` only for an already-focused round.
 - **Auth drifted mid-session.** For Agy, run `agy` once interactively to refresh
   sign-in, then confirm the configured/default model with `agy models`.
 

@@ -49,7 +49,11 @@ diagnostics; callers should not depend on `raw` for normal workflow logic.
 many selected vendors must succeed, then let the upper-layer skill decide how to
 handle partial results.
 
-Use `--timeout SECONDS` for every workflow that can be run unattended. If one
+Use `--timeout SECONDS` for every workflow that can be run unattended. Add
+`--timeout-extend SECONDS` when a slow-but-alive vendor should not be killed:
+at the deadline the wrapper checks the vendor's `stream` file, and while it
+keeps growing the call gets another window of that many seconds; only a full
+window with no new output triggers the kill. If one
 vendor hangs, the wrapper can mark that vendor failed while the remaining
 outputs stay available.
 

@@ -108,7 +108,10 @@ A configured call that fails mid-run is marked failed and never substituted —
 substitution would silently weaken the divergence signal. `launch.sh` aborts
 if fewer than 2 panel outputs succeed. Each vendor call has a **5 minute**
 timeout by default via `PANEL_CALL_TIMEOUT=300`; override with
-`PANEL_CALL_TIMEOUT=<seconds>` only for a focused prompt.
+`PANEL_CALL_TIMEOUT=<seconds>` only for a focused prompt. The timeout kills
+only stalled vendors: if a vendor is still producing output when the deadline
+hits, the call is extended in 5-minute windows (`PANEL_CALL_TIMEOUT_EXTEND=300`,
+`0` disables) and killed only after a full window with no new output.
 
 Path-based discovery drives `shared/vendors/scripts/call.sh` with
 `--cwd <repo/source>` and `--yolo` for each panel vendor. The shared wrapper

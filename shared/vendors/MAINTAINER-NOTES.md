@@ -66,6 +66,15 @@ real integration is intentionally being tested.
 
 ## Load-bearing implementation details
 
+- Keep the `--timeout-extend` loop inside the timer subshell in `call.sh`:
+  at the deadline it re-checks `stream_size()` and grants another window while
+  the vendor's `stream` file keeps growing. panel-review's `launch.sh` and
+  `synthesize.sh` pass the flag unconditionally.
+- Keep the codex non-interactive preamble in `vendors_run_codex`
+  (`VENDORS_CODEX_PREAMBLE=0` opts out). On large analysis prompts GPT-5.x via
+  single-shot `codex exec` otherwise spends its only turn asking "confirm
+  proceeding?", and that question becomes the final `out`. Other vendors'
+  headless modes answer directly, so this is codex-only.
 - Use `vendors_lower()` instead of Bash 4 `${var,,}` syntax.
 - Avoid associative arrays; macOS Bash 3.2 does not support them.
 - Keep `set -eo pipefail` in `call.sh`; nounset has caused false failures with

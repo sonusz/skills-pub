@@ -92,6 +92,12 @@ Prompt and instruction input:
 Runtime and native options:
   --cwd DIR                      Run from this working directory
   --timeout SECONDS              Per-vendor timeout
+  --timeout-extend SECONDS       At the timeout deadline, if the vendor's
+                                 stream output grew since the last check,
+                                 wait another SECONDS instead of killing;
+                                 repeats while output keeps growing. Kill
+                                 happens only after a full window with no
+                                 new output. 0 disables (default).
   --native-arg ARG               Raw selected-vendor CLI arg; repeatable
   --env NAME=VALUE               Per-call environment override; repeatable
   --dry-run                      Print resolved command(s) without calling models
@@ -136,6 +142,7 @@ SESSION_KEYS=()
 SESSION_MAX_TURNS=""
 MIN_SUCCESS=""
 TIMEOUT_SECONDS=0
+TIMEOUT_EXTEND_SECONDS=0
 
 VENDORS_CWD=""
 VENDORS_EFFECTIVE_CWD=""
@@ -355,6 +362,15 @@ while [ "$#" -gt 0 ]; do
       TIMEOUT_SECONDS="${1#*=}"
       shift
       ;;
+    --timeout-extend)
+      require_value "$1" "${2-}"
+      TIMEOUT_EXTEND_SECONDS="$2"
+      shift 2
+      ;;
+    --timeout-extend=*)
+      TIMEOUT_EXTEND_SECONDS="${1#*=}"
+      shift
+      ;;
     --speed|--speed=*|--add-dir|--add-dir=*|--tools|--tools=*|--sandbox|--sandbox=*|--output-format|--output-format=*|--json|--schema-json|--schema-json=*)
       die "$1 is not a shared option; pass vendor-specific controls with --native-arg"
       ;;
@@ -418,6 +434,10 @@ esac
 
 case "$TIMEOUT_SECONDS" in
   ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
+esac
+
+case "$TIMEOUT_EXTEND_SECONDS" in
+  ''|*[!0-9]*) die "--timeout-extend must be a non-negative integer" ;;
 esac
 
 case "$MIN_SUCCESS" in
@@ -626,6 +646,15 @@ kill_tree() {
   done < <(pgrep -P "$pid" 2>/dev/null || true)
 
   kill "-$signal_name" "$pid" 2>/dev/null || true
+}
+
+stream_size() {
+  # Size in bytes of the vendor's stream file; 0 if it does not exist yet.
+  if [ -f "$VENDORS_STREAM_FILE" ]; then
+    wc -c < "$VENDORS_STREAM_FILE" | tr -d '[:space:]'
+  else
+    printf 0
+  fi
 }
 
 collect_process_tree() {
@@ -1010,6 +1039,19 @@ run_one_vendor() {
     RUN_PID=$!
     (
       sleep "$TIMEOUT_SECONDS"
+      # With --timeout-extend, a deadline reached while output is still
+      # flowing is not a stall: grant another window whenever the stream
+      # file grew since the previous check, and kill only after a full
+      # window passes with no new output.
+      prev_size=0
+      while [ "$TIMEOUT_EXTEND_SECONDS" -gt 0 ]; do
+        cur_size=$(stream_size)
+        if [ "$cur_size" -le "$prev_size" ]; then
+          break
+        fi
+        prev_size="$cur_size"
+        sleep "$TIMEOUT_EXTEND_SECONDS"
+      done
       : > "$timeout_marker"
       kill_tree "$RUN_PID" TERM
       sleep 2
