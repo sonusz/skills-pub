@@ -237,6 +237,52 @@ calibration then changes nothing, but the deferral-soundness gate
 question above still applies to every `contract` item, and interior
 thinness on contract items remains a non-finding.
 
+## Design-stage POC (gate question)
+
+Some PRDs carry a "Design-stage POC clause" architectural principle (a
+clause requiring a bounded, torn-down POC for a high-risk premise), or
+design.md itself names a high-risk factual gap it resolved with a POC. When
+either is true, answer one more
+gate question: **did the POC actually run, in this stage, and inform the
+design?**
+
+- **Record present and complete?** Look for
+  `<FEATURE_ACTIVE>/scratch/poc-<slug>/` — the design stage's only writable
+  location beyond its five owned artifacts. It needs: a named, falsifiable
+  hypothesis; stated cost/time bounds; phase scripts that each open with an
+  identity gate against the repository's designated non-production account;
+  a resource manifest appended at creation time; a results file with a
+  one-line verdict and measured numbers; and verified teardown (a sweep,
+  not merely issued delete calls).
+- **Does design.md cite the measured result?** A POC that ran but left
+  design.md's wording unchanged ("should support...", "is likely to...")
+  did not actually inform the design.
+- **Was it deferred, or replaced by a conditional promise?** A required POC
+  recorded as future build-stage work, or hedged as "if X becomes
+  available, we will run..." instead of an actual attempt-then-degrade
+  record, does not satisfy the clause.
+
+A required POC that is missing, deferred to build, or replaced by a
+conditional promise is **always `invariant_violation` / `P0`**, regardless
+of the cited requirement's rigor level or the PRD's release threshold — it
+is evidence withheld from the design under review, not deferrable follow-up
+work. Use category `missing` (absent or deferred) or `other` (present but
+uncited in design.md); target `primary_pair.design.md` so the design stage
+reruns and actually runs — or completes — the POC. Exception: a record
+showing a genuine, logged attempt that still failed excuses the missing
+**result**, never a handoff. Grade what design.md then says: an honest
+"unresolved — attempted X, blocked by Y" in Design decisions is a normal
+design gap (`risk`, priority per the release path), but any wording that
+moves the POC into build — "the build stage's first blocking step", a
+conditional promise — stays `invariant_violation` / `P0` even when the
+attempt was honest.
+
+Do not require a second POC run merely to reproduce a record that already
+carries a timestamp, the environment identity, an artifact hash or pinned
+version, its inputs, its result, and its failure mode (if any) — that
+record is evidence; proposing a rerun without a changed underlying question
+is itself an `opinion`-level waste finding, not a virtue.
+
 ## Targets (routing)
 
 Every finding includes a `targets` list: the filename-qualified

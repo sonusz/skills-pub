@@ -450,6 +450,82 @@ Every artifact starts with:
 
 (scope.json carries the same info as top-level JSON fields.)
 
+## Design-stage POC
+
+Most designs need no POC. Run one only when the PRD requires it — an
+`### A<n>:` architectural principle in the shape described below — or,
+absent such a principle, when this design rests on a high-risk factual
+question that code, authoritative documentation, and the
+discretionary-read set genuinely cannot settle. Do not invent a POC the
+PRD does not ask for merely because a claim would read more confidently
+with one; that is over-design, not rigor.
+
+**Run it in this stage, not build.** Verified: the harness dispatches every
+coding stage, this one included, through `run_stage_subprocess`, which
+passes `yolo=True` — the same sandbox-bypass mode as `build` — so you have a
+real shell and real tool access, not a read-only sandbox. A required POC
+tests whether the design's premises hold; build implements an
+already-accepted design and does not re-litigate its premises. Deferring a
+required POC to build, or turning it into a conditional promise ("if
+credentials become available, run..."), is a design-review P0 finding, not
+a legitimate build handoff.
+
+A missing tool or missing credential is a fixable obstacle, never a reason
+to degrade the POC into a promise:
+
+1. Check whichever identity/credential the repository's own deployment
+   contract names for its designated non-production account — read the
+   contract file (or this repo's equivalent), do not guess a name.
+2. Check environment variables or profile files the contract points at.
+3. Try the check once (the account-identity call the contract's own
+   tooling uses, or equivalent).
+
+Only after a real attempt fails do you degrade — and when you do, say so
+explicitly in design.md's Design decisions section: name what you tried and
+why it did not resolve. A prior run got this wrong exactly this way: it hit
+a missing-credentials error on the first attempt and wrote the PRD-required
+POC into the design as "the build stage's first blocking step" — that is
+not degrading after a real attempt, it is skipping the obligation and
+hoping build absorbs it. Fixing that took an operator-issued rerun with the
+credential actually made available; do not manufacture the need for that
+correction when one real attempt would have worked.
+
+**Record it under `<FEATURE_ACTIVE>/scratch/poc-<slug>/`** — inside
+SCRATCH_DIR, the only path beyond your five owned artifacts this stage may
+write (see WRITABLE_PATHS in the Orchestrator context). A POC directory
+placed directly under `<FEATURE_ACTIVE>/`, outside scratch, is an
+out-of-scope write and will be flagged as a containment failure. Layout,
+adapted from a shipped precedent — file names may vary, the shape may not:
+
+- `README.md` — the hypothesis (one falsifiable sentence), the cost/time
+  bounds, and the probe design (what you measure, and how it tells success
+  from failure without exposing more than the POC needs).
+- numbered phase scripts (`10-<phase>.sh` … `N0-teardown.sh`, `N0-sweep.sh`),
+  **each beginning with an identity gate** that resolves the current
+  credential identity and refuses — non-zero exit, logged — on any mismatch
+  against the repository's designated non-production account. Not optional,
+  even for a single-script POC.
+- `commands.log` — every command actually run, not a curated subset.
+- a resource manifest, appended at creation time for every resource the
+  POC creates, uniquely tagged to this POC, so a crash mid-run still leaves
+  a true accounting.
+- `results.md` — a one-line verdict (CONFIRMED / REFUTED / INCONCLUSIVE),
+  the measured numbers against the stated bounds, and the negative
+  security test of the POC's own surface.
+- teardown proof — a teardown log plus a sweep that re-verifies every
+  tagged/manifested resource against the authoritative API, not merely that
+  a delete call was issued.
+
+**Write the measured numbers into design.md**, replacing any inferred or
+hedged wording ("should support", "is likely to allow") that the POC's
+result now settles. The design-review gate checks whether design.md cites
+the measured result, not merely whether a POC directory exists.
+
+A timestamped attempt that already records environment/identity, an
+artifact hash or pinned version, its inputs, its result, and its failure
+mode (if any) is evidence. Do not re-run it for ceremony on a later design
+turn unless the underlying question actually changed.
+
 ## Format requirements
 
 - Every active `in_scope[].id` appears in ≥1 trace row AND ≥1
