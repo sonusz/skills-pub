@@ -16,6 +16,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -88,6 +89,23 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _required_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid {label}: {exc}")
+    if not isinstance(value, dict):
+        raise SystemExit(f"invalid {label}: expected object")
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise SystemExit(f"cannot hash recovery evidence: {exc}")
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -426,6 +444,42 @@ def _process_group_members(pgid: int) -> set[int]:
     return members
 
 
+def _strict_process_identity(pid: int) -> tuple[str, int, str] | None:
+    """Read one Linux identity; only a vanished proc entry means absent."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SystemExit(f"cannot verify recovery process {pid}: {exc}")
+    try:
+        fields = raw[raw.rfind(")") + 2:].split()
+        return fields[19], int(fields[2]), fields[0]
+    except (IndexError, ValueError) as exc:
+        raise SystemExit(f"cannot parse recovery process {pid}: {exc}")
+
+
+def _require_absent_identity(pid: int, start_id: str, label: str) -> None:
+    current = _strict_process_identity(pid)
+    if current is not None:
+        relation = "same identity" if current[0] == start_id else "reused identity"
+        raise SystemExit(f"{label} pid has {relation}: refusing recovery")
+
+
+def _require_empty_process_group(pgid: int) -> None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        raise SystemExit("cannot verify recovery process group without /proc")
+    if _strict_process_identity(pgid) is not None:
+        raise SystemExit("recovery process-group leader pid was reused")
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        identity = _strict_process_identity(int(entry.name))
+        if identity is not None and identity[1] == pgid and identity[2] not in {"Z", "X"}:
+            raise SystemExit("recovery process group still has live members")
+
+
 def _signal_members(pids: set[int], signal_number: int) -> None:
     for pid in pids:
         try:
@@ -515,6 +569,165 @@ def cmd_interrupt(args: argparse.Namespace) -> int:
         for raw_plan in args.plan
     )
     print(released)
+    return 0
+
+
+def _host_boot() -> tuple[str, str]:
+    host = socket.gethostname().strip()
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError as exc:
+        raise SystemExit(f"cannot verify local boot identity: {exc}")
+    if not host or not boot:
+        raise SystemExit("cannot verify local host and boot identity")
+    return host, boot
+
+
+def _positive_int(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise SystemExit(f"invalid {label}")
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise SystemExit(f"invalid {label}")
+    if result <= 0:
+        raise SystemExit(f"invalid {label}")
+    return result
+
+
+def _identity(value: Any, label: str) -> tuple[int, str, int, str]:
+    if not isinstance(value, dict):
+        raise SystemExit(f"missing {label} identity")
+    pid = _positive_int(value.get("pid"), f"{label} pid")
+    pgid = _positive_int(value.get("pgid"), f"{label} pgid")
+    start = value.get("start_id")
+    token_hash = value.get("run_token_sha256")
+    if not isinstance(start, str) or not start.isdigit():
+        raise SystemExit(f"invalid {label} start identity")
+    if not isinstance(token_hash, str) or re.fullmatch(r"[0-9a-f]{64}", token_hash) is None:
+        raise SystemExit(f"invalid {label} run token digest")
+    return pid, start, pgid, token_hash
+
+
+def _recovery_evidence(
+    *, plan_path: Path, plan: dict[str, Any], owner_path: Path,
+    identities_path: Path, result_path: Path,
+) -> tuple[int, str, int, int, str, str]:
+    owner_doc = _required_object(owner_path, "guard owner evidence")
+    identities_doc = _required_object(identities_path, "guard identities evidence")
+    result = _required_object(result_path, "guard result evidence")
+    host, boot = _host_boot()
+    for label, doc in (("owner", owner_doc), ("identities", identities_doc), ("result", result)):
+        if doc.get("hostname") != host or doc.get("boot_id") != boot:
+            raise SystemExit(f"guard {label} evidence is from another host or boot")
+    guard = _identity(owner_doc.get("owner"), "guard owner")
+    if _identity(identities_doc.get("guard_owner"), "guard owner") != guard \
+            or _identity(result.get("guard_owner"), "guard owner") != guard:
+        raise SystemExit("guard identity documents disagree")
+    if result.get("guard_owner_sha256") != _sha256_file(owner_path) \
+            or result.get("guard_identities_sha256") != _sha256_file(identities_path):
+        raise SystemExit("guard result does not bind its identity evidence")
+    if result.get("terminal") is not True or result.get("reason") not in {"quota", "deadline"}:
+        raise SystemExit("guard result is not a recoverable terminal")
+    returncode = result.get("returncode")
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise SystemExit("guard result lacks a terminal return code")
+    try:
+        empty_scans = int(result.get("consecutive_empty_scans", 0))
+    except (TypeError, ValueError):
+        empty_scans = 0
+    if result.get("survivors") != [] or empty_scans < 2:
+        raise SystemExit("guard result does not prove an empty run")
+
+    raw_record = plan.get("record_path")
+    token = plan.get("lease_token")
+    if not isinstance(raw_record, str) or not isinstance(token, str) or not token:
+        raise SystemExit("invalid session plan")
+    bindings = result.get("session_leases")
+    if not isinstance(bindings, list):
+        raise SystemExit("guard result lacks session lease bindings")
+    binding = next((row for row in bindings if isinstance(row, dict)
+                    and row.get("plan_path") == str(plan_path)
+                    and row.get("plan_sha256") == _sha256_file(plan_path)), None)
+    if binding is None:
+        raise SystemExit("guard result does not bind the session plan")
+    if binding.get("record_path") != str(Path(raw_record).expanduser().resolve()) \
+            or binding.get("lease_token_sha256") != hashlib.sha256(token.encode()).hexdigest():
+        raise SystemExit("guard result does not bind the exact session lease")
+    lease = _identity({
+        "pid": binding.get("owner_pid"), "start_id": binding.get("owner_start_id"),
+        "pgid": binding.get("owner_pgid"), "run_token_sha256": guard[3],
+    }, "lease owner")
+    identities = identities_doc.get("identities")
+    if not isinstance(identities, list) or not any(
+        isinstance(row, dict) and _identity(row, "run") == lease for row in identities
+    ):
+        raise SystemExit("lease owner is absent from the guarded identity inventory")
+    events = result.get("events")
+    if not isinstance(events, list) or not any(
+        isinstance(event, dict) and event.get("pid") == lease[0]
+        and event.get("start_id") == lease[1] and event.get("signal") == signal.SIGKILL
+        for event in events
+    ):
+        raise SystemExit("guard result does not prove lease-owner termination")
+    _require_absent_identity(guard[0], guard[1], "guard owner")
+    _require_absent_identity(lease[0], lease[1], "lease owner")
+    _require_empty_process_group(lease[2])
+    return lease[0], lease[1], lease[2], guard[0], guard[1], _sha256_file(result_path)
+
+
+def cmd_recover_interrupted(args: argparse.Namespace) -> int:
+    """Release one exact orphan lease proven dead by a same-boot guard."""
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    plan_path = Path(args.plan).expanduser().resolve()
+    plan = _required_object(plan_path, "session plan")
+    record_path = Path(str(plan.get("record_path", ""))).expanduser().resolve()
+    if record_path.parent != state_dir or record_path.suffix != ".json" \
+            or record_path.stem != plan.get("identity_hash"):
+        raise SystemExit("session record is outside the canonical state directory")
+    owner_path = Path(args.guard_owner).expanduser().resolve()
+    identities_path = Path(args.guard_identities).expanduser().resolve()
+    result_path = Path(args.guard_result).expanduser().resolve()
+    evidence = _recovery_evidence(
+        plan_path=plan_path, plan=plan, owner_path=owner_path,
+        identities_path=identities_path, result_path=result_path,
+    )
+    owner_pid, owner_start, owner_pgid, guard_pid, guard_start, result_hash = evidence
+    token = str(plan.get("lease_token"))
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with _record_guard(record_path):
+        if _required_object(plan_path, "session plan") != plan:
+            raise SystemExit("session plan changed during recovery")
+        if _recovery_evidence(
+            plan_path=plan_path, plan=plan, owner_path=owner_path,
+            identities_path=identities_path, result_path=result_path,
+        ) != evidence:
+            raise SystemExit("guard evidence changed during recovery")
+        record = _required_object(record_path, "session record")
+        current = record.get("lease_token")
+        if current is None and record.get("last_recovered_lease_sha256") == token_hash \
+                and record.get("last_recovery_guard_sha256") == result_hash:
+            print(0)
+            return 0
+        if record.get("identity_hash") != plan.get("identity_hash") \
+                or current != token or record.get("lease_owner_pid") != owner_pid:
+            raise SystemExit("session lease changed before recovery")
+        if record.get("pending_mode") != plan.get("mode") \
+                or record.get("pending_session_id") != plan.get("session_id") \
+                or record.get("pending_turn_number") != plan.get("turn_number"):
+            raise SystemExit("session pending state does not match its plan")
+        _require_absent_identity(guard_pid, guard_start, "guard owner")
+        _require_absent_identity(owner_pid, owner_start, "lease owner")
+        _require_empty_process_group(owner_pgid)
+        pending_mode = record.get("pending_mode")
+        for field in ("pending_session_id", "pending_mode", "pending_turn_number",
+                      "lease_token", "lease_owner_pid", "lease_expires_epoch"):
+            record.pop(field, None)
+        record.update(last_mode=pending_mode, last_success=False, last_interrupted=True,
+                      last_recovered_lease_sha256=token_hash,
+                      last_recovery_guard_sha256=result_hash, updated_at=_utc_now())
+        _atomic_write_json(record_path, record)
+    print(1)
     return 0
 
 
@@ -667,6 +880,14 @@ def _parser() -> argparse.ArgumentParser:
     interrupt.add_argument("--grace-sec", type=float, default=1.0)
     interrupt.add_argument("--plan", action="append", default=[])
     interrupt.set_defaults(func=cmd_interrupt)
+
+    recover = sub.add_parser("recover-interrupted")
+    recover.add_argument("--state-dir", required=True)
+    recover.add_argument("--plan", required=True)
+    recover.add_argument("--guard-owner", required=True)
+    recover.add_argument("--guard-identities", required=True)
+    recover.add_argument("--guard-result", required=True)
+    recover.set_defaults(func=cmd_recover_interrupted)
 
     observe = sub.add_parser("observe")
     observe.add_argument("--vendor", required=True)

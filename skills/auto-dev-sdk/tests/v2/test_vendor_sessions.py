@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import socket
 import os
 import signal
 import subprocess
@@ -30,6 +33,207 @@ from autodev.vendors.subprocess_runner import run_stage_subprocess
 
 SHARED_CALL = Path(__file__).resolve().parents[4] / "shared" / "vendors" / "scripts" / "call.sh"
 SESSION_HELPER = SHARED_CALL.with_name("session-state.py")
+
+
+
+def _proc_identity(pid: int) -> tuple[str, int]:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields = raw[raw.rfind(")") + 2:].split()
+    return fields[19], int(fields[2])
+
+
+def _write_recovery_evidence(
+    root: Path, *, plan_path: Path, owner_pid: int, owner_start: str,
+    owner_pgid: int, guard_pid: int, guard_start: str, guard_pgid: int,
+) -> tuple[Path, Path, Path]:
+    host = socket.gethostname()
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    run_digest = hashlib.sha256(b"test-run-token").hexdigest()
+    guard = {"pid": guard_pid, "start_id": guard_start, "pgid": guard_pgid,
+             "run_token_sha256": run_digest}
+    lease_owner = {"pid": owner_pid, "start_id": owner_start, "pgid": owner_pgid,
+                   "run_token_sha256": run_digest}
+    owner_path = root / "owner.json"
+    identities_path = root / "identities.json"
+    result_path = root / "result.json"
+    owner_doc = {"schema_version": "quota_guard_identity_v2", "hostname": host,
+                 "boot_id": boot, "owner": guard}
+    identities_doc = {"schema_version": "quota_guard_identity_v2", "hostname": host,
+                      "boot_id": boot, "guard_owner": guard,
+                      "identities": [guard, lease_owner]}
+    owner_path.write_text(json.dumps(owner_doc, sort_keys=True) + "\n")
+    identities_path.write_text(json.dumps(identities_doc, sort_keys=True) + "\n")
+    plan = json.loads(plan_path.read_text())
+    result_doc = {
+        "schema_version": "quota_guard_result_v2", "hostname": host, "boot_id": boot,
+        "guard_owner": guard,
+        "guard_owner_sha256": hashlib.sha256(owner_path.read_bytes()).hexdigest(),
+        "guard_identities_sha256": hashlib.sha256(identities_path.read_bytes()).hexdigest(),
+        "terminal": True, "reason": "quota", "returncode": -signal.SIGKILL,
+        "finished_at": time.time(), "detection": {"type": "rate_limit_event"},
+        "survivors": [], "consecutive_empty_scans": 2,
+        "events": [{"pid": owner_pid, "start_id": owner_start,
+                    "signal": signal.SIGKILL}],
+        "session_leases": [{
+            "plan_path": str(plan_path.resolve()),
+            "plan_sha256": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+            "record_path": str(Path(plan["record_path"]).resolve()),
+            "lease_token_sha256": hashlib.sha256(plan["lease_token"].encode()).hexdigest(),
+            "owner_pid": owner_pid, "owner_start_id": owner_start,
+            "owner_pgid": owner_pgid,
+        }],
+    }
+    result_path.write_text(json.dumps(result_doc, sort_keys=True) + "\n")
+    return owner_path, identities_path, result_path
+
+
+def test_postmortem_recovery_preserves_session_and_is_idempotent(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    first = tmp_path / "first.json"
+    subprocess.run([
+        sys.executable, str(SESSION_HELPER), "plan", "--state-dir", str(state),
+        "--key", "recover-key", "--vendor", "claude", "--cwd", str(tmp_path),
+        "--owner-pid", str(os.getpid()), "--output", str(first),
+    ], check=True)
+    subprocess.run([
+        sys.executable, str(SESSION_HELPER), "finalize", "--plan", str(first),
+        "--success", "--observed-session-id", "11111111-1111-4111-8111-111111111111",
+    ], check=True)
+
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             start_new_session=True)
+    guard = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             start_new_session=True)
+    try:
+        owner_start, owner_pgid = _proc_identity(owner.pid)
+        guard_start, guard_pgid = _proc_identity(guard.pid)
+        plan_path = tmp_path / "pending.json"
+        subprocess.run([
+            sys.executable, str(SESSION_HELPER), "plan", "--state-dir", str(state),
+            "--key", "recover-key", "--vendor", "claude", "--cwd", str(tmp_path),
+            "--owner-pid", str(owner.pid), "--output", str(plan_path),
+        ], check=True)
+        evidence = _write_recovery_evidence(
+            tmp_path, plan_path=plan_path, owner_pid=owner.pid,
+            owner_start=owner_start, owner_pgid=owner_pgid, guard_pid=guard.pid,
+            guard_start=guard_start, guard_pgid=guard_pgid,
+        )
+        command = [
+            sys.executable, str(SESSION_HELPER), "recover-interrupted",
+            "--state-dir", str(state), "--plan", str(plan_path),
+            "--guard-owner", str(evidence[0]), "--guard-identities", str(evidence[1]),
+            "--guard-result", str(evidence[2]),
+        ]
+        live = subprocess.run(command, capture_output=True, text=True)
+        assert live.returncode != 0 and "pid has same identity" in live.stderr
+
+        owner_doc = json.loads(evidence[0].read_text())
+        del owner_doc["boot_id"]
+        evidence[0].write_text(json.dumps(owner_doc) + "\n")
+        historical = subprocess.run(command, capture_output=True, text=True)
+        assert historical.returncode != 0 and "another host or boot" in historical.stderr
+        owner_doc["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        evidence[0].write_text(json.dumps(owner_doc, sort_keys=True) + "\n")
+        result_doc = json.loads(evidence[2].read_text())
+        result_doc["guard_owner_sha256"] = hashlib.sha256(evidence[0].read_bytes()).hexdigest()
+        evidence[2].write_text(json.dumps(result_doc, sort_keys=True) + "\n")
+
+        for proc in (owner, guard):
+            os.killpg(proc.pid, signal.SIGKILL)
+            assert proc.wait(timeout=5) == -signal.SIGKILL
+        result_doc["terminal"] = False
+        evidence[2].write_text(json.dumps(result_doc, sort_keys=True) + "\n")
+        nonterminal = subprocess.run(command, capture_output=True, text=True)
+        assert nonterminal.returncode != 0 and "not a recoverable terminal" in nonterminal.stderr
+        result_doc["terminal"] = True
+        evidence[2].write_text(json.dumps(result_doc, sort_keys=True) + "\n")
+
+        record_path = Path(json.loads(plan_path.read_text())["record_path"])
+        original_record = json.loads(record_path.read_text())
+        changed_record = dict(original_record, lease_token="replacement-token")
+        record_path.write_text(json.dumps(changed_record) + "\n")
+        changed = subprocess.run(command, capture_output=True, text=True)
+        assert changed.returncode != 0 and "lease changed" in changed.stderr
+        record_path.write_text(json.dumps(original_record) + "\n")
+
+        assert subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip() == "1"
+        assert subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip() == "0"
+        record = json.loads(Path(json.loads(plan_path.read_text())["record_path"]).read_text())
+        assert record["session_id"] == "11111111-1111-4111-8111-111111111111"
+        assert record["session_turn_count"] == 1
+        assert record["last_interrupted"] is True
+        assert "lease_token" not in record and "pending_session_id" not in record
+    finally:
+        for proc in (owner, guard):
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+
+
+def test_postmortem_recovery_rejects_reused_pid_identity(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    plan_path = tmp_path / "pending.json"
+    subprocess.run([
+        sys.executable, str(SESSION_HELPER), "plan", "--state-dir", str(state),
+        "--key", "reused-key", "--vendor", "openai", "--cwd", str(tmp_path),
+        "--owner-pid", str(os.getpid()), "--output", str(plan_path),
+    ], check=True)
+    absent_guard = 1_000_000_002
+    evidence = _write_recovery_evidence(
+        tmp_path, plan_path=plan_path, owner_pid=os.getpid(), owner_start="1",
+        owner_pgid=os.getpgrp(), guard_pid=absent_guard, guard_start="1",
+        guard_pgid=absent_guard,
+    )
+    command = [
+        sys.executable, str(SESSION_HELPER), "recover-interrupted",
+        "--state-dir", str(state), "--plan", str(plan_path),
+        "--guard-owner", str(evidence[0]), "--guard-identities", str(evidence[1]),
+        "--guard-result", str(evidence[2]),
+    ]
+    refused = subprocess.run(command, capture_output=True, text=True)
+    assert refused.returncode != 0 and "reused identity" in refused.stderr
+
+
+def test_postmortem_recovery_rejects_unknown_proc_read(monkeypatch) -> None:
+    spec = importlib.util.spec_from_file_location("session_state_under_test", SESSION_HELPER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original = module.Path.read_text
+
+    def denied(path, *args, **kwargs):
+        if str(path).startswith("/proc/"):
+            raise PermissionError("synthetic denied proc read")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "read_text", denied)
+    with pytest.raises(SystemExit, match="cannot verify recovery process"):
+        module._strict_process_identity(12345)
+
+
+def test_postmortem_recovery_rejects_reused_process_group_leader(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    plan_path = tmp_path / "pending.json"
+    absent_owner = 1_000_000_001
+    absent_guard = 1_000_000_002
+    subprocess.run([
+        sys.executable, str(SESSION_HELPER), "plan", "--state-dir", str(state),
+        "--key", "reused-group", "--vendor", "openai", "--cwd", str(tmp_path),
+        "--owner-pid", str(absent_owner), "--output", str(plan_path),
+    ], check=True)
+    evidence = _write_recovery_evidence(
+        tmp_path, plan_path=plan_path, owner_pid=absent_owner, owner_start="1",
+        owner_pgid=os.getpid(), guard_pid=absent_guard, guard_start="1",
+        guard_pgid=absent_guard,
+    )
+    command = [
+        sys.executable, str(SESSION_HELPER), "recover-interrupted",
+        "--state-dir", str(state), "--plan", str(plan_path),
+        "--guard-owner", str(evidence[0]), "--guard-identities", str(evidence[1]),
+        "--guard-result", str(evidence[2]),
+    ]
+    refused = subprocess.run(command, capture_output=True, text=True)
+    assert refused.returncode != 0 and "leader pid was reused" in refused.stderr
 
 
 FAKE_VENDOR = r'''#!{python}
