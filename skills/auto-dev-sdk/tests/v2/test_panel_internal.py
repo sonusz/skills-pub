@@ -249,6 +249,21 @@ def test_compose_synthesizer_prompt_lists_responding_vendors(feature_active):
     assert "### Reviewer: codex (m)\n\nVerdict: needs_revision" in sp
 
 
+def test_single_reviewer_synthesizer_prompt_allows_one_response(feature_active):
+    artifact = _make_artifact(feature_active)
+    from autodev.panel.runner import ReviewerResult
+    sp = _compose_synthesizer_prompt(
+        gate="design-review",
+        artifact_path=artifact,
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True,
+            output="Verdict: pass", elapsed_sec=1.0,
+        )],
+    )
+    assert "receive N independent reviews (N ≥ 1)" in sp
+    assert "N ≥ 2" not in sp
+
+
 def test_compose_synthesizer_prompt_does_not_truncate_or_inline_artifact(feature_active):
     artifact = feature_active / "design-packet.json"
     tail = "SYNTH_ARTIFACT_TAIL_SENTINEL"

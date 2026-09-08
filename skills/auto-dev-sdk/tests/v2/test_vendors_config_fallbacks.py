@@ -73,8 +73,20 @@ def test_backward_compatible_without_quota_fields():
     assert c.panel.min_responding_reviewers == 2
 
 
-@pytest.mark.parametrize("value", [0, 1, 3, True])
-def test_rejects_invalid_panel_response_quorum(value):
+def test_accepts_explicit_single_reviewer_quorum():
+    c = _load(
+        _GOOD.replace(
+            "panel:\n", "panel:\n  min_responding_reviewers: 1\n", 1,
+        ).replace(
+            "    - {vendor: cursor, model: gemini-3.1-pro, effort: max}\n", "",
+        )
+    )
+    assert len(c.panel.reviewers) == 1
+    assert c.panel.min_responding_reviewers == 1
+
+
+@pytest.mark.parametrize("value", [0, True])
+def test_rejects_non_positive_or_boolean_panel_response_quorum(value):
     with pytest.raises(ConfigError, match="min_responding_reviewers"):
         _load(
             _GOOD.replace(
@@ -83,6 +95,21 @@ def test_rejects_invalid_panel_response_quorum(value):
                 1,
             )
         )
+
+
+def test_rejects_panel_response_quorum_exceeding_reviewer_count():
+    with pytest.raises(ConfigError, match="exceeds configured reviewer count"):
+        _load(_GOOD.replace(
+            "panel:\n", "panel:\n  min_responding_reviewers: 3\n", 1,
+        ))
+
+
+def test_default_panel_quorum_remains_two_and_rejects_single_reviewer():
+    one_reviewer = _GOOD.replace(
+        "    - {vendor: cursor, model: gemini-3.1-pro, effort: max}\n", "",
+    )
+    with pytest.raises(ConfigError, match="exceeds configured reviewer count"):
+        _load(one_reviewer)
 
 
 _BASE = (

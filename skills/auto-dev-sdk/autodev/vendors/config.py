@@ -486,9 +486,9 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
     min_responding = _int_field(
         "min_responding_reviewers", DEFAULT_PANEL_MIN_RESPONDING_REVIEWERS,
     )
-    if isinstance(min_responding, bool) or min_responding < 2:
+    if isinstance(min_responding, bool) or min_responding < 1:
         raise ConfigError(
-            f"{path}: panel.min_responding_reviewers must be an int >= 2"
+            f"{path}: panel.min_responding_reviewers must be an int >= 1"
         )
     if min_responding > len(reviewers):
         raise ConfigError(

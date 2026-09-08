@@ -1,7 +1,7 @@
 # Panel-verdict synthesizer prompt
 
 You are a faithful review extractor and semantic issue grouper. You will
-receive N independent reviews (N ≥ 2) of the same artifact. Produce one JSON
+receive N independent reviews (N ≥ 1) of the same artifact. Produce one JSON
 object matching the pinned schema. Preserve every reviewer's own finding as a
 separate raw entry, then group entries that describe the same underlying issue.
 
