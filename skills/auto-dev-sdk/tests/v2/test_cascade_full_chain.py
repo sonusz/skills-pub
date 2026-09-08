@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from autodev.artifacts.common import write_markdown_with_hash
@@ -24,8 +25,20 @@ def _seed_all_ten(active: Path) -> None:
         "# Architecture Proposal\n",
         encoding="utf-8",
     )
+    subprocess.run(
+        ["git", "add", "docs/architecture-proposal.md"],
+        cwd=str(repo_root), check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "seed architecture input"],
+        cwd=str(repo_root), check=True,
+    )
+    base_ref = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), text=True,
+    ).strip()
     (active / "architecture.md").write_text(
-        "# Architecture Input\n\n- `docs/architecture-proposal.md`\n",
+        f"# Architecture Input\n\n- `docs/architecture-proposal.md`\n\n"
+        f"## Base ref\n\n`{base_ref}`\n",
         encoding="utf-8",
     )
     # prd
@@ -108,7 +121,7 @@ def _seed_all_ten(active: Path) -> None:
     atomic_write_json(active / "build.json", build_data)
 
     # implementation-index.json, implemented-spec.md, prd-checklist.json
-    index_path = write_implementation_index(active, repo_root=active)
+    index_path = write_implementation_index(active, repo_root=repo_root)
     index_h = hash_file(index_path)
     write_markdown_with_hash(active / "implemented-spec.md", "body\n",
                              source=str(index_path), source_hash=index_h)

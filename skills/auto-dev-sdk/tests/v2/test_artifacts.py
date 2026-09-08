@@ -122,9 +122,23 @@ def test_build_requires_test_exit_code(tmp_path):
     assert loaded.test_exit_code == 0
 
 
-def test_implementation_index_strips_build_semantics(tmp_path):
-    active = tmp_path / "active"
-    active.mkdir()
+def test_implementation_index_strips_build_semantics(feature_active, git_repo):
+    import subprocess
+
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
+    active = feature_active
+    (active / "architecture.md").write_text(
+        f"# Architecture\n\n## Base ref\n\n`{base}`\n",
+        encoding="utf-8",
+    )
+    (git_repo / "x.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "x.py"], cwd=str(git_repo), check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "feature implementation"],
+        cwd=str(git_repo), check=True,
+    )
     write_build(active / "build.json", BuildReport(
         source="scope.json", source_hash="sha256:" + "a" * 64,
         written="2026-04-20", test_cmd_run="pytest",
@@ -133,7 +147,7 @@ def test_implementation_index_strips_build_semantics(tmp_path):
         deviations=[{"scope_id": "s-1", "detail": "semantic diagnosis"}],
         blocking=True,
     ))
-    path = write_implementation_index(active, repo_root=tmp_path)
+    path = write_implementation_index(active, repo_root=git_repo)
     raw = path.read_text(encoding="utf-8")
     assert "semantic diagnosis" not in raw
     assert "deviations" not in raw

@@ -100,8 +100,8 @@ def _cumulative_changed_files(repo_root: Path, base_ref: str) -> list[str] | Non
     under-represents a multi-iteration build; the spec (built from this index)
     must see the entire implementation, or it documents only a slice and
     close-approval flags the rest as "missing". Returns None when git or the
-    base ref is unavailable, so the caller falls back to build.files_changed
-    (pre-base-ref behavior).
+    declared base ref is unavailable; callers must fail closed rather than
+    silently substituting the last build iteration's file list.
     """
     try:
         proc = subprocess.run(
@@ -122,14 +122,23 @@ def build_implementation_index(
     build_path = Path(feature_active) / "build.json"
     build = load_build(build_path)
     root = Path(repo_root) if repo_root else Path(feature_active)
-    # Prefer the cumulative product change-set vs the declared base ref over
-    # build.json's last-iteration files, so the spec sees the WHOLE feature.
-    files_changed: list[str] | None = None
+    # A cumulative product change-set requires an explicit feature boundary.
+    # Git's default branch and merge-base are insufficient evidence: the
+    # default may have advanced or absorbed an earlier slice of this feature,
+    # in which case inference would silently omit real implementation files.
     base_ref = discover_base_ref(feature_active)
-    if base_ref:
-        files_changed = _cumulative_changed_files(root, base_ref)
+    if not base_ref:
+        raise SchemaError(
+            "implementation-index requires an explicit ## Base ref in "
+            "feature-local architecture.md; refusing to infer the feature "
+            "boundary from origin/HEAD or main"
+        )
+    files_changed = _cumulative_changed_files(root, base_ref)
     if files_changed is None:
-        files_changed = list(build.files_changed)
+        raise SchemaError(
+            f"implementation-index declared Base ref {base_ref!r} cannot be "
+            "resolved or diffed; refusing to fall back to build.files_changed"
+        )
     return ImplementationIndex(
         source=str(build_path),
         source_hash=hash_file(build_path),

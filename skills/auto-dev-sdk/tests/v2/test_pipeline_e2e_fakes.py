@@ -41,8 +41,20 @@ def _write_prd(git_repo: Path, feature: str = "smoke") -> Path:
         "# Architecture Proposal\n",
         encoding="utf-8",
     )
+    subprocess.run(
+        ["git", "add", "docs/architecture-proposal.md"],
+        cwd=str(git_repo), check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "seed architecture base"],
+        cwd=str(git_repo), check=True,
+    )
+    base_ref = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
     (active / "architecture.md").write_text(
-        "# Architecture Input\n\n- `docs/architecture-proposal.md`\n",
+        "# Architecture Input\n\n- `docs/architecture-proposal.md`\n\n"
+        f"## Base ref\n\n`{base_ref}`\n",
         encoding="utf-8",
     )
     prd = active / "prd.md"

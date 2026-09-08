@@ -939,5 +939,135 @@ def test_cumulative_changed_files_excludes_harness_bookkeeping(git_repo):
     assert "gothena/x.go" in files
     assert not any(f.startswith("docs/features/") for f in files), files
 
-    # Unresolvable base ref → None (caller falls back to build.files_changed).
+    # The low-level probe reports failure; index construction fails closed.
     assert _cumulative_changed_files(git_repo, "no-such-ref-xyz") is None
+
+
+def _write_index_build(active, *, files_changed=None):
+    from autodev.artifacts.build import BuildReport, write_build
+
+    write_build(active / "build.json", BuildReport(
+        source="scope.json",
+        source_hash="sha256:" + "a" * 64,
+        written="2026-04-20",
+        test_cmd_run="pytest -q",
+        test_exit_code=0,
+        test_results={"passed": 7, "failed": 0, "skipped": 1},
+        files_changed=files_changed or ["last-iteration.py"],
+    ))
+
+
+def test_implementation_index_declared_base_wins_and_captures_whole_feature(git_repo):
+    import subprocess
+
+    from autodev.artifacts.implementation_index import build_implementation_index
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(git_repo), *args],
+            check=True, capture_output=True, text=True,
+        )
+
+    declared_base = git("rev-parse", "HEAD").stdout.strip()
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    (active / "architecture.md").write_text(
+        f"# Architecture\n\n## Base ref\n\n`{declared_base}`\n",
+        encoding="utf-8",
+    )
+    _write_index_build(active)
+
+    (git_repo / "early.py").write_text("EARLY = True\n", encoding="utf-8")
+    git("add", "early.py")
+    git("commit", "-qm", "early feature slice")
+    (git_repo / "late.py").write_text("LATE = True\n", encoding="utf-8")
+    (active / "ralph-state.json").write_text("{}\n", encoding="utf-8")
+    git("add", "late.py", "docs/features")
+    git("commit", "-qm", "late feature slice and bookkeeping")
+
+    # Deliberately point the apparent default at the late commit. The explicit
+    # declaration remains authoritative and preserves the earlier feature file.
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+    index = build_implementation_index(active, repo_root=git_repo)
+    assert index.files_changed == ["early.py", "late.py"]
+    assert index.test_cmd_run == "pytest -q"
+    assert index.test_exit_code == 0
+    assert index.test_results == {"passed": 7, "failed": 0, "skipped": 1}
+
+
+def test_implementation_index_missing_base_fails_even_with_linear_origin_head(git_repo):
+    import subprocess
+
+    import pytest
+
+    from autodev.artifacts.implementation_index import build_implementation_index
+    from autodev.errors import SchemaError
+
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    (active / "architecture.md").write_text("# Architecture\n", encoding="utf-8")
+    _write_index_build(active)
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+        cwd=str(git_repo), check=True,
+    )
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=str(git_repo), check=True,
+    )
+
+    with pytest.raises(SchemaError, match="requires an explicit ## Base ref"):
+        build_implementation_index(active, repo_root=git_repo)
+
+
+def test_implementation_index_missing_base_rejects_partial_default_merge(git_repo):
+    import subprocess
+
+    import pytest
+
+    from autodev.artifacts.implementation_index import build_implementation_index
+    from autodev.errors import SchemaError
+
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    (active / "architecture.md").write_text("# Architecture\n", encoding="utf-8")
+    _write_index_build(active)
+    (git_repo / "early.py").write_text("EARLY = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "early.py"], cwd=str(git_repo), check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "feature slice already on default"],
+        cwd=str(git_repo), check=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+        cwd=str(git_repo), check=True,
+    )
+    (git_repo / "late.py").write_text("LATE = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "late.py"], cwd=str(git_repo), check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "remaining feature slice"],
+        cwd=str(git_repo), check=True,
+    )
+
+    with pytest.raises(SchemaError, match="refusing to infer"):
+        build_implementation_index(active, repo_root=git_repo)
+
+
+def test_implementation_index_declared_base_must_resolve(git_repo):
+    import pytest
+
+    from autodev.artifacts.implementation_index import build_implementation_index
+    from autodev.errors import SchemaError
+
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    (active / "architecture.md").write_text(
+        "# Architecture\n\n## Base ref\n\n`missing/base`\n",
+        encoding="utf-8",
+    )
+    _write_index_build(active)
+
+    with pytest.raises(SchemaError, match="cannot be resolved or diffed"):
+        build_implementation_index(active, repo_root=git_repo)
