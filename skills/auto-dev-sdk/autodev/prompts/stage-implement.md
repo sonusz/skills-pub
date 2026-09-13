@@ -148,13 +148,19 @@ complete.
 
   A prior `ralph-review.json` may also contain
   `design_conformance.findings`. Treat every finding as required correction
-  work for its named scope IDs: replace the differing implementation method
-  with the method stated in the cited accepted-design section, then test the
-  correction. Do not preserve an alternate method merely because it also
-  appears to work.
+  work for its named scope IDs. For design drift, replace the differing
+  implementation method with the method stated in the cited accepted-design
+  section. For evidenced code redundancy, apply the stated minimal
+  deletion/reuse/simplification. In either case, test that required behavior,
+  safety, compatibility, performance, and design constraints remain preserved.
+  Do not merely rewrite metadata, suppress the finding, or preserve an
+  alternate method merely because it also appears to work.
   If the finding proves the accepted design itself cannot satisfy the PRD,
   use the existing blocking-deviation route with
   `diagnosis.defective_layer="design"`; never edit protected design files.
+  Apply the same rules to panel findings with category `redundant` that target
+  build output. If their remedy requires changing the accepted design, use the
+  design blocking-deviation route instead of silently changing that design.
 - `WRITABLE_PATHS`: exact files/directories this stage may write.
 - `PROTECTED_PATHS`: immutable PRD and accepted-design inputs. These
   remain read-only even when nested under the writable repo root.
@@ -250,6 +256,18 @@ complete.
     `evidence` must be concrete (quotable, testable). Hand-wavy
     evidence ("plan feels off") will be rejected or fail to produce
     useful rerun prompts.
+
+    Before writing `defective_layer: "design"` for a given `scope_id`,
+    read `design-changelog.json` (it sits next to `SCOPE_PATH`, is
+    listed in `PROTECTED_PATHS`, and is read-only to you). If its most
+    recent entry with `trigger` containing `"build"` already responded
+    to this `scope_id`: if that response is enough to continue, follow
+    the design path it points to and implement — do not write
+    `defective_layer: "design"` again. If it is not enough, you may
+    not re-route to `design` a second time for the same finding;
+    instead write `"ambiguous"` (you cannot tell whether design or PRD
+    is at fault) or `"prd"` (the PRD itself is contradictory), and cite
+    that changelog entry's `round` in `evidence`.
 - **Non-blocking deviation**: minor/pragmatic choice; add to
   `deviations` with `blocking: false`. Pipeline continues.
 - **Inline annotation**: trivial doc/phrasing fix; mention in commit

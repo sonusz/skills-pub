@@ -75,6 +75,12 @@ real integration is intentionally being tested.
   single-shot `codex exec` otherwise spends its only turn asking "confirm
   proceeding?", and that question becomes the final `out`. Other vendors'
   headless modes answer directly, so this is codex-only.
+- The same preamble must also forbid skill/plugin/agent-CLI recursion and
+  skills-directory helper scripts. With `~/.codex/skills` populated, a
+  repo-mode prompt titled "Panel review: ..." made codex run its own
+  `panel-review` skill (looping on `scripts/doctor.sh`, which spawns nested
+  vendor probes) for the full timeout instead of reviewing (2026-09-11).
+  Rewording the title fixed one run; the preamble makes it wording-independent.
 - Use `vendors_lower()` instead of Bash 4 `${var,,}` syntax.
 - Avoid associative arrays; macOS Bash 3.2 does not support them.
 - Keep `set -eo pipefail` in `call.sh`; nounset has caused false failures with
@@ -154,6 +160,7 @@ real integration is intentionally being tested.
 | Exit 70 with a session protocol/state reason | A keyed provider omitted its native id, observation failed, or durable finalization failed; do not treat the turn as resumable |
 | `output id is already in use` | Another coordinator owns that `<output-dir>/<id>`, or a killed coordinator left a fail-closed hidden lock; verify the recorded pid before cleanup |
 | Resume fails with a native not-found error | The mapping is invalidated intentionally; the next call starts new and must receive the full prompt |
+| Codex `out` is empty/timeout and the transcript shows `skills/<name>/scripts/*.sh` or nested vendor calls | The codex preamble lost its no-skill/no-agent-recursion clause, or the prompt title matches an installed skill name |
 
 ## Maintaining this file
 

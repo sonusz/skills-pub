@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from autodev.artifacts.common import write_markdown_with_hash
 from autodev.orchestrator import Orchestrator, OrchestratorConfig
+from autodev.state.atomic import atomic_write_json
+from autodev.state.hashing import hash_file
 from autodev.vendors.config import (
     PanelConfig,
     PanelReviewerSpec,
@@ -49,10 +52,29 @@ def _prd(git_repo, feature="toy"):
         "# PRD: toy\n## 1. Problem\n## 2. Users\n## 3. Requirements\n"
         "## 4. Constraints\n## 5. Success\n## 6. Out of scope\n"
     )
+    prd_hash = hash_file(prd)
+    # core R4: design's canonical upstream is arch-design.md, not prd.md
+    # directly. Seed a passed initial design + arch-review so cascade
+    # skips straight to the "design" stage these tests exercise.
+    arch_design = planned / "arch-design.md"
+    write_markdown_with_hash(
+        arch_design,
+        "## 1. Goal\ntoy\n## 5. PRD coverage\n| R1 | toy |\n",
+        source=str(prd), source_hash=prd_hash,
+    )
+    atomic_write_json(planned / "arch-review.json", {
+        "kind": "arch-review",
+        "source": str(arch_design),
+        "source_hash": hash_file(arch_design),
+        "prd_hash": prd_hash,
+        "written": "2026-04-21T00:00:00Z",
+        "verdict": "pass",
+        "findings": [],
+    })
     # Commit so git status shows clean baseline
     subprocess.run(["git", "add", "-A"], cwd=str(git_repo), check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init prd"], cwd=str(git_repo), check=True)
-    return planned, prd
+    return planned, prd, arch_design
 
 
 def _bypass_panel_gate(feature_active, gate, *, git_repo=None):
@@ -100,14 +122,13 @@ def _fake_env(target_artifact, source_path, source_hash, feature="toy", behavior
 
 
 def test_coding_design_stage_success(git_repo, monkeypatch):
-    planned, prd = _prd(git_repo)
-    from autodev.state.hashing import hash_file
-    prd_hash = hash_file(prd)
+    planned, prd, arch_design = _prd(git_repo)
+    arch_design_hash = hash_file(arch_design)
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd,
-        source_hash=prd_hash,
+        source_path=arch_design,
+        source_hash=arch_design_hash,
         behavior="success_design",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -132,12 +153,12 @@ def test_coding_design_stage_success(git_repo, monkeypatch):
 
 
 def test_coding_stage_exit_nonzero_produces_failure_json(git_repo, monkeypatch):
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd, source_hash=hash_file(prd),
+        source_path=arch_design, source_hash=hash_file(arch_design),
         behavior="exit_nonzero",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -161,12 +182,12 @@ def test_coding_stage_malformed_provenance_md(git_repo, monkeypatch):
     """A markdown primary without parseable `<!-- source_hash: ... -->`
     header would otherwise loop forever (cascade always sees stale).
     Orchestrator must fail loud with provenance_malformed instead."""
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd, source_hash=hash_file(prd),
+        source_path=arch_design, source_hash=hash_file(arch_design),
         behavior="malformed_provenance",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -187,12 +208,12 @@ def test_coding_stage_malformed_provenance_md(git_repo, monkeypatch):
 
 
 def test_coding_stage_missing_artifact(git_repo, monkeypatch):
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd, source_hash=hash_file(prd),
+        source_path=arch_design, source_hash=hash_file(arch_design),
         behavior="missing_artifact",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -213,12 +234,12 @@ def test_coding_stage_missing_artifact(git_repo, monkeypatch):
 
 def test_coding_stage_malformed_json_classified_as_malformed(git_repo, monkeypatch):
     """Schema validation on loaded artifact after rename → malformed_artifact."""
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd, source_hash=hash_file(prd),
+        source_path=arch_design, source_hash=hash_file(arch_design),
         behavior="malformed_json",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -237,14 +258,14 @@ def test_coding_stage_malformed_json_classified_as_malformed(git_repo, monkeypat
 
 def test_coding_stage_out_of_scope_write_detected(git_repo, monkeypatch, tmp_path):
     """G3: a subagent that writes outside feature-root is caught post-stage."""
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     escape_file = git_repo / "escape.txt"  # outside feature-root but inside repo
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd, source_hash=hash_file(prd),
+        source_path=arch_design, source_hash=hash_file(arch_design),
         behavior="out_of_scope_write",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -269,13 +290,13 @@ def test_design_stage_rejects_write_to_prd_inside_feature_root(
     git_repo, monkeypatch,
 ):
     """The old feature-root allowlist silently allowed design to edit PRD."""
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd,
-        source_hash=hash_file(prd),
+        source_path=arch_design,
+        source_hash=hash_file(arch_design),
         behavior="out_of_scope_write",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")
@@ -301,12 +322,12 @@ def test_coding_stage_deficient_output_retries_then_succeeds(git_repo, monkeypat
     the run on the first slip. The harness re-dispatches the same agent
     with a <stage>-output-rejection.json + the prior artifacts, and the
     amended retry completes the deliverable."""
-    planned, prd = _prd(git_repo)
+    planned, prd, arch_design = _prd(git_repo)
     from autodev.state.hashing import hash_file
 
     env = _fake_env(
         target_artifact=planned / "design.md",
-        source_path=prd, source_hash=hash_file(prd),
+        source_path=arch_design, source_hash=hash_file(arch_design),
         behavior="missing_then_success_design",
     )
     env["AUTODEV_FAKE_TARGET_SCOPE"] = str(planned / "scope.json")

@@ -58,7 +58,7 @@ For each reviewer who responded, emit one entry in `per_reviewer`:
     empty list `[]`. Do NOT drop, filter, or re-classify targets — the
     harness post-processes targets separately.
   - `category` — the lowercase category token the reviewer stated
-    (`missing`, `invented`, `ambiguous`, `undelivered`, `missized`,
+    (`missing`, `invented`, `ambiguous`, `undelivered`, `redundant`, `missized`,
     `untestable`, `underspecified-contract`). Copy it verbatim; if the reviewer stated none,
     emit `null`. Do NOT infer a category from the summary.
   - `evidence_refs` — the machine-readable evidence tokens the

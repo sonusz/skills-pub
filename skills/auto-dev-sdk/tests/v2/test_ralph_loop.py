@@ -121,6 +121,36 @@ def test_blocking_design_drift_caps_affected_scope_at_deviated(tmp_path):
     assert ralph.parse_review_statuses(p) == {"t-1": "Deviated"}
 
 
+def test_redundancy_correction_caps_only_affected_fully_scope_until_cleared(
+    tmp_path,
+):
+    p = tmp_path / "ralph-review.json"
+    rows = [
+        {"req_id": "t-1.r1", "scope_id": "t-1",
+         "classification": "Fully", "evidence": "src/x.py:1"},
+        {"req_id": "t-2.r1", "scope_id": "t-2",
+         "classification": "Fully", "evidence": "src/y.py:1"},
+    ]
+    _write_ralph_review(p, rows, design_conformance={
+        "verdict": "Deviated",
+        "findings": [{
+            "scope_ids": ["t-1"],
+            "design_ref": "design.md:10-14",
+            "evidence": "src/x.py:1-9",
+            "difference": "Wrapper duplicates the existing helper",
+            "correction": "Delete the wrapper and reuse the helper",
+        }],
+    })
+    assert ralph.parse_review_statuses(p) == {
+        "t-1": "Deviated", "t-2": "Fully",
+    }
+
+    _write_ralph_review(p, rows)
+    assert ralph.parse_review_statuses(p) == {
+        "t-1": "Fully", "t-2": "Fully",
+    }
+
+
 def test_design_conformance_rejects_inconsistent_verdict(tmp_path):
     p = tmp_path / "ralph-review.json"
     _write_ralph_review(p, [{

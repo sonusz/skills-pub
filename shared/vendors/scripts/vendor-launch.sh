@@ -735,10 +735,14 @@ vendors_run_codex() {
   # analysis prompts, often spend their single `codex exec` turn asking
   # "proceed?" instead of answering. Pin the non-interactive contract in the
   # prompt itself. VENDORS_CODEX_PREAMBLE=0 opts out.
+  # The same preamble also forbids skill/agent recursion: with ~/.codex/skills
+  # populated, a prompt whose title matches an installed skill name (e.g. a
+  # panel-review prompt headed "Panel review: ...") made codex run that
+  # skill's own doctor/launch scripts in a loop instead of reviewing.
   if [ "${VENDORS_CODEX_PREAMBLE:-1}" = "1" ]; then
     local preamble_file="$output_file.prompt"
     {
-      printf '%s\n\n' "Non-interactive run: this is a single-shot \`codex exec\` call with no human attached. Never reply with a question, a confirmation request, or a plan-only answer — produce the complete final deliverable in this one response."
+      printf '%s\n\n' "Non-interactive run: this is a single-shot \`codex exec\` call with no human attached. Never reply with a question, a confirmation request, or a plan-only answer — produce the complete final deliverable in this one response. Perform the task yourself with direct tools (shell, git, file reads): do not invoke any skill, plugin, or agent CLI (codex/claude/gemini/cursor/agy/grok), and do not run helper scripts from a skills directory — even if the prompt's title or wording resembles the name of a skill you have installed."
       cat "$prompt_file"
     } > "$preamble_file"
     prompt_file="$preamble_file"

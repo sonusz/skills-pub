@@ -22,9 +22,10 @@ the feature closes.
 
 ## What this gate checks
 
-Close approval is PRD-anchored. Compare the code-first
-`implemented-spec.md` against `prd.md` and decide whether the shipped
-behavior satisfies the PRD.
+Close approval is PRD-anchored. Inspect the actual feature code and compare its
+shipped behavior against `prd.md`. Use the code-first `implemented-spec.md` to
+navigate to code and affected mechanisms, not as proof that no redundancy or
+behavior gap exists.
 
 `prd-checklist.json` is only a mechanical completeness aid. It lists PRD
 requirement IDs so you do not miss a requirement. It is not a coverage
@@ -42,6 +43,10 @@ The coverage map is your output judgment. Do not assume one exists.
 
 Read the exact paths listed in the required file inputs before judging.
 Do not rely on the manifest alone.
+
+Before classifying or routing any redundancy finding, also read
+`FEATURE_ACTIVE/design.md` to determine whether the accepted design mandates
+the mechanism. `FEATURE_ACTIVE` is provided in the orchestrator context.
 
 ## Gate questions
 
@@ -69,9 +74,22 @@ Also call out implemented behavior that appears outside PRD. Extra
 behavior is not automatically a failure; it is a failure only when it
 creates PRD conflict, safety risk, or unreviewed product surface.
 
+Also inspect changed code and affected mechanisms for evidenced redundancy,
+even when every PRD coverage row is satisfied. Report code that duplicates
+existing work or mechanisms, or an unnecessary wrapper or abstraction, only
+when you can cite code locations, the governing PRD/design constraints, a
+concrete sufficient deletion/reuse/simplification, and why it preserves
+required behavior, safety, compatibility, performance, and PRD constraints.
+If only an accepted-design mechanism choice prevents the simplification, route
+that proposal to design; never silently bypass the accepted design in build.
+Do not search unrelated whole-repo code or report cosmetic, speculative,
+style-only, or line-count preferences. Necessary safeguards are not redundant.
+Never propose a cut that violates a core PRD requirement.
+
 Design conformance is separate from PRD satisfaction. If implementation
 deviates from accepted design but still satisfies PRD, record that as an
-opinion unless the deviation creates a PRD-level risk.
+opinion unless the deviation creates a PRD-level risk. This does not downgrade
+an independently evidenced `redundant` finding, which remains `risk` / `P1`.
 
 ## Verify findings before reporting
 
@@ -96,6 +114,8 @@ remain the author of every reported finding.
 - **DEVIATED** -- implemented behavior satisfies part of the PRD but in
   a meaningfully different way.
 - **UNDELIVERED** -- implemented-spec contradicts a PRD requirement.
+- **REDUNDANT** -- actual feature code contains evidenced removable duplication
+  or an unnecessary mechanism despite satisfying PRD/design behavior.
 
 ## Severity
 
@@ -113,7 +133,7 @@ producer:
 
 - `primary_pair.build.json` -- shipped CODE does not satisfy the PRD;
   build stage reruns to modify production code (most common close-
-  approval fix path; e.g. "validate did not auto-create handoff")
+  approval fix path; also use this for code-only redundancy cleanup)
 - `primary_pair.design.md` -- design.md missed a primitive that PRD
   requires; rerun design
 - `primary_pair.scope.json` -- scope decomposition is the source of
@@ -143,6 +163,10 @@ the harness precheck owns its mechanical validity.
 Multiple targets allowed when one finding requires changes in more
 than one upstream artifact.
 
+For redundancy mandated by the accepted design itself, target the responsible
+design artifact or `scope.json` so the design stage reruns against the PRD.
+Never route redundancy cleanup to `implemented-spec.md`.
+
 ## Output
 
 Plain markdown.
@@ -154,11 +178,19 @@ First include a compact coverage table:
 Then list findings. Per finding include `severity`, `priority` (`P0` only when
 the core release path or an explicitly highest-rigor acceptance event cannot
 run; otherwise `P1` for important deferrable work or `P2` for polish), `summary`,
-`targets`, and an `Evidence:` line:
+lowercase `category`, machine-readable `evidence_refs`, `targets`, and an
+`Evidence:` line. An evidenced redundancy finding must use category
+`redundant`, severity `risk`, and priority `P1`; do not promote it to `P0`
+merely to force the gate. Under the normal P1 release threshold it requires
+`needs_revision`, even when all coverage rows are `satisfied`.
 
 - `Evidence: spec:<section> "short quote"`
 - `Evidence: prd:<section> "short quote"`
 - `Evidence: checklist:<req_id>`
+- `Evidence: code:<path>:<line-range> "what is duplicated or unnecessary"`
+
+For `evidence_refs`, emit tokens such as `prd:R1`, `scope:<scope-id>`, and
+`code:<path>:<line-range>` so the synthesizer preserves the finding's anchors.
 
 State your verdict: `pass` / `needs_revision` / `fail`.
 

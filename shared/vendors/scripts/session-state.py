@@ -391,6 +391,57 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_credit_turn(args: argparse.Namespace) -> int:
+    """Credit back one turn on every record mapped from one opaque
+    logical key, without touching ``session_id`` or reset bookkeeping.
+
+    Used by the harness (autodev's arch-design/arch-review loop) to undo
+    counting a turn that a passing review folds back into the same
+    session, so that round does not consume the automatic-rotation
+    budget. Distinct from ``reset``: this never clears the native
+    session id, it only decrements the turn counter (floored at 0).
+    """
+
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    expected_key_hash = _key_sha256(args.key)
+    if not state_dir.is_dir():
+        print(0)
+        return 0
+
+    with _record_guard(_key_guard_path(state_dir, args.key)):
+        matching_paths = sorted(
+            path
+            for path in state_dir.glob("*.json")
+            if _read_json(path).get("key_sha256") == expected_key_hash
+        )
+        with contextlib.ExitStack() as stack:
+            for path in matching_paths:
+                stack.enter_context(_record_guard(path))
+
+            records = [(path, _read_json(path)) for path in matching_paths]
+            live = [
+                (path, record.get("lease_owner_pid", "unknown"))
+                for path, record in records
+                if _lease_is_live(record)
+            ]
+            if live:
+                owners = ", ".join(f"{path.stem[:12]}:{owner}" for path, owner in live)
+                raise SystemExit(
+                    f"session key has active lease(s) ({owners}); abort or "
+                    "wait before credit-turn"
+                )
+
+            updated_at = _utc_now()
+            for path, record in records:
+                current = _nonnegative_int(record.get("session_turn_count"))
+                record["session_turn_count"] = max(0, current - 1)
+                record["updated_at"] = updated_at
+                _atomic_write_json(path, record)
+
+    print(len(matching_paths))
+    return 0
+
+
 def _process_group_members(pgid: int) -> set[int]:
     """Return non-zombie members of a process group."""
 
@@ -873,6 +924,11 @@ def _parser() -> argparse.ArgumentParser:
     reset.add_argument("--state-dir", required=True)
     reset.add_argument("--key", required=True)
     reset.set_defaults(func=cmd_reset)
+
+    credit_turn = sub.add_parser("credit-turn")
+    credit_turn.add_argument("--state-dir", required=True)
+    credit_turn.add_argument("--key", required=True)
+    credit_turn.set_defaults(func=cmd_credit_turn)
 
     interrupt = sub.add_parser("interrupt")
     interrupt.add_argument("--process-group", type=int, required=True)

@@ -79,17 +79,29 @@ ALL_PANEL_GATES: tuple[str, ...] = (
 # (previously fell back to spec, which is the wrong layer for shipped-
 # behavior gaps). Indeterminate close-approval blocking findings halt
 # for human decision.
+#
+# design-review's fallback is "arch-design", not "design" (core R5,
+# detail §4): a blocking design-review verdict with no pinned filename
+# reruns the architecture initial-design stage, which the cascade's
+# hash chain (core R4) then expands back through design/scope/trace/
+# test_plan automatically.
 GATE_FALLBACK_PRODUCER: dict[str, str] = {
-    "design-review": "design",
+    "design-review": "arch-design",
 }
 
 # Filename → producer stage. Used to dispatch reruns based on the
 # filename-qualified targets on blocking findings (v3-core R4).
+#
+# design.md/scope.json/trace.md/test-plan.md route to "arch-design"
+# (core R5, detail §4): the four design-package artifacts are now
+# expansions of arch-design.md, so a blocking finding against any of
+# them reruns the initial-design/review loop, not the expansion stage
+# directly.
 FILENAME_TO_PRODUCER: dict[str, str] = {
-    "design.md": "design",
-    "scope.json": "design",
-    "trace.md": "design",
-    "test-plan.md": "design",
+    "design.md": "arch-design",
+    "scope.json": "arch-design",
+    "trace.md": "arch-design",
+    "test-plan.md": "arch-design",
     "implemented-spec.md": "spec",
 }
 # prd.md and discovered architecture docs are NOT in this map: blocking
@@ -100,10 +112,10 @@ FILENAME_TO_PRODUCER: dict[str, str] = {
 # has a different meaning inside that gate.
 GATE_FILENAME_TO_PRODUCER: dict[str, dict[str, str]] = {
     "design-review": {
-        "design.md": "design",
-        "scope.json": "design",
-        "trace.md": "design",
-        "test-plan.md": "design",
+        "design.md": "arch-design",
+        "scope.json": "arch-design",
+        "trace.md": "arch-design",
+        "test-plan.md": "arch-design",
     },
     # close-approval can route findings back to any upstream producer.
     # It deliberately omits implemented-spec.md (the spec stage just
@@ -112,10 +124,10 @@ GATE_FILENAME_TO_PRODUCER: dict[str, dict[str, str]] = {
     # ask spec to redescribe it). PRD targets halt for human; arch-doc
     # targets halt for human (handled in dispatch).
     "close-approval": {
-        "design.md": "design",
-        "scope.json": "design",
-        "trace.md": "design",
-        "test-plan.md": "design",
+        "design.md": "arch-design",
+        "scope.json": "arch-design",
+        "trace.md": "arch-design",
+        "test-plan.md": "arch-design",
         "build.json": "build",
     },
 }

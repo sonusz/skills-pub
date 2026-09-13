@@ -8,8 +8,10 @@ pipeline_position:
   role: stage                              # coding-stage (not a panel)
   i_produce: [design.md, scope.json, trace.md, test-plan.md]
   upstream:
+    - artifact: arch-design.md
+      producer: arch-design                # auto-rerunnable
     - artifact: prd.md
-      producer: human                      # cannot auto-rerun
+      producer: human                      # requirement anchor; cannot auto-rerun
   discretionary_read:                      # browse via Read tool; your
                                             # design must fit these docs
     - "<FEATURE_ACTIVE>/architecture.md"
@@ -48,6 +50,12 @@ altitude decisions stay with you. Subagents must not edit any file.
   content).
 - `PRD_HASH`: expected sha256 of the PRD bytes. Verify before
   proceeding; abort if mismatch.
+- `ARCH_DESIGN_PATH`: path to the accepted architecture initial design
+  (`arch-design.md`) this stage expands. Read-only.
+- `ARCH_DESIGN_HASH`: expected sha256 of `arch-design.md`. Verify
+  before proceeding; abort if mismatch. `arch-design.md` is listed in
+  `PROTECTED_PATHS` — you expand it into the four design artifacts,
+  you never edit it.
 - `FEATURE`: feature name (matches feature folder under
   `docs/features/`).
 - `TARGET_DESIGN`: path to write design.md (`<TARGET_DESIGN>.tmp`;
@@ -79,7 +87,12 @@ altitude decisions stay with you. Subagents must not edit any file.
     as historical context to inform — but not dictate — what you do
     this round. See "Maintaining design-changelog.json" below.
   - `build.json` if a build halt routed back here: inspect
-    `deviations[]` entries and address each one's `evidence` pointer
+    `deviations[]` entries and address each one's `evidence` pointer.
+    If, having reviewed the evidence, you conclude the design is sound
+    and none of your four artifacts need to change, you must still
+    explain that in this round's `design-changelog.json` entry — see
+    the `reason` field rules below; silence is not an acceptable
+    response to a build-routed rerun.
 
 On an initial run (`CONTEXT_ARTIFACTS: []`), derive the design only from the
 current PRD, current source tree, and current architecture/reference inputs
@@ -102,6 +115,20 @@ in one pass.
 Three jobs, four artifacts. All three matter; optimizing for one
 while ignoring the others produces a design that passes precheck
 and fails the panel.
+
+Your architectural commitments are not yours to make from scratch:
+`arch-design.md` already passed a single-agent review for PRD
+coverage, invented scope, redundancy, and reuse. Its component
+boundaries, reuse decisions, and interfaces are the starting
+architecture — expand them into design.md's fuller detail, scope
+items, trace rows, and test cases; do not re-derive the architecture
+independently from the PRD. If digging into implementation-level
+detail shows `arch-design.md` cannot actually satisfy a PRD
+requirement, expand honestly around the gap, record why in this
+round's `design-changelog.json` `reason`, and note it in design.md —
+the design-review panel will route the problem back to the
+arch-design stage rather than let you silently invent a different
+architecture here.
 
 ## Rework protocol on reruns
 
@@ -361,8 +388,8 @@ G1 checks six things. Optimize for all six:
    Schema:
    ```json
    {
-     "source": "<PRD_PATH>",
-     "source_hash": "<PRD_HASH exactly, including the sha256: prefix>",
+     "source": "<ARCH_DESIGN_PATH>",
+     "source_hash": "<ARCH_DESIGN_HASH exactly, including the sha256: prefix>",
      "written": "<YYYY-MM-DD>",
      "feature": "<FEATURE>",
      "mode": "fresh",
@@ -443,8 +470,8 @@ G1 checks six things. Optimize for all six:
 Every artifact starts with:
 
 ```
-<!-- source: <PRD_PATH> -->            # design.md / trace.md / test-plan.md
-<!-- source_hash: <PRD_HASH> -->
+<!-- source: <ARCH_DESIGN_PATH> -->     # design.md / trace.md / test-plan.md
+<!-- source_hash: <ARCH_DESIGN_HASH> -->
 <!-- written: <YYYY-MM-DD> -->
 ```
 
@@ -549,8 +576,8 @@ Failure = stage re-dispatched with the failure message as
 feedback. Save the round-trip: self-verify first.
 
 1. All four files present + valid.
-2. `scope.source_hash` equals `PRD_HASH` exactly, including the
-   literal `sha256:` prefix.
+2. `scope.source_hash` equals `ARCH_DESIGN_HASH` exactly, including
+   the literal `sha256:` prefix.
 3. Every `in_scope.id` unique.
 4. Every active `in_scope.prd_ref` and `in_scope.design_ref` is a
    non-empty `list[str]` of token strings (NOT a comma- or semicolon-
@@ -619,6 +646,17 @@ artifacts on disk; the changelog merely informs that decision.
 - `reason` — short string (≤ 500 chars). Describes what feedback
   drove this round, in your own words. Pure description, not a
   directive.
+  - When `trigger` includes `"build"`, this rule replaces the
+    500-char guidance above: `reason` must respond to every blocking
+    deviation in `build.json` that triggered the route, one by one —
+    cite each deviation's `scope_id` and `diagnosis.evidence`, and for
+    each say either why the existing design is correct as-is or what
+    you changed. Point to which design path (a `design.md` section or
+    scope ID) build should follow to continue implementation. Length
+    is whatever it takes to address every cited deviation, not a
+    fixed cap. `artifacts_changed` may be empty when the conclusion is
+    that no artifact needs to change — the explanation itself is the
+    required output of this round.
 - `artifacts_changed` — list of filenames you modified this round
   (subset of `["design.md", "scope.json", "trace.md",
   "test-plan.md"]`).
@@ -685,9 +723,10 @@ Before writing the four `.tmp` files:
 - If this is a rerun, write down the root-cause clusters from incoming
   feedback and confirm the final packet addresses each cluster
   coherently, not finding-by-finding.
-- Recompute `sha256(prd.md)` only as a check; set every
-  `source_hash` field/header to `PRD_HASH` exactly, including the
-  literal `sha256:` prefix. Do not write a bare 64-character hex hash.
+- Recompute `sha256(arch-design.md)` only as a check; set every
+  `source_hash` field/header to `ARCH_DESIGN_HASH` exactly, including
+  the literal `sha256:` prefix. Do not write a bare 64-character hex
+  hash.
 - Scan `in_scope`: every item has `id`, `description`,
   `prd_ref`, `design_ref`, `status`; `id`s unique.
 - For every active item, iterate `prd_ref` (which is `list[str]`)

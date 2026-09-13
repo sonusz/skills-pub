@@ -61,21 +61,44 @@ def _seed(feature_active: Path, *, packet: bool = False) -> Path:
     )
     prd_hash = hash_file(prd)
 
+    # arch-design.md: canonical upstream of design/scope/trace/test_plan is
+    # now arch_design (core R4), not prd directly.
+    arch_design = feature_active / "arch-design.md"
+    write_markdown_with_hash(
+        arch_design,
+        "## 1. Goal\nHandle R1.\n## 5. PRD coverage\n| R1 | handled |\n",
+        source=str(prd),
+        source_hash=prd_hash,
+    )
+    arch_design_hash = hash_file(arch_design)
+    (feature_active / "arch-review.json").write_text(
+        json.dumps({
+            "kind": "arch-review",
+            "source": str(arch_design),
+            "source_hash": arch_design_hash,
+            "prd_hash": prd_hash,
+            "written": "2026-04-20T00:00:00Z",
+            "verdict": "pass",
+            "findings": [],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
     design = feature_active / "design.md"
     write_markdown_with_hash(
         design,
         "# Design\n\n## 2. Primitives & commitments\n"
         "Validation commands: [\"pytest -q\"]\n\n"
         "## Flow\nHandle R1.\n",
-        source=str(prd),
-        source_hash=prd_hash,
+        source=str(arch_design),
+        source_hash=arch_design_hash,
     )
 
     scope = feature_active / "scope.json"
     scope.write_text(
         json.dumps({
-            "source": "prd.md",
-            "source_hash": prd_hash,
+            "source": str(arch_design),
+            "source_hash": arch_design_hash,
             "written": "2026-04-20",
             "feature": "demo",
             "mode": "fresh",
@@ -95,7 +118,7 @@ def _seed(feature_active: Path, *, packet: bool = False) -> Path:
         "| # | Req ID | Scope ID | Requirement | Source |\n"
         "| - | ------ | -------- | ----------- | ------ |\n"
         "| 1 | d-1.r1 | d-1 | hash file | Source: prd:R1 |\n",
-        source=str(prd), source_hash=prd_hash,
+        source=str(arch_design), source_hash=arch_design_hash,
     )
     write_markdown_with_hash(
         feature_active / "test-plan.md",
@@ -103,7 +126,7 @@ def _seed(feature_active: Path, *, packet: bool = False) -> Path:
         "| Scope ID | Description | Source |\n"
         "|----------|-------------|--------|\n"
         "| d-1 | hash empty file | Source: scope:d-1 |\n",
-        source=str(prd), source_hash=prd_hash,
+        source=str(arch_design), source_hash=arch_design_hash,
     )
     if packet:
         return write_design_packet(feature_active)

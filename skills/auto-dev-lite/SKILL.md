@@ -1,25 +1,15 @@
 ---
 name: auto-dev-lite
 description: >
-  Lightweight document-driven development orchestrator with a two-document
-  contract. The user's core requirements document is the immutable source of
-  intent (changed only after discussing with the user); from it the
-  orchestrator derives a slightly more detailed working spec that it alone
-  may edit. Flow: obtain the core doc (co-author it with the user if it
-  doesn't exist) → derive the detail doc → comprehension gate: a context-free
-  subagent on an everyday-tier model (Sonnet-class, medium effort) reads both
-  documents and describes what it WOULD do — no execution — and flags
-  divergence between them; the orchestrator repairs gaps by editing ONLY the
-  detail doc until a fresh reader's plan matches intent → development: the
-  orchestrator fans out medium-effort dev subagents sized to the workload but
-  never edits code itself → after each stage, context-free review subagents
-  check every change against both documents. Anything the documents don't
-  cover — or a divergence unfixable without touching the core doc — stops
-  the pipeline for user confirmation. Triggers on "auto-dev-lite",
-  "doc-driven development", "develop against this design doc", "implement
-  per this document", or when the user wants a lighter alternative to the
-  full auto-dev pipeline. Skip for single-line fixes, typos, or changes with
-  no design surface.
+  Lightweight document-driven development from a user-owned core requirements
+  document and an orchestrator-owned detail spec. Uses fresh subagents for a
+  design dry run, scoped implementation, and stage/final reviews; checks both
+  requirement conformance and unnecessary or redundant design/code mechanisms.
+  Unresolved requirements and core changes return to the user. Triggers on
+  "auto-dev-lite", "doc-driven development", "develop against this design
+  doc", "implement per this document", or requests for a lighter alternative
+  to the full auto-dev pipeline. Skip single-line fixes, typos, and changes
+  with no design surface.
 allowed-tools: Task, Read, Grep, Glob, Bash
 ---
 
@@ -99,6 +89,10 @@ core doc as `<core-doc-basename>.detail.md`, unless the user names one.
   want a say — take it to the user now rather than burying it.
 - Keep it proportionate: "slightly more detailed" means an ordinary reader
   can execute it without guessing, not a design novel.
+- For each mechanism the detail doc introduces, prefer reuse or the simplest
+  design that still satisfies every core requirement and constraint. A
+  mechanism can be redundant even when it traces to a requirement if removing
+  it or using one existing mechanism preserves the same required behavior.
 
 ## Stage 2 — Comprehension gate (dry-run loop)
 
@@ -112,12 +106,15 @@ reader who has none of your context.
    the core doc and the detail doc**: places where the detail doc drifts
    from, contradicts, or silently extends the core requirements.
    **It must not execute anything.**
-2. Compare that reply against the intended direction. Three failure kinds:
+2. Compare that reply against the intended direction. Four failure kinds:
    - **Drift** — the plan does things the documents never meant, or misses
      things they require.
    - **Invention** — the plan fills gaps with its own guesses.
    - **Divergence** — the subagent (or your own reading of its plan) shows
      the detail doc no longer faithfully elaborates the core doc.
+   - **Excess or redundancy** — the subagent identifies a specific mechanism
+     that can be removed, reused, or simplified while preserving all core
+     requirements and constraints.
 3. On any failure: **edit only the detail document** to close the specific
    gap — the core document is off-limits here — then tell the user in one
    short message what changed and why (*do not wait for a reply*), and loop
@@ -128,9 +125,9 @@ reader who has none of your context.
    cannot be repaired while keeping the core requirements as written — that
    is not yours to decide. Stop and discuss with the user (§5).
 5. Exit the loop when a fresh reader's plan matches intent and reports no
-   divergence. If after **3 rounds** the same disagreement persists, that is
-   not a wording problem — it's an unresolved requirement. Stop and put the
-   question to the user (§5).
+   divergence or evidenced excess/redundancy. If after **3 rounds** the same
+   disagreement persists, that is not a wording problem — it's an unresolved
+   requirement. Stop and put the question to the user (§5).
 
 ## Stage 3 — Development fan-out
 
@@ -146,6 +143,13 @@ Derive stages and tasks from the detail document, then dispatch.
   explicit task scope, and the standing order: *implement only what's in
   scope; if you hit anything the documents don't answer — or the two
   documents disagree — stop and report back, do not improvise.*
+- Dev subagents prefer existing suitable mechanisms and the simplest
+  implementation sufficient for the documents. If the detail doc prescribes
+  a mechanism that appears unnecessary or redundant, they report its exact
+  location and a supported simpler alternative instead of silently omitting
+  it. The orchestrator corrects the detail doc and performs a fresh targeted
+  Stage 2 check before redispatching code work; complexity required by the
+  core doc cannot be removed without the user's decision (§5).
 - When a dev subagent reports a doc gap or a core/detail conflict, route it
   through §5 (or a detail-doc fix + quick Stage 2 recheck, if the core doc
   already answers it) before dispatching anyone else into that area.
@@ -160,7 +164,7 @@ review subagents (everyday model, medium effort) with
 scope — no conversation context, so the review tests what the code *is*,
 not what the orchestrator believes it is.
 
-The reviewer answers four questions:
+The reviewer answers five questions:
 
 1. **Conformance** — does every change trace to the documents?
 2. **Completeness** — is anything the documents require for this stage
@@ -170,19 +174,29 @@ The reviewer answers four questions:
 4. **Fidelity** — do the changes honor the *core* document, not just the
    detail doc? A change that matches the detail doc but strays from the
    core requirements is a divergence finding, not a pass.
+5. **Proportionality** — can a specific changed-code or affected-design
+   mechanism be removed, replaced with an existing mechanism, or simplified
+   while preserving every affected requirement and constraint?
 
 Route the findings:
 
 - Conformance/completeness defects → dispatch fix subagents (doc-bound, same
   rules), then re-review the fixed area.
+- Evidenced excess/redundancy → treat it as an actionable fix, dispatch code
+  fixes through dev subagents, and re-review. If the detail doc prescribes
+  the excess, correct it first and run a fresh targeted Stage 2 check before
+  code rework. A required core-doc change or unresolved requirement goes to
+  the user (§5).
 - Overreach, doc-gap, or fidelity findings → §5 (or a detail-doc correction
   plus targeted rework, when the core doc clearly settles the question). Do
   not "keep it since it's written" — undocumented work is a stop signal even
   when the code looks good.
 
-After the final stage, run one closing review over the full change set, then
-report to the user: what was built, mapped section-by-section to the core
-document, plus every detail-doc edit made along the way.
+After the final stage, run one closing review over the full change set using
+the same five checks. Neither a stage nor closing review passes with an
+unresolved evidenced excess/redundancy finding. Then report to the user: what
+was built, mapped section-by-section to the core document, plus every
+detail-doc edit made along the way.
 
 ## §5 — Stop-and-discuss rule
 
@@ -214,13 +228,14 @@ wait.
 - Not the full `auto-dev` pipeline — no `docs/features/` folder contract, no
   feature-spec stage, no external vendor CLIs. Two docs, in-harness
   subagents, done.
-- Not a code-review skill — reviews here check *doc conformance*, not
-  general code quality. Use `pr-review` / `multi-lens-review` for bug hunts.
+- Not a general code-review skill — reviews here check *doc conformance and
+  proportionality*. Use `pr-review` / `multi-lens-review` for bug hunts and
+  style review.
 
 ## Files
 
 | Template | Purpose |
 | -------- | ------- |
-| `prompts/doc-dry-run.md` | Stage 2: context-free reader plans against both docs — without executing — and flags core/detail divergence |
-| `prompts/dev-task.md` | Stage 3: scoped implementation task, doc-bound, stop-on-gap and stop-on-conflict |
-| `prompts/stage-review.md` | Stage 4: context-free conformance/completeness/overreach/fidelity review of a stage diff |
+| `prompts/doc-dry-run.md` | Stage 2: dry-run plan, divergence, and design proportionality check |
+| `prompts/dev-task.md` | Stage 3: scoped, doc-bound implementation using the simplest sufficient mechanisms |
+| `prompts/stage-review.md` | Stage 4: context-free conformance and proportionality review of a stage diff |

@@ -179,12 +179,13 @@ def _apply_design_conformance(
     per_scope_rank: dict[str, int],
     per_scope_status: dict[str, str],
 ) -> None:
-    """Validate design drift findings and fold them into scope status.
+    """Validate correction findings and fold them into scope status.
 
     Trace-row classifications remain a faithful code-vs-trace judgment in the
-    artifact.  Any accepted-design deviation is a second, independent reason
-    that the affected scope is not complete, so its rolled-up status is capped
-    at ``Deviated`` here.
+    artifact. The legacy-named bucket covers accepted-design drift and evidenced
+    removable implementation redundancy. Either is a second, independent
+    reason that the affected scope is not complete, so its rolled-up status is
+    capped at ``Deviated`` here without requiring a false trace-row judgment.
     """
     conformance = data.get("design_conformance")
     if not isinstance(conformance, dict):

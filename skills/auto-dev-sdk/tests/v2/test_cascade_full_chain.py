@@ -46,16 +46,39 @@ def _seed_all_ten(active: Path) -> None:
     atomic_write(prd, "# PRD\n## 1. Problem\n## 2. Users\n## 3. Requirements\n## 4. Constraints\n## 5. Success\n## 6. Out of scope\n")
     prd_h = hash_file(prd)
 
+    # arch-design.md: canonical upstream of design/scope/trace/test_plan is
+    # now arch_design (core R4), not prd directly.
+    write_markdown_with_hash(
+        active / "arch-design.md",
+        "## 1. Goal\nbody\n## 5. PRD coverage\nbody\n",
+        source=str(prd),
+        source_hash=prd_h,
+    )
+    arch_design = active / "arch-design.md"
+    arch_design_h = hash_file(arch_design)
+
+    # arch-review.json: pass, hash-bound to arch-design.md
+    arch_review_data = {
+        "kind": "arch-review",
+        "source": str(arch_design),
+        "source_hash": arch_design_h,
+        "prd_hash": prd_h,
+        "written": "2026-04-20T00:00:00Z",
+        "verdict": "pass",
+        "findings": [],
+    }
+    atomic_write_json(active / "arch-review.json", arch_review_data)
+
     write_markdown_with_hash(
         active / "design.md",
         "## 2. Primitives & commitments\nValidation commands: [\"pytest -q\"]\n\nbody\n",
-        source=str(prd),
-        source_hash=prd_h,
+        source=str(arch_design),
+        source_hash=arch_design_h,
     )
 
     # scope.json
     scope = Scope(
-        source=str(prd), source_hash=prd_h, written="2026-04-20",
+        source=str(arch_design), source_hash=arch_design_h, written="2026-04-20",
         feature="demo", mode="fresh", diff_base="main",
         in_scope=[ScopeItem(id="s-1", description="x", prd_ref=["§1"], design_ref=["§1"])],
     )
@@ -64,9 +87,9 @@ def _seed_all_ten(active: Path) -> None:
 
     # trace.md, test-plan.md
     write_markdown_with_hash(active / "trace.md", "body\n",
-                             source=str(prd), source_hash=prd_h)
+                             source=str(arch_design), source_hash=arch_design_h)
     write_markdown_with_hash(active / "test-plan.md", "body\n",
-                             source=str(prd), source_hash=prd_h)
+                             source=str(arch_design), source_hash=arch_design_h)
 
     # design-packet.json
     packet = write_design_packet(active)
@@ -160,6 +183,7 @@ def test_cascade_prd_change_invalidates_full_chain(feature_active):
     # prd itself is fresh (root), but every downstream stale
     assert fresh["prd"] is True
     expected_stale = {
+        "arch_design", "arch_review",
         "design", "scope", "trace", "test_plan", "design_packet",
         "panel_design_review", "accepted_design", "build",
         "implementation_index", "spec", "prd_checklist",
@@ -167,7 +191,7 @@ def test_cascade_prd_change_invalidates_full_chain(feature_active):
     }
     for name in expected_stale:
         assert fresh[name] is False, f"{name} should be stale after PRD mutation"
-    assert c.next_stage() == "design"
+    assert c.next_stage() == "arch_design"
 
 
 def test_cascade_scope_mutation_invalidates_downstream_only(feature_active):

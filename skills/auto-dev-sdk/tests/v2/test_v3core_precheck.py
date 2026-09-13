@@ -37,12 +37,20 @@ def _write_design_packet(active: Path):
         "## 4. Constraints\n\n## 5. Success\n\n## 6. Out of scope\n"
     )
     prd_h = hash_file(prd)
+    # arch-design.md: canonical upstream of design/scope/trace/test_plan is
+    # now arch_design (core R4), not prd directly.
+    arch_design = active / "arch-design.md"
+    arch_design.write_text(
+        f"<!-- source: {prd} -->\n<!-- source_hash: {prd_h} -->\n"
+        "<!-- written: 2026-04-20 -->\n\n## 1. Goal\nx\n## 5. PRD coverage\nx\n"
+    )
+    arch_design_h = hash_file(arch_design)
     (active / "design.md").write_text(
         "# Design\n\n## Flow\n- Handle R1.\n- Handle R2.\n\n"
         "Validation commands: [\"pytest -q\"]\n"
     )
     scope = {
-        "source": str(prd), "source_hash": prd_h,
+        "source": str(arch_design), "source_hash": arch_design_h,
         "written": "2026-04-20", "feature": "demo",
         "mode": "fresh", "diff_base": "main",
         "in_scope": [
@@ -188,6 +196,7 @@ def test_design_review_precheck_scope_invalid_json(active):
         encoding="utf-8",
     )
     (active / "prd.md").write_text("# PRD\n")
+    (active / "arch-design.md").write_text("# Arch Design\n")
     (active / "design.md").write_text("# Design\n\nValidation commands: [\"pytest -q\"]\n")
     (active / "scope.json").write_text("{ not json")
     (active / "trace.md").write_text("# trace\n")

@@ -275,7 +275,7 @@ if ! grep -q -- 'unknown option: --inline' "$WORK/rejected-inline.log"; then
   exit 1
 fi
 
-if "$SCRIPT_DIR/launch.sh" \
+if PANEL_REVIEW_CWD= "$SCRIPT_DIR/launch.sh" \
     "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$WORK/rejected-no-cwd" \
     >"$WORK/rejected-no-cwd.log" 2>&1; then
   printf "FAIL: launch.sh must require an explicit audit cwd\n" >&2
@@ -284,6 +284,19 @@ fi
 if ! grep -q -- '--cwd is required' "$WORK/rejected-no-cwd.log"; then
   printf "FAIL: missing-cwd rejection did not explain the path-based contract\n" >&2
   cat "$WORK/rejected-no-cwd.log" >&2
+  exit 1
+fi
+
+# PANEL_REVIEW_CWD in the environment is the only accepted substitute for
+# --cwd; --repo is a compatibility no-op.
+ENV_RUN_DIR="$WORK/run-env"
+ENV_MARKER_PREFIX="$WORK/env-marker"
+PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$ENV_MARKER_PREFIX" PANEL_REVIEW_CWD="$ROOT_DIR" \
+  "$SCRIPT_DIR/launch.sh" --repo "$PROMPT_FILE" "$ROOT_DIR/vendors.yaml" "$ENV_RUN_DIR" >/dev/null
+if ! grep -qx "pwd=$ROOT_DIR" "$ENV_MARKER_PREFIX.codex" \
+    || ! grep -qx "cwd=$ROOT_DIR" "$ENV_RUN_DIR/openai/status"; then
+  printf "FAIL: expected PANEL_REVIEW_CWD to supply the audit cwd when --cwd is omitted\n" >&2
+  cat "$ENV_MARKER_PREFIX.codex" "$ENV_RUN_DIR/openai/status" >&2
   exit 1
 fi
 

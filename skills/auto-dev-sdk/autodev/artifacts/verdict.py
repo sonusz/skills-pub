@@ -97,14 +97,16 @@ class ReviewDecision:
 
 
 FindingCategory = Literal[
-    "missing", "invented", "ambiguous", "undelivered", "missized",
+    "missing", "invented", "ambiguous", "undelivered", "redundant",
+    "missized",
     "untestable", "underspecified-contract", "other",
 ]
 FailureClass = Literal["mainline", "edge"]
 MissizedDirection = Literal["coarse", "fine"]
 
 _VALID_CATEGORY = {
-    "missing", "invented", "ambiguous", "undelivered", "missized",
+    "missing", "invented", "ambiguous", "undelivered", "redundant",
+    "missized",
     "untestable", "underspecified-contract", "other",
 }
 _VALID_FAILURE_CLASS = {"mainline", "edge"}

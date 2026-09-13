@@ -359,7 +359,7 @@ def test_build_prompt_body_mentions_prd():
     assert "including work\n   awaiting external runtime" in body
     assert "Name\n  the remaining rows and why each lacks a local implementation path" in body
     assert "design_conformance.findings" in body
-    assert "replace the differing implementation method" in body
+    assert "For design drift, replace the differing\n  implementation method" in body
     assert "Never use `git add -A`, `git add .`" in body
     assert "Run every commit synchronously" in body
     assert "Never leave a commit or hook running\n  in the background" in body

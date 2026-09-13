@@ -13,7 +13,9 @@ from autodev.vendors.session_keys import feature_session_key
 
 SDK_ROOT = Path(__file__).resolve().parents[2]
 SESSION_HELPER = SDK_ROOT / "shared" / "vendors" / "scripts" / "session-state.py"
-PERSISTENT_AGENT_ROLES = ("design", "build", "ralph-review")
+# arch-design is not listed here: it shares the "design" role's session
+# (core R7), so `autodev reset-session <feature> design` already covers it.
+PERSISTENT_AGENT_ROLES = ("design", "build", "ralph-review", "arch-review")
 
 
 def shared_session_state_dir() -> Path:
@@ -57,3 +59,38 @@ def reset_feature_session(feature_active: Path, role: str) -> int:
         return int(proc.stdout.strip())
     except ValueError as exc:
         raise RuntimeError("session reset helper returned an invalid result") from exc
+
+
+def credit_feature_session_turn(feature_active: Path, role: str) -> int:
+    """Credit back one turn on every native-session record mapped from
+    ``role``'s logical key (core R7): folds the just-passed arch-design
+    review round back out of the design session's automatic-rotation
+    counter, so it does not count toward ``DESIGN_SESSION_MAX_TURNS``.
+
+    Callers should treat failure as non-fatal (log and continue) — this
+    is a bookkeeping nicety, not a pipeline-blocking operation.
+    """
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SESSION_HELPER),
+            "credit-turn",
+            "--state-dir",
+            str(shared_session_state_dir()),
+            "--key",
+            feature_session_key(feature_active, role),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "unknown credit-turn failure"
+        raise RuntimeError(detail)
+    try:
+        return int(proc.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            "session credit-turn helper returned an invalid result"
+        ) from exc

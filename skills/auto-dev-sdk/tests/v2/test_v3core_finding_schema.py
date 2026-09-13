@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema import validate
 
 from autodev.artifacts.verdict import (
     DroppedFinding, IssueCluster, PanelFinding, PanelVerdict, load_verdict,
@@ -151,3 +152,31 @@ def test_synthesizer_schema_requires_targets_with_empty_list_default():
     # target is represented by the prompt-mandated empty list.
     finding_schema = entry["properties"]["findings"]["items"]
     assert "targets" in finding_schema["required"]
+
+
+def test_redundant_category_survives_schema_and_verdict_round_trip(tmp_path):
+    from autodev.panel.runner import _finding_from_synth
+
+    schema = synthesizer_output_schema()
+    finding_schema = schema["properties"]["per_reviewer"]["items"] \
+        ["properties"]["findings"]["items"]
+    synthesized = {
+        "severity": "risk",
+        "priority": "P1",
+        "finding_id": "claude:1",
+        "summary": "duplicate adapter",
+        "targets": ["primary_pair.build.json"],
+        "category": "redundant",
+        "evidence_refs": ["prd:R1", "code:src/x.py:12"],
+        "failure_class": None,
+        "missized_direction": None,
+    }
+    validate(synthesized, finding_schema)
+    finding = _finding_from_synth("claude", synthesized)
+    path = _base_verdict(tmp_path, [finding])
+    loaded = load_verdict(path)
+    assert loaded.findings[0].category == "redundant"
+    assert loaded.findings[0].evidence_refs == [
+        "prd:R1", "code:src/x.py:12",
+    ]
+    assert loaded.findings[0].targets == ["primary_pair.build.json"]

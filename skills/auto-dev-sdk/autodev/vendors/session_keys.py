@@ -16,6 +16,7 @@ SESSION_KEY_VERSION = "v1"
 DESIGN_SESSION_MAX_TURNS = 15
 BUILD_SESSION_MAX_TURNS = 3
 RALPH_REVIEW_SESSION_MAX_TURNS = 5
+ARCH_REVIEW_SESSION_MAX_TURNS = 3
 DEFAULT_SESSION_MAX_TURNS = 5
 
 
@@ -77,12 +78,14 @@ def session_max_turns_for_role(role: str) -> int:
     """Return the automatic native-session rotation limit for one agent role."""
 
     normalized_role = role.strip()
-    if normalized_role == "design":
+    if normalized_role in ("design", "arch-design"):
         return DESIGN_SESSION_MAX_TURNS
     if normalized_role == "build":
         return BUILD_SESSION_MAX_TURNS
     if normalized_role == "ralph-review":
         return RALPH_REVIEW_SESSION_MAX_TURNS
+    if normalized_role == "arch-review":
+        return ARCH_REVIEW_SESSION_MAX_TURNS
     return DEFAULT_SESSION_MAX_TURNS
 
 
@@ -100,6 +103,11 @@ def feature_session_key(feature_active: Path, role: str) -> str:
     normalized_role = role.strip().replace("\n", " ")
     if not normalized_role:
         raise ValueError("session role must not be empty")
+    # arch-design shares the design role's session (core R7): normalize
+    # to "design" before the review-phase suffix so both stages resolve
+    # to the exact same key.
+    if normalized_role == "arch-design":
+        normalized_role = "design"
     if normalized_role == "design":
         normalized_role = _with_review_phase(active, normalized_role)
     return f"autodev:{SESSION_KEY_VERSION}:{repo_hash}:{feature}:{normalized_role}"

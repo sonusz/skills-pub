@@ -34,6 +34,7 @@ If asked to code directly in a repo covered by this skill, decline and ask the u
 
 - Dispatches all harness-owned LLM calls through the packaged
   `shared/vendors/scripts/call.sh` interface per repo-root `vendors.yml`.
+- Runs a single-agent `arch-design`/`arch-review` loop before design: `arch-design` drafts the architecture from the PRD, `arch-review` checks PRD coverage/invention/redundancy/reuse; repeat until `pass` sends it into `design`.
 - Runs `design-review` over the unified design packet and `close-approval` over `implemented-spec.md` + PRD + judgment-free PRD checklist.
 - Uses configured `claude` + `grok` + `agy` + `codex`/`openai` panel reviewers
   for review diversity.
@@ -86,7 +87,7 @@ I may only invoke these:
 | `autodev skip-gate <f> <gate> --reason "..."` | Override a mandatory gate |
 | `autodev acknowledge-dirty <f> --reason "..."` | Override dirty-workspace block |
 | `autodev abort <f>` | Hard-stop the run: write `.pause` sentinel (so orchestrator can't dispatch next stage) + kill running vendor subprocess + write interrupted failure. Run `autodev resume` before next `run`. |
-| `autodev reset-session <f> design\|build\|ralph-review` | Forget one paused feature agent's provider-native conversation so its next turn starts fresh. Pause first; an active session lease blocks reset. |
+| `autodev reset-session <f> design\|build\|ralph-review\|arch-review` | Forget one paused feature agent's provider-native conversation so its next turn starts fresh. Pause first; an active session lease blocks reset. |
 | `autodev restore-design <f> [--package package-NNN]` | Restore a paused feature's latest (or named) hash-verified design-package snapshot after an interrupted or mistaken invalidation. |
 | `autodev retry <f>` | Retry last failed stage |
 | `autodev invalidate <f> <stage>` | Rollback a stage artifact |

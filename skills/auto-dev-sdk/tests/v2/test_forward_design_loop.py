@@ -79,6 +79,27 @@ def _seed_forward_feature(active: Path) -> None:
     )
     prd_hash = hash_file(prd)
 
+    # arch-design.md: canonical upstream of design/scope/trace/test_plan is
+    # now arch_design (core R4), not prd directly.
+    arch_design = active / "arch-design.md"
+    write_markdown_with_hash(
+        arch_design,
+        "## 1. Goal\nForward design loop.\n## 5. PRD coverage\n"
+        "| R1 | packet |\n| R6 | packet |\n",
+        source=str(prd),
+        source_hash=prd_hash,
+    )
+    arch_design_hash = hash_file(arch_design)
+    atomic_write_json(active / "arch-review.json", {
+        "kind": "arch-review",
+        "source": str(arch_design),
+        "source_hash": arch_design_hash,
+        "prd_hash": prd_hash,
+        "written": "2026-04-26T00:00:00Z",
+        "verdict": "pass",
+        "findings": [],
+    })
+
     write_markdown_with_hash(
         active / "design.md",
         (
@@ -90,14 +111,14 @@ def _seed_forward_feature(active: Path) -> None:
             "Validation commands: [\"pytest -q\"]\n\n"
             "Packet contract.\n"
         ),
-        source=str(prd),
-        source_hash=prd_hash,
+        source=str(arch_design),
+        source_hash=arch_design_hash,
     )
     atomic_write_json(
         active / "scope.json",
         {
-            "source": str(prd),
-            "source_hash": prd_hash,
+            "source": str(arch_design),
+            "source_hash": arch_design_hash,
             "written": "2026-04-26",
             "feature": "demo",
             "mode": "fresh",
@@ -139,8 +160,8 @@ def _seed_forward_feature(active: Path) -> None:
             "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
             "| 1 | fdl-1.r1 | fdl-1 | packet exists | -- | -- | pending | Source: prd:R1 |\n"
         ),
-        source=str(prd),
-        source_hash=prd_hash,
+        source=str(arch_design),
+        source_hash=arch_design_hash,
     )
     write_markdown_with_hash(
         active / "test-plan.md",
@@ -151,8 +172,8 @@ def _seed_forward_feature(active: Path) -> None:
             "| --- | --- | --- | --- | --- | --- |\n"
             "| fdl-1 | packet flow | integration | -- | repo | Source: prd:R1 |\n"
         ),
-        source=str(prd),
-        source_hash=prd_hash,
+        source=str(arch_design),
+        source_hash=arch_design_hash,
     )
 
 

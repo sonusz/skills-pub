@@ -71,6 +71,8 @@ def main() -> int:
     tgt_readme = _extract_path(prompt, ["TARGET_README"])
     tgt_review = _extract_path(prompt, ["TARGET_REVIEW"])
     tgt_ralph_review = _extract_path(prompt, ["TARGET_RALPH_REVIEW"])
+    tgt_arch_design = _extract_path(prompt, ["TARGET_ARCH_DESIGN"])
+    tgt_arch_review = _extract_path(prompt, ["TARGET_ARCH_REVIEW"])
 
     # TARGET_ARTIFACT is the primary; the stage-specific keys above
     # are stage-resolvable without ambiguity except scope/build which
@@ -92,15 +94,97 @@ def main() -> int:
             tgt_spec = primary
         elif name == "trace.md":
             tgt_trace = primary
+        elif name == "arch-design.md":
+            tgt_arch_design = primary
+        elif name == "arch-review.json":
+            tgt_arch_review = primary
 
-    # unified design stage
+    # arch-design stage (core R1, detail §9.1): single markdown artifact,
+    # source-anchored to prd.md (arch-design.md has no upstream design
+    # package yet — it IS the thing design.md/scope.json/etc. will expand).
+    if tgt_arch_design:
+        active = tgt_arch_design.parent
+        prd_path = active / "prd.md"
+        src_hash = _hash_file(prd_path) if prd_path.exists() else _HASH_ZERO
+        _write_tmp(tgt_arch_design, f"""<!-- source: {prd_path} -->
+<!-- source_hash: {src_hash} -->
+<!-- written: {_DATE} -->
+
+## 1. Goal
+Smoke feature architecture, one pass.
+
+## 2. Components
+- smoke-component (new)
+
+## 3. Control & data flow
+Single request/response pass-through.
+
+## 4. Boundaries & interfaces
+No external boundaries in the smoke scenario.
+
+## 5. PRD coverage
+| Req | Component |
+|---|---|
+| R1 | smoke-component |
+""")
+        return 0
+
+    # arch-review stage (core R2, detail §9.1): single-agent review verdict.
+    # AUTODEV_FAKE_ARCH_REVIEW_REJECT_FIRST=1 makes the FIRST call for a
+    # given arch-design.md return needs_revision (one redundant finding);
+    # every subsequent call returns pass. "First" is detected the same way
+    # as elsewhere in this fake: absence of the previously-landed artifact.
+    if tgt_arch_review:
+        active = tgt_arch_review.parent
+        arch_design_path = active / "arch-design.md"
+        prd_path = active / "prd.md"
+        arch_design_hash = (
+            _hash_file(arch_design_path) if arch_design_path.exists() else _HASH_ZERO
+        )
+        prd_hash = _hash_file(prd_path) if prd_path.exists() else _HASH_ZERO
+        reject_first = os.environ.get("AUTODEV_FAKE_ARCH_REVIEW_REJECT_FIRST") == "1"
+        is_first_call = not tgt_arch_review.exists()
+        if reject_first and is_first_call:
+            payload = {
+                "kind": "arch-review",
+                "source": str(arch_design_path),
+                "source_hash": arch_design_hash,
+                "prd_hash": prd_hash,
+                "written": _DATE,
+                "verdict": "needs_revision",
+                "findings": [{
+                    "category": "redundant",
+                    "prd_ref": None,
+                    "evidence": "arch-design.md §2 Components",
+                    "problem": "fake_vendor_cli_auto reject-first probe finding",
+                    "correction": "merge the redundant component into an existing one",
+                }],
+            }
+        else:
+            payload = {
+                "kind": "arch-review",
+                "source": str(arch_design_path),
+                "source_hash": arch_design_hash,
+                "prd_hash": prd_hash,
+                "written": _DATE,
+                "verdict": "pass",
+                "findings": [],
+            }
+        _write_tmp(tgt_arch_review, json.dumps(payload, indent=2) + "\n")
+        return 0
+
+    # unified design stage — core R4: canonical upstream is arch-design.md,
+    # not prd.md directly (the four design-package artifacts now expand
+    # the reviewed initial design).
     if tgt_design and tgt_scope and tgt_trace and tgt_test_plan:
         feature = os.environ.get("AUTODEV_FAKE_FEATURE", "smoke")
         active = tgt_design.parent
-        prd_path = active / "prd.md"
-        src_hash = _hash_file(prd_path) if prd_path.exists() else _HASH_ZERO
+        arch_design_path = active / "arch-design.md"
+        src_hash = (
+            _hash_file(arch_design_path) if arch_design_path.exists() else _HASH_ZERO
+        )
         scope_path = active / "scope.json"
-        _write_tmp(tgt_design, f"""<!-- source: {prd_path} -->
+        _write_tmp(tgt_design, f"""<!-- source: {arch_design_path} -->
 <!-- source_hash: {src_hash} -->
 <!-- written: {_DATE} -->
 
@@ -113,7 +197,7 @@ Validation commands: ["pytest -q"]
 Implement the smoke feature in one pass.
 """)
         _write_tmp(tgt_scope, f"""{{
-  "source": "docs/features/{feature}/active/prd.md",
+  "source": "docs/features/{feature}/active/arch-design.md",
   "source_hash": "{src_hash}",
   "written": "{_DATE}",
   "feature": "{feature}",
@@ -125,7 +209,7 @@ Implement the smoke feature in one pass.
   "excluded": []
 }}
 """)
-        _write_tmp(tgt_trace, f"""<!-- source: {prd_path} -->
+        _write_tmp(tgt_trace, f"""<!-- source: {arch_design_path} -->
 <!-- source_hash: {src_hash} -->
 <!-- written: {_DATE} -->
 
@@ -133,7 +217,7 @@ Implement the smoke feature in one pass.
 |---|---|---|---|---|---|---|
 | 1 | t-1.r1 | t-1 | smoke test | -- | -- | pending |
 """)
-        _write_tmp(tgt_test_plan, f"""<!-- source: {prd_path} -->
+        _write_tmp(tgt_test_plan, f"""<!-- source: {arch_design_path} -->
 <!-- source_hash: {src_hash} -->
 <!-- written: {_DATE} -->
 

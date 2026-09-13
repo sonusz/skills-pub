@@ -18,7 +18,7 @@ Processing matrix (rigor levels: strict > core > loose):
     | IV, category=undelivered (contradiction) | block  | block| block |
     | IV, category=missing (semantic gap)      | block  | block| DOWN  |
     | IV, any other/unknown category           | block  | block| block |
-    | risk, category=invented (over-design)    | block  | block| block |
+    | risk, category=invented/redundant        | block  | block| block |
     | risk, category=missized, dir=coarse/none | block  | block| block |
     | risk, category=missized, dir=fine        | block  | DOWN | DOWN  |
     | risk, other category, class=mainline/none| block  | block| DOWN  |
@@ -142,8 +142,8 @@ def _matrix_downgrades(
         return False, "row1:iv-blocks", fail_closed
 
     # severity == "risk"
-    if category == "invented":
-        return False, "row5:invented-blocks", fail_closed
+    if category in {"invented", "redundant"}:
+        return False, f"row5:{category}-blocks", fail_closed
     if category == "underspecified-contract":
         # Mechanism 4: an unusable boundary poisons build like a
         # contradiction; `defer` waives the interior, never the

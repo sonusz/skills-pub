@@ -102,6 +102,7 @@ def synthesizer_output_schema() -> dict:
                                             "invented",
                                             "ambiguous",
                                             "undelivered",
+                                            "redundant",
                                             "missized",
                                             "untestable",
                                             "underspecified-contract",

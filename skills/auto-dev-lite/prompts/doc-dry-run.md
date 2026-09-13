@@ -49,7 +49,15 @@ Reply with:
    document: contradicts it, silently adds scope it never asked for, drops
    a requirement it states, or reinterprets it. Quote both sides. If the
    detail document is a faithful elaboration, say so.
-4. **Out of scope** — what you would deliberately NOT do, per your reading
+4. **Proportionality** — identify any specific design mechanism that could be
+   removed, replaced by an existing suitable mechanism, or simplified while
+   preserving every affected core requirement and constraint. Name the
+   design location, the removal or alternative, and why the requirements and
+   constraints still hold. A mechanism may be redundant even when it traces
+   to a requirement. Do not force a finding or search exhaustively; future
+   flexibility, stylistic preference, and fewer lines alone are not evidence.
+   If no such mechanism is supported by concrete evidence, say so.
+5. **Out of scope** — what you would deliberately NOT do, per your reading
    of the documents.
 
 Work at a straightforward, practical level — a clear plan, not an exhaustive

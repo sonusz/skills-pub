@@ -4,7 +4,7 @@ Best-effort: wraps `git status --porcelain`. Not a security boundary.
 
 Harness-owned feature workspaces (`docs/features/<feature>/active/`) and
 internal paths (`.lock/`, `.pause`, `.running.pid`,
-`.running-pids.json`, `.route-feedback.json`, `*.stdout.log`,
+`.running-pids.json`, `*.stdout.log`,
 `*.stderr.log`, `*.tmp` mid-rename, `*-failure.json`, `log.jsonl`,
 `overrides.json`, `panel-*.json`) are excluded from the dirty check —
 they're pipeline state, not user code. The raw porcelain snapshot is retained,
@@ -31,7 +31,6 @@ _HARNESS_IGNORE_PATTERNS = (
     "docs/features/*/active/.pause",
     "docs/features/*/active/.running.pid",
     "docs/features/*/active/.running-pids.json",
-    "docs/features/*/active/.route-feedback.json",
     "docs/features/*/active/.*.stdout.log",
     "docs/features/*/active/.*.stderr.log",
     "docs/features/*/active/*.tmp",

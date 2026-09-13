@@ -176,6 +176,45 @@ EOF
 EOF
     exit 0
     ;;
+  success_arch_design)
+    cat > "$tmp" <<EOF
+<!-- source: $src_path -->
+<!-- source_hash: $src_hash -->
+<!-- written: $(date +%Y-%m-%d) -->
+
+## 1. Goal
+toy architecture
+
+## 2. Components
+- toy-component (new)
+
+## 3. Control & data flow
+toy flow
+
+## 4. Boundaries & interfaces
+toy boundary
+
+## 5. PRD coverage
+| Req | Component |
+|---|---|
+| R1 | toy-component |
+EOF
+    exit 0
+    ;;
+  success_arch_review)
+    cat > "$tmp" <<EOF
+{
+  "kind": "arch-review",
+  "source": "$src_path",
+  "source_hash": "$src_hash",
+  "prd_hash": "$src_hash",
+  "written": "$(date +%Y-%m-%d)",
+  "verdict": "pass",
+  "findings": []
+}
+EOF
+    exit 0
+    ;;
   timeout)
     sleep 3600
     ;;

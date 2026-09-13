@@ -17,9 +17,9 @@ You are reviewing a stage of development against the two design documents
 that authorized it. You have no other context, and that is deliberate: judge
 only what is written in the documents and what is present in the code.
 
-This review is about **conformance to the documents**, not general code
-quality. Ignore style nits and hypothetical bugs unless they contradict the
-documents.
+This review is about **conformance to the documents and proportionality**, not
+general code quality. Ignore style nits and hypothetical bugs unless they
+contradict the documents.
 
 Repository root: <repo_root>
 
@@ -47,7 +47,7 @@ Changes made in this stage:
 
 Read whatever repo files you need for context. Do not modify anything.
 
-Answer four questions, with evidence (file:line and the document section):
+Answer five questions, with evidence (file:line and the document section):
 
 1. **Conformance** — does every change trace to something the documents say?
    List any change you cannot map to either document.
@@ -60,7 +60,23 @@ Answer four questions, with evidence (file:line and the document section):
    change that follows the detail document but strays from the core
    requirements is a divergence finding, not a pass — quote both the core
    document and the detail document where they part ways.
+5. **Proportionality** — for changed code and affected design, identify any
+   specific mechanism that can be removed, replaced by an existing suitable
+   mechanism, or simplified while preserving every affected requirement and
+   constraint. Give the code/design location, the proposed change, and why
+   the requirements and constraints still hold. Do not force findings or
+   search exhaustively; speculative future flexibility, stylistic preference,
+   and fewer lines alone are not evidence. A simpler option that conflicts
+   with a core requirement or actual behavioral constraint is not a valid
+   finding. A detail-only mechanism choice may be proposed for revision when
+   the evidence shows the simpler design preserves those requirements and
+   constraints, but code must not silently depart from the current detail
+   document. If there is no evidenced excess or redundancy, say so.
 
-End with a verdict line: `PASS` (nothing found), `FIX` (conformance or
-completeness defects — list them), or `ESCALATE` (overreach, a doc gap, or a
-core/detail divergence that needs a human decision — explain what and why).
+End with a verdict line: `PASS` (nothing found), `FIX` (conformance,
+completeness, or evidenced excess/redundancy defects — list actionable
+changes), or `ESCALATE` (overreach, a doc gap, or a core/detail divergence
+that needs a human decision — explain what and why). If the detail document
+prescribes evidenced excess, return `FIX` and state that the detail must be
+corrected and comprehension rechecked before code rework. Never return
+`PASS` with an unresolved evidenced proportionality finding.

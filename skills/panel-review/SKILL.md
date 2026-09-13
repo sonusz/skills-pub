@@ -142,7 +142,9 @@ scripts/launch.sh --cwd "$REVIEW_CWD" <prompt_file> vendors.yaml "$RUN_DIR"
 # outputs before the synthesizer reads them.
 ```
 
-`--cwd` is mandatory. `launch.sh` has no inline mode.
+`--cwd` is mandatory (`PANEL_REVIEW_CWD` in the environment is accepted as the
+same explicit setting; the flag wins when both are set). `launch.sh` has no
+inline mode.
 
 ### 5. Synthesize with the configured synthesis call
 

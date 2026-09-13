@@ -126,6 +126,7 @@ def _has_boundary_test(tp_text: str, scope_id: str) -> bool:
 
 def precheck_design_review(feature_active: Path) -> PrecheckResult:
     prd_path = feature_active / "prd.md"
+    arch_design_path = feature_active / "arch-design.md"
     design_path = feature_active / "design.md"
     scope_path = feature_active / "scope.json"
     trace_path = feature_active / "trace.md"
@@ -133,6 +134,9 @@ def precheck_design_review(feature_active: Path) -> PrecheckResult:
     packet_path = feature_active / "design-packet.json"
     if not prd_path.exists():
         return PrecheckResult(False, "precheck_design_review: prd.md missing")
+    if not arch_design_path.exists():
+        return PrecheckResult(
+            False, "precheck_design_review: arch-design.md missing")
     if not design_path.exists():
         return PrecheckResult(False, "precheck_design_review: design.md missing")
     if not scope_path.exists():
@@ -279,15 +283,17 @@ def precheck_design_review(feature_active: Path) -> PrecheckResult:
                     f"contract|integration|e2e|boundary)"
                 )
 
-    # source_hash provenance: scope.source_hash == hash_file(prd)
+    # source_hash provenance: scope.source_hash == hash_file(arch-design.md)
+    # (core R4 / detail §7 — design docs now expand arch-design.md rather
+    # than prd.md directly; arch-design.md itself still anchors to prd.md).
     from autodev.state.hashing import hash_file
-    actual_prd_hash = hash_file(prd_path)
+    actual_arch_design_hash = hash_file(arch_design_path)
     claimed = scope_raw.get("source_hash", "")
-    if claimed != actual_prd_hash:
+    if claimed != actual_arch_design_hash:
         return PrecheckResult(
             False,
             f"precheck_design_review: scope.source_hash {claimed!r} != "
-            f"hash(prd.md) {actual_prd_hash!r}"
+            f"hash(arch-design.md) {actual_arch_design_hash!r}"
         )
 
     # Reverse coverage: every ### R<N>: heading in prd.md must appear in

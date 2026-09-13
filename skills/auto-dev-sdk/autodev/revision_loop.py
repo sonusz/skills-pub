@@ -168,7 +168,7 @@ def _dispatch_for_verdict(
                     f"{sorted(prd_filenames)!r}; halt for human "
                     f"(PRD amendment required)"
                 ), prd_targeted=True)
-            producers.add("design")
+            producers.add("arch-design")
         if len(producers) >= 1:
             # When findings span multiple rerunnable producer stages, pick
             # the upstream-most. Rerunning upstream cascades downstream
@@ -176,7 +176,10 @@ def _dispatch_for_verdict(
             # so the harness can make progress without halting for a human
             # to pick. Halt remains the right answer for PRD or arch-doc
             # targets (handled above) — those are not rerunnable.
-            _UPSTREAM_ORDER = ("design", "build", "spec")
+            # "design" stays in this order (core R6): producer_stage_for_layer
+            # can still hand back "design" via route_to_layer's build-diagnostic
+            # path, which is out of scope for this change.
+            _UPSTREAM_ORDER = ("arch-design", "design", "build", "spec")
             p = next((s for s in _UPSTREAM_ORDER if s in producers), None)
             if p is None:
                 # Defensive: an unrecognized producer value made it in.
@@ -195,8 +198,9 @@ def _dispatch_for_verdict(
             if prd_filenames:
                 reason = (
                     f"PRD-targeted design-review finding(s) "
-                    f"{sorted(prd_filenames)!r}; rerun design first so the "
-                    "design agent can try to avoid the apparent PRD conflict"
+                    f"{sorted(prd_filenames)!r}; rerun arch-design first so "
+                    "the initial-design agent can try to avoid the apparent "
+                    "PRD conflict"
                 )
             return _DispatchResult(p, p, reason, prd_targeted=bool(prd_filenames))
         # producers empty but filenames non-empty — all were halt-filenames
@@ -236,7 +240,7 @@ def producer_eligible_for_manual_rerun(
     if state.L.get(gate, 0) < L_MAX:
         return None
     if gate == "design-review" and verdict.decision is not None:
-        return "design" if verdict.decision.outcome == "retry_design" else None
+        return "arch-design" if verdict.decision.outcome == "retry_design" else None
     dispatch = _dispatch_for_verdict(gate, verdict)
     if dispatch.producer is None:
         return None
@@ -275,7 +279,7 @@ def handle_panel_verdict(
                 gate=gate,
                 state=s,
                 reason=verdict.decision.summary,
-                would_rerun="design",
+                would_rerun="arch-design",
             )
         if outcome == "retry_design":
             prd_targeted = bool(verdict.decision.prd_targeted)
@@ -290,9 +294,9 @@ def handle_panel_verdict(
                     reason=(
                         f"L[{gate}]={l} already at L_MAX={L_MAX}; this is the "
                         f"{L_MAX+1}th blocking verdict — halt for human decision "
-                        "(would have rerun 'design')"
+                        "(would have rerun 'arch-design')"
                     ),
-                    would_rerun="design",
+                    would_rerun="arch-design",
                 )
             write_state(feature_active, s)
             suffix = (
@@ -302,10 +306,10 @@ def handle_panel_verdict(
             return Decision(
                 kind=DecisionKind.LOCAL_REVISE,
                 gate=gate,
-                stage_to_rerun="design",
+                stage_to_rerun="arch-design",
                 feedback_paths=[_gate_verdict_filename(gate)],
                 state=s,
-                would_rerun="design",
+                would_rerun="arch-design",
                 reason=(
                     f"canonical design_review retry_design; "
                     f"L[{gate}]={s.L[gate]}/{L_MAX}{suffix}"

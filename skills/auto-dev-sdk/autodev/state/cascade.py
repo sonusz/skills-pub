@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autodev.artifacts.verdict import panel_payload_transport_incomplete
+from autodev.artifacts.arch_review import arch_review_fresh
 from autodev.artifacts.design_packet import (
     accepted_design_fresh,
     design_packet_fresh,
@@ -22,17 +23,20 @@ class ArtifactRef:
 
 
 # Unified design-stage graph.
-#   prd → {design, scope, trace, test_plan} → design_packet
+#   prd → arch_design → arch_review (single-agent review loop, core R1-R3)
+#   arch_design → {design, scope, trace, test_plan} → design_packet
 #       → panel_design_review → accepted_design → build
 #       → implementation_index → spec
 #   prd → prd_checklist
 #   {prd, prd_checklist, spec} → panel_close_approval
 ARTIFACTS: tuple[ArtifactRef, ...] = (
     ArtifactRef("prd",                     "prd.md",                         False, ()),
-    ArtifactRef("design",                  "design.md",                      False, ("prd",)),
-    ArtifactRef("scope",                   "scope.json",                     True,  ("prd",)),
-    ArtifactRef("trace",                   "trace.md",                       False, ("prd",)),
-    ArtifactRef("test_plan",               "test-plan.md",                   False, ("prd",)),
+    ArtifactRef("arch_design",             "arch-design.md",                 False, ("prd",)),
+    ArtifactRef("arch_review",             "arch-review.json",               True,  ("arch_design",)),
+    ArtifactRef("design",                  "design.md",                      False, ("arch_design",)),
+    ArtifactRef("scope",                   "scope.json",                     True,  ("arch_design",)),
+    ArtifactRef("trace",                   "trace.md",                       False, ("arch_design",)),
+    ArtifactRef("test_plan",               "test-plan.md",                   False, ("arch_design",)),
     ArtifactRef("design_packet",           "design-packet.json",             True,  ("design", "scope", "trace", "test_plan", "prd")),
     ArtifactRef("panel_design_review",     "panel-design-review.json",       True,  ("design_packet", "prd")),
     ArtifactRef("accepted_design",         "accepted-design.json",           True,  ("panel_design_review", "design_packet")),
@@ -163,6 +167,9 @@ class StalenessCascade:
                 continue
             if ref.name == "accepted_design":
                 result[ref.name] = accepted_design_fresh(p)
+                continue
+            if ref.name == "arch_review":
+                result[ref.name] = arch_review_fresh(p, self.path_for("arch_design"))
                 continue
             recorded = _recorded_hash(p, ref.is_json)
             canon = _canonical_upstream(ref)

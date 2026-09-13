@@ -63,9 +63,9 @@ EXPECTED_HASHES = {
     "review-trace-review.md":
         "4306f587f1d5d5e630bec001013e06f2613772c0115f4893c1368528bb75f834",
     "review-close-approval.md":
-        "e42814b8bb675fe4c94b941e0e4cd2ce19d2e8102b316b38cf764aa0e6b7bee2",
+        "eabe4ff9745d9cdcee080c6217b1c7d64fdcc5688c9e64848783672b8e864df5",
     "synthesize.md":
-        "4685aef10285ef8bb6d605e5fa6a4a7a2b3350371cf0e8e8d7aa78f8569a727f",
+        "48a3611a75bb36a0692ea1d380e46e79a8d78e8cdd83d6c375b2342f2865308a",
 }
 
 

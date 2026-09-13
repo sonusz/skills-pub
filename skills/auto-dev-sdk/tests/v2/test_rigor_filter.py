@@ -110,6 +110,16 @@ def test_invented_blocks_on_loose():
     assert f.severity == "risk"
 
 
+def test_redundant_blocks_at_every_rigor_and_respects_release_threshold():
+    for level in ("strict", "core", "loose"):
+        f = _finding(category="redundant", refs=["prd:R1"])
+        f.priority = "P1"
+        apply_rigor_filter([f], _assurance(per_r={"R1": level}))
+        assert f.severity == "risk", level
+        assert has_effective_blocking([f], "P1")
+        assert not has_effective_blocking([f], "P0")
+
+
 def test_missized_fine_downgrades_on_core_and_loose():
     for level in ("core", "loose"):
         f = _finding(category="missized", missized_direction="fine",
@@ -326,19 +336,6 @@ def test_finding_from_synth_preserves_rigor_fields():
     assert f.evidence_refs == ["prd:R5", "scope:s-1"]
     assert f.failure_class == "edge"
     assert f.missized_direction == "fine"
-
-
-def test_route_invalidation_clears_stale_rework_mode(tmp_path):
-    """P1-2: a routed design rerun is a structural dispatch the mode
-    selector never saw; a stale `patch` mode must not constrain it."""
-    from autodev.orchestrator import Orchestrator
-    active = tmp_path / "active"
-    active.mkdir()
-    (active / "rework-mode.json").write_text('{"mode": "patch"}')
-    (active / "design.md").write_text("d")
-    o = object.__new__(Orchestrator)   # method uses no instance state
-    o._apply_route_invalidation(active, "design")
-    assert not (active / "rework-mode.json").exists()
 
 
 # ---- P1 regressions (review round 2) ---------------------------------------

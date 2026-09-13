@@ -68,10 +68,10 @@ def test_all_panel_gates_cover_tracked_gates():
 # ---------- Target → producer dispatch ----------
 
 @pytest.mark.parametrize("filename,producer", [
-    ("design.md", "design"),
-    ("scope.json", "design"),
-    ("trace.md", "design"),
-    ("test-plan.md", "design"),
+    ("design.md", "arch-design"),
+    ("scope.json", "arch-design"),
+    ("trace.md", "arch-design"),
+    ("test-plan.md", "arch-design"),
 ])
 def test_target_maps_to_producer(active, filename, producer):
     gate = "design-review"
@@ -85,7 +85,7 @@ def test_prd_target_routes_design_once(active):
     v = _v("design-review", [_f(targets=["primary_pair.prd.md"])])
     d = handle_panel_verdict(active, "design-review", v)
     assert d.kind == DecisionKind.LOCAL_REVISE
-    assert d.stage_to_rerun == "design"
+    assert d.stage_to_rerun == "arch-design"
     s = load_state(active)
     assert s.L["design-review"] == 1
     assert s.prd_target_streak["design-review"] == 1
@@ -96,7 +96,7 @@ def test_anchor_prd_target_routes_design_once(active):
     v = _v("design-review", [_f(targets=["anchor.prd.md"])])
     d = handle_panel_verdict(active, "design-review", v)
     assert d.kind == DecisionKind.LOCAL_REVISE
-    assert d.stage_to_rerun == "design"
+    assert d.stage_to_rerun == "arch-design"
     assert load_state(active).prd_target_streak["design-review"] == 1
 
 
@@ -158,7 +158,7 @@ def test_prd_target_halts_on_second_consecutive_round(active):
     assert first.kind == DecisionKind.LOCAL_REVISE
     second = handle_panel_verdict(active, "design-review", v)
     assert second.kind == DecisionKind.HALT_FOR_HUMAN
-    assert second.would_rerun == "design"
+    assert second.would_rerun == "arch-design"
     s = load_state(active)
     assert s.L["design-review"] == 1
     assert s.prd_target_streak["design-review"] == PRD_TARGET_HALT_STREAK
@@ -226,6 +226,17 @@ def test_close_build_target_reruns_build(active):
     assert d.stage_to_rerun == "build"
 
 
+def test_close_redundancy_routes_code_cleanup_to_build(active):
+    finding = _f(severity="risk", targets=["primary_pair.build.json"])
+    finding.category = "redundant"
+    finding.priority = "P1"
+    d = handle_panel_verdict(active, "close-approval", _v(
+        "close-approval", [finding],
+    ))
+    assert d.kind == DecisionKind.LOCAL_REVISE
+    assert d.stage_to_rerun == "build"
+
+
 def test_close_findings_span_design_and_build_picks_design(active):
     """When close-approval findings target both design and build
     artifacts, the orchestrator must pick the upstream-most producer
@@ -238,7 +249,7 @@ def test_close_findings_span_design_and_build_picks_design(active):
     ])
     d = handle_panel_verdict(active, "close-approval", v)
     assert d.kind == DecisionKind.LOCAL_REVISE
-    assert d.stage_to_rerun == "design"
+    assert d.stage_to_rerun == "arch-design"
     assert "upstream-most" in d.reason
 
 
@@ -251,14 +262,25 @@ def test_close_design_target_reruns_design(active):
     ])
     d = handle_panel_verdict(active, "close-approval", v)
     assert d.kind == DecisionKind.LOCAL_REVISE
-    assert d.stage_to_rerun == "design"
+    assert d.stage_to_rerun == "arch-design"
+
+
+def test_close_design_mandated_redundancy_routes_to_design(active):
+    finding = _f(severity="risk", targets=["primary_pair.design.md"])
+    finding.category = "redundant"
+    finding.priority = "P1"
+    d = handle_panel_verdict(active, "close-approval", _v(
+        "close-approval", [finding],
+    ))
+    assert d.kind == DecisionKind.LOCAL_REVISE
+    assert d.stage_to_rerun == "arch-design"
 
 
 def test_design_review_fallback_rerun_design(active):
     v = _v("design-review", [_f(targets=[])])  # indeterminate
     d = handle_panel_verdict(active, "design-review", v)
     assert d.kind == DecisionKind.LOCAL_REVISE
-    assert d.stage_to_rerun == "design"
+    assert d.stage_to_rerun == "arch-design"
 
 
 def test_close_indeterminate_halts(active):
@@ -286,7 +308,7 @@ def test_opinion_targets_ignored_for_dispatch(active):
     ])
     d = handle_panel_verdict(active, "design-review", v)
     assert d.kind == DecisionKind.LOCAL_REVISE
-    assert d.stage_to_rerun == "design"
+    assert d.stage_to_rerun == "arch-design"
 
 
 def test_risk_severity_triggers_dispatch(active):
@@ -383,7 +405,7 @@ def test_manual_rerun_eligibility_accepts_rerunnable_cap_halt(active):
     s.L["design-review"] = L_MAX
     write_state(active, s)
     v = _v("design-review", [_f(targets=["primary_pair.trace.md"])])
-    assert producer_eligible_for_manual_rerun(active, "design-review", v) == "design"
+    assert producer_eligible_for_manual_rerun(active, "design-review", v) == "arch-design"
 
 
 def test_first_blocking_verdict_bumps_l_to_1(active):
@@ -510,7 +532,7 @@ def test_would_rerun_field_populated_on_halt(active):
     v = _v("design-review", [_f(targets=["primary_pair.trace.md"])])
     d = handle_panel_verdict(active, "design-review", v)
     assert d.kind == DecisionKind.HALT_FOR_HUMAN
-    assert d.would_rerun == "design"
+    assert d.would_rerun == "arch-design"
 
 
 def test_rerun_does_not_set_pending_feedback(active):

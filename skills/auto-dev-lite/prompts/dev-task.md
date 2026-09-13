@@ -55,6 +55,16 @@ Rules:
   touches, do not pick a side. Treat it like a gap: stop that thread and
   report the conflict with quotes from both documents.
 - Match the surrounding code's style and conventions.
+- Prefer existing suitable mechanisms and the simplest implementation that
+  satisfies every requirement and constraint. Do not add abstractions or
+  parallel mechanisms for speculative future flexibility, stylistic
+  preference, or line-count reduction alone.
+- If the detail document prescribes a mechanism that appears unnecessary or
+  redundant, do not silently omit it. Report its document location, the
+  proposed removal/reuse/simpler alternative, and why all affected
+  requirements and constraints still hold so the orchestrator can correct
+  the detail document and rerun comprehension. Do not remove complexity that
+  the core document explicitly requires.
 - Verify your work with the repo's existing test/build commands where they
   exist; write tests when the documents or task scope call for them.
 

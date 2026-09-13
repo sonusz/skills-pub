@@ -59,28 +59,37 @@ def _seed_prd_and_scope(active: Path) -> tuple[str, str]:
         "## Constraints\n\n## Success criteria\n\n## Out of scope\n",
     )
     prd_h = hash_file(prd)
-    (active / "design.md").write_text(
+    # arch-design.md: canonical upstream of design/scope/trace/test_plan is
+    # now arch_design (core R4), not prd directly.
+    arch_design = active / "arch-design.md"
+    arch_design.write_text(
         f"<!-- source: {prd} -->\n<!-- source_hash: {prd_h} -->\n"
+        "<!-- written: 2026-04-22 -->\n\n## 1. Goal\nx\n## 5. PRD coverage\nx\n",
+        encoding="utf-8",
+    )
+    arch_design_h = hash_file(arch_design)
+    (active / "design.md").write_text(
+        f"<!-- source: {arch_design} -->\n<!-- source_hash: {arch_design_h} -->\n"
         "<!-- written: 2026-04-22 -->\n\n## 1. Context\nx\n"
         "## 2. Primitives & commitments\n"
         "Validation commands: [\"pytest -q\"]\n\nx\n",
         encoding="utf-8",
     )
     scope = Scope(
-        source=str(prd), source_hash=prd_h, written="2026-04-22",
+        source=str(arch_design), source_hash=arch_design_h, written="2026-04-22",
         feature="demo", mode="fresh", diff_base="main",
         in_scope=[ScopeItem(id="s-1", description="do it", prd_ref=["R1"], design_ref=["§2"])],
     )
     write_scope(active / "scope.json", scope)
     (active / "trace.md").write_text(
-        f"<!-- source: {prd} -->\n<!-- source_hash: {prd_h} -->\n"
+        f"<!-- source: {arch_design} -->\n<!-- source_hash: {arch_design_h} -->\n"
         "| # | Req ID | Scope ID | Requirement | Test(s) | Code Path | Status | Source |\n"
         "|---|---|---|---|---|---|---|---|\n"
         "| 1 | s-1.r1 | s-1 | do it | -- | -- | pending | Source: prd:R1 |\n",
         encoding="utf-8",
     )
     (active / "test-plan.md").write_text(
-        f"<!-- source: {prd} -->\n<!-- source_hash: {prd_h} -->\n"
+        f"<!-- source: {arch_design} -->\n<!-- source_hash: {arch_design_h} -->\n"
         "## Test Strategy\nx\n## Test Cases\n"
         "| Scope ID | Desc | Tier | Edges | Fixtures | Source |\n"
         "|---|---|---|---|---|---|\n"
@@ -257,7 +266,7 @@ def test_orchestrator_routes_on_disk_blocking_verdict(tmp_path):
     )
     assert decision is not None
     assert decision.kind == DecisionKind.LOCAL_REVISE
-    assert decision.stage_to_rerun == "design"
+    assert decision.stage_to_rerun == "arch-design"
     assert load_state(active).L["design-review"] == 1
 
 
@@ -337,12 +346,13 @@ def test_filename_to_producer_close_approval_routes_to_build():
     assert filename_to_producer("close-approval", "build.json") == "build"
 
 
-def test_filename_to_producer_close_approval_routes_to_design():
-    """close-approval can route to upstream design artifacts."""
-    assert filename_to_producer("close-approval", "design.md") == "design"
-    assert filename_to_producer("close-approval", "scope.json") == "design"
-    assert filename_to_producer("close-approval", "trace.md") == "design"
-    assert filename_to_producer("close-approval", "test-plan.md") == "design"
+def test_filename_to_producer_close_approval_routes_to_arch_design():
+    """close-approval can route to upstream design artifacts, which now
+    rerun arch-design (core R5) rather than the expansion stage."""
+    assert filename_to_producer("close-approval", "design.md") == "arch-design"
+    assert filename_to_producer("close-approval", "scope.json") == "arch-design"
+    assert filename_to_producer("close-approval", "trace.md") == "arch-design"
+    assert filename_to_producer("close-approval", "test-plan.md") == "arch-design"
 
 
 def test_filename_to_producer_design_review_spec_is_external():
@@ -350,7 +360,7 @@ def test_filename_to_producer_design_review_spec_is_external():
 
 
 def test_filename_to_producer_design_review_scope_works():
-    assert filename_to_producer("design-review", "scope.json") == "design"
+    assert filename_to_producer("design-review", "scope.json") == "arch-design"
 
 
 def test_filename_to_producer_design_review_unknown_is_halt():

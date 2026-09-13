@@ -206,7 +206,7 @@ def run_stage_subprocess(
     vendor = chosen.vendor
     session_key: str | None = None
     session_max_turns: int | None = None
-    if stage in {"design", "build", "ralph-review"}:
+    if stage in {"design", "build", "ralph-review", "arch-design", "arch-review"}:
         from autodev.vendors.session_keys import (
             feature_session_key,
             session_max_turns_for_role,

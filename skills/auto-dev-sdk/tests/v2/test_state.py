@@ -85,20 +85,30 @@ def test_cascade_prd_only_is_fresh(feature_active):
     c = StalenessCascade(feature_active)
     fresh = c.fresh()
     assert fresh["prd"] is True
+    assert fresh["arch_design"] is False
     assert fresh["design"] is False
     assert fresh["scope"] is False
-    assert c.next_stage() == "design"
+    assert c.next_stage() == "arch_design"
 
 
 def test_cascade_prd_change_invalidates_scope(feature_active):
     from autodev.artifacts.scope import Scope, ScopeItem, write_scope
     (feature_active / "prd.md").write_text("# v1\n")
     prd_h = hash_file(feature_active / "prd.md")
+    # arch-design.md: canonical upstream of design/scope is now arch_design
+    # (core R4), not prd directly.
+    (feature_active / "arch-design.md").write_text(
+        f"<!-- source: {feature_active / 'prd.md'} -->\n"
+        f"<!-- source_hash: {prd_h} -->\n"
+        "<!-- written: 2026-04-20 -->\n\n## 1. Goal\nx\n",
+        encoding="utf-8",
+    )
+    arch_design_h = hash_file(feature_active / "arch-design.md")
     # panel-design-review verdict
     from autodev.artifacts.verdict import PanelVerdict, write_verdict
     (feature_active / "design.md").write_text(
-        f"<!-- source: {feature_active / 'prd.md'} -->\n"
-        f"<!-- source_hash: {prd_h} -->\n"
+        f"<!-- source: {feature_active / 'arch-design.md'} -->\n"
+        f"<!-- source_hash: {arch_design_h} -->\n"
         "<!-- written: 2026-04-20 -->\n\n## 1. Context\nx\n",
         encoding="utf-8",
     )
@@ -110,15 +120,17 @@ def test_cascade_prd_change_invalidates_scope(feature_active):
     )
     write_verdict(feature_active / "panel-design-review.json", v)
     write_scope(feature_active / "scope.json", Scope(
-        source=str(feature_active / "prd.md"), source_hash=prd_h,
+        source=str(feature_active / "arch-design.md"), source_hash=arch_design_h,
         written="2026-04-20", feature="demo", mode="fresh", diff_base="main",
         in_scope=[ScopeItem(id="s-1", description="x", prd_ref=["§1"], design_ref=["§1"])],
     ))
     c = StalenessCascade(feature_active)
+    assert c.fresh()["arch_design"] is True
     assert c.fresh()["scope"] is True
     # Mutate PRD
     (feature_active / "prd.md").write_text("# v2\n")
     c2 = StalenessCascade(feature_active)
+    assert c2.fresh()["arch_design"] is False
     assert c2.fresh()["design"] is False
     assert c2.fresh()["scope"] is False
     assert c2.fresh()["panel_design_review"] is False

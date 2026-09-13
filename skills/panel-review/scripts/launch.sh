@@ -16,10 +16,14 @@ Usage:
 
 Panel calls always run in path-based discovery mode with --yolo and --cwd so
 each vendor reads the requested repo/source itself. Reviewed artifact bodies
-must not be embedded in the prompt.
+must not be embedded in the prompt. There is no inline mode.
 
 Options:
-  --cwd DIR   Required repo/source root for reviewer tool access
+  --cwd DIR   Required repo/source root for reviewer tool access.
+              PANEL_REVIEW_CWD in the environment is an equivalent explicit
+              setting; --cwd wins when both are given.
+  --repo      No-op kept for callers written against the two-mode launcher;
+              path-based discovery is the only mode.
   -h, --help  Show this help
 USAGE
 }
@@ -38,7 +42,7 @@ require_value() {
   fi
 }
 
-PANEL_REVIEW_CWD_VALUE=""
+PANEL_REVIEW_CWD_VALUE="${PANEL_REVIEW_CWD:-}"
 PANEL_REVIEW_GIT_GUARD=0
 PANEL_REVIEW_GIT_ROOT=""
 
@@ -55,6 +59,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --cwd=*)
       PANEL_REVIEW_CWD_VALUE="${1#*=}"
+      shift
+      ;;
+    --repo)
+      # Compatibility no-op: path-based discovery is the only mode.
       shift
       ;;
     --)
@@ -91,7 +99,7 @@ mkdir -p "$RUN_DIR"
 RUN_DIR="$(cd "$RUN_DIR" && pwd -P)"
 
 if [ -z "$PANEL_REVIEW_CWD_VALUE" ]; then
-  die "--cwd is required; panel reviews are path-based"
+  die "--cwd is required (or set PANEL_REVIEW_CWD); panel reviews are path-based"
 fi
 if [ ! -d "$PANEL_REVIEW_CWD_VALUE" ]; then
   printf "FAIL: --cwd is not a directory: %s\n" "$PANEL_REVIEW_CWD_VALUE" >&2

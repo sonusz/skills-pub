@@ -12,12 +12,15 @@ _STAGE_PROMPT_FILE = {
     "design": "stage-design.md",
     "build":  "stage-implement.md",
     "spec":   "stage-spec.md",
+    "arch-design": "stage-arch-design.md",
 }
 
 
 def _prompt_file_for_stage(stage: str) -> Path:
     if stage == "ralph-review":
         return PROMPTS_DIR / "stage-ralph-review.md"
+    if stage == "arch-review":
+        return PROMPTS_DIR / "stage-arch-review.md"
     return PROMPTS_DIR / _STAGE_PROMPT_FILE[stage]
 
 
@@ -102,8 +105,16 @@ def render_stage_prompt(
     # code-first: it receives only the harness-authored implementation
     # index, not PRD/scope/design/build semantics.
     upstream_by_stage = {
+        "arch-design": [
+            (feature_active / "prd.md",     "PRD_PATH",   "PRD_HASH"),
+        ],
+        "arch-review": [
+            (feature_active / "prd.md",         "PRD_PATH",         "PRD_HASH"),
+            (feature_active / "arch-design.md", "ARCH_DESIGN_PATH", "ARCH_DESIGN_HASH"),
+        ],
         "design": [
             (feature_active / "prd.md",     "PRD_PATH",   "PRD_HASH"),
+            (feature_active / "arch-design.md", "ARCH_DESIGN_PATH", "ARCH_DESIGN_HASH"),
         ],
         "build":  [
             (feature_active / "prd.md",        "PRD_PATH",       "PRD_HASH"),
@@ -143,7 +154,7 @@ def render_stage_prompt(
     # remaining budget, not only their own context window. ralph-review stays
     # context-isolated (pure code-vs-trace classifier) and spec is code-first,
     # so neither receives it. Rendering must survive any metering failure.
-    if stage in ("design", "build"):
+    if stage in ("design", "build", "arch-design"):
         try:
             from autodev.budget import format_budget_lines
             ctx_lines.extend(format_budget_lines(feature_active))
@@ -170,6 +181,8 @@ def render_stage_prompt(
 
     # Target artifacts
     target_map = {
+        "arch-design": [("TARGET_ARCH_DESIGN", primary_target)],
+        "arch-review": [("TARGET_ARCH_REVIEW", primary_target)],
         "design": [
             ("TARGET_DESIGN", primary_target),
             ("TARGET_SCOPE", extra_targets[0] if len(extra_targets) > 0 else feature_active / "scope.json"),
@@ -242,7 +255,10 @@ def render_stage_prompt(
     # A human-invalidated design is a true rebaseline. Feeding its old event
     # timeline back into an otherwise empty initial prompt would recreate the
     # discarded design through a hidden context channel.
-    fresh_design = stage == "design" and not preseeded and not effective_context
+    fresh_design = (
+        stage in ("design", "arch-design")
+        and not preseeded and not effective_context
+    )
     history = [] if fresh_design else build_iteration_history(feature_active)
     if history:
         ctx_lines.append("")

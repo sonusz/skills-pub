@@ -15,6 +15,11 @@ route/human halt intervenes. Final close review compares code-first
 implementation facts against the PRD; coverage is produced by the panel,
 not precomputed for it.
 
+Ralph and close-approval also flag evidenced removable code redundancy. Ralph
+reuses its correction findings to keep only affected scopes incomplete; the
+panel routes code-only cleanup to build and design-mandated redundancy to
+`arch-design`.
+
 ## Vendor Configuration
 
 The default config lives with the SDK at `vendors.yml`. Harness-owned
@@ -123,10 +128,18 @@ Notes:
 The agents that revise the same work across pipeline iterations keep distinct
 provider-native sessions:
 
-- one design session per repo + feature;
-- one build session and one Ralph-review session per repo + feature; and
+- one design session per repo + feature — `arch-design` shares this session,
+  since it is the same agent's preliminary architecture pass before the
+  design (packet-expansion) turns;
+- one build session, one Ralph-review session, and one arch-review session
+  per repo + feature; and
 - one panel-reviewer session per repo + feature + gate + configured reviewer
   slot/vendor/model.
+
+An `arch-design` turn whose `arch-review` verdict is `pass` is credited back
+to the design session — that turn is not counted toward the session's
+15-turn rotation budget. An `arch-design` turn sent back for revision counts
+normally, as do all design (packet-expansion) turns.
 
 Reviewer sessions are never shared with one another or across
 `design-review`, `trace-review`, and `close-approval`. On later turns the
@@ -221,10 +234,10 @@ Reset refuses an active session lease; the agent's next turn starts a fresh
 provider-native conversation.
 
 The harness also rotates conversations automatically at successful-turn
-boundaries: design keeps at most 15 turns, build at most 3, and Ralph review plus
-each panel reviewer at most 5. Turn 16 for design, turn 4 for build, and turn 6
-for Ralph review and panel reviewers start fresh with the full current artifact
-packet.
+boundaries: design keeps at most 15 turns, build at most 3, arch-review at
+most 3, and Ralph review plus each panel reviewer at most 5. Turn 16 for
+design, turn 4 for build, turn 4 for arch-review, and turn 6 for Ralph review
+and panel reviewers start fresh with the full current artifact packet.
 Failures and handled interruptions do not advance the count.
 
 If an interrupted or mistaken invalidation removed the active design package,
@@ -244,6 +257,7 @@ Current runtime stages and harness-authored nodes:
 
 | Step | Artifact | Review / next action |
 |------|----------|----------------------|
+| `arch-design` | `arch-design.md` | Single-agent `arch-review.json` review; a `pass` verdict advances the cascade into `design` |
 | `design` | `design.md`, `scope.json`, `trace.md`, `test-plan.md` | Harness seals `design-packet.json`, then panel runs `design-review` |
 | `build` | code + `build.json` | Ralph loop dispatches `ralph-review.json` until complete, stalled, or routed |
 | `implementation-index` | `implementation-index.json` | Harness-authored code navigation index for spec |
@@ -283,7 +297,7 @@ either dispatch a producer rerun (bumping the gate's L counter) or halt for
 human decision. Cross-round recurrence first reuses synthesizer cluster IDs
 and falls back to structural identity that deliberately ignores summary prose.
 For `design-review`, a blocking finding that targets `prd.md` first
-reruns the design stage so the design agent can try to remove the
+reruns `arch-design` so the arch-design agent can try to remove the
 apparent PRD conflict. A second consecutive PRD-targeted design-review
 finding halts for human.
 

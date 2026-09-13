@@ -18,8 +18,8 @@ from autodev.artifacts.revision_state import RevisionState, load_state, write_st
 from autodev.artifacts.scope import Scope, ScopeItem, write_scope
 from autodev.artifacts.verdict import PanelVerdict, write_verdict
 from autodev.errors import GatePending, PreflightError, SchemaError
+from autodev.state.atomic import atomic_write_json
 from autodev.orchestrator import (
-    ROUTE_FEEDBACK_FILENAME,
     Orchestrator,
     OrchestratorConfig,
 )
@@ -236,18 +236,46 @@ def _write_fake_vendor(path: Path) -> Path:
                 sys.exit(0)
 
             if tgt_trace and tgt_test_plan:
-                scope_hash = hash_file(active / "scope.json")
+                n = bump(active, "design")
+                log_prompt(active, "design", n, prompt)
+                # Design artifacts hash against arch-design.md (its canonical
+                # cascade upstream), not prd.md.
+                arch_hash_match = extract(prompt, "ARCH_DESIGN_HASH")
+                arch_hash = str(arch_hash_match) if arch_hash_match else hash_file(active / "arch-design.md")
                 write_tmp(
                     tgt_trace,
-                    f"<!-- source: scope.json -->\\n<!-- source_hash: {scope_hash} -->\\n"
+                    f"<!-- source: arch-design.md -->\\n<!-- source_hash: {arch_hash} -->\\n"
                     f"<!-- written: {DATE} -->\\n\\n| # | Req ID | Scope ID | Requirement | Test(s) | Code Path | Status |\\n"
                     f"|---|---|---|---|---|---|---|\\n| 1 | t-1.r1 | t-1 | x | -- | -- | pending |\\n",
                 )
                 write_tmp(
                     tgt_test_plan,
-                    f"<!-- source: scope.json -->\\n<!-- source_hash: {scope_hash} -->\\n"
+                    f"<!-- source: arch-design.md -->\\n<!-- source_hash: {arch_hash} -->\\n"
                     f"<!-- written: {DATE} -->\\n\\n## Test Strategy\\n",
                 )
+                tgt_changelog = extract(prompt, "TARGET_CHANGELOG")
+                if tgt_changelog is not None:
+                    landed_changelog = active / "design-changelog.json"
+                    entries = []
+                    if landed_changelog.exists():
+                        entries = json.loads(landed_changelog.read_text()).get("entries", [])
+                    next_round = (entries[-1]["round"] + 1) if entries else 1
+                    entries.append({
+                        "round": next_round,
+                        "trigger": "build",
+                        "reason": "fake rebuttal",
+                        "artifacts_changed": [],
+                        "added": [],
+                        "removed": [],
+                    })
+                    write_tmp(
+                        tgt_changelog,
+                        json.dumps({
+                            "kind": "design-changelog",
+                            "schema_version": 1,
+                            "entries": entries,
+                        }, indent=2) + "\\n",
+                    )
                 sys.exit(0)
 
             print("fake vendor: unsupported stage", file=sys.stderr)
@@ -297,16 +325,36 @@ def _seed_feature(active: Path, *, ids: list[str]) -> None:
     )
     (active / "prd.md").write_text("# PRD\n\n1. Loop review.\n", encoding="utf-8")
     prd_hash = hash_file(active / "prd.md")
+    # core R4: design/scope/trace/test_plan's canonical upstream is now
+    # arch-design.md, not prd.md directly — seed a passed initial design
+    # + arch-review so the four design-package artifacts anchor to it.
+    write_markdown_with_hash(
+        active / "arch-design.md",
+        "## 1. Goal\nDrive the build/ralph cycle.\n"
+        "## 5. PRD coverage\n| R1 | build/ralph loop |\n",
+        source=str(active / "prd.md"),
+        source_hash=prd_hash,
+    )
+    arch_design_hash = hash_file(active / "arch-design.md")
+    atomic_write_json(active / "arch-review.json", {
+        "kind": "arch-review",
+        "source": str(active / "arch-design.md"),
+        "source_hash": arch_design_hash,
+        "prd_hash": prd_hash,
+        "written": "2026-04-21T00:00:00Z",
+        "verdict": "pass",
+        "findings": [],
+    })
     write_markdown_with_hash(
         active / "design.md",
         "# Design\n\n## Loop\nDrive the build/ralph cycle from one design packet.\n\n"
         "Validation commands: [\"pytest -q\"]\n",
-        source=str(active / "prd.md"),
-        source_hash=prd_hash,
+        source=str(active / "arch-design.md"),
+        source_hash=arch_design_hash,
     )
     scope = Scope(
-        source=str(active / "prd.md"),
-        source_hash=prd_hash,
+        source=str(active / "arch-design.md"),
+        source_hash=arch_design_hash,
         written="2026-04-21",
         feature="demo",
         mode="fresh",
@@ -328,14 +376,14 @@ def _seed_feature(active: Path, *, ids: list[str]) -> None:
         active / "trace.md",
         f"| # | Req ID | Scope ID | Requirement | Test(s) | Code Path | Status |\n"
         f"|---|---|---|---|---|---|---|\n{trace_rows}\n",
-        source=str(active / "prd.md"),
-        source_hash=prd_hash,
+        source=str(active / "arch-design.md"),
+        source_hash=arch_design_hash,
     )
     write_markdown_with_hash(
         active / "test-plan.md",
         "## Test Strategy\nLoop coverage.\n",
-        source=str(active / "prd.md"),
-        source_hash=prd_hash,
+        source=str(active / "arch-design.md"),
+        source_hash=arch_design_hash,
     )
     packet = write_design_packet(active)
     zero_hash = "sha256:" + "0" * 64
@@ -740,7 +788,12 @@ def _read_log(active: Path) -> list[dict]:
     return out
 
 
-def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
+def test_build_route_dispatches_design_in_place(git_repo, feature_active, monkeypatch):
+    """A build-routed rerun revises design in place: no artifact is deleted,
+    design is dispatched within the same advance cycle, and the design
+    agent receives build.json + both panel verdicts + its own prior
+    artifacts through CONTEXT_ARTIFACTS (the same path a blocking panel
+    verdict's LOCAL_REVISE branch already uses)."""
     _seed_feature(feature_active, ids=["t-1"])
     ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
     vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
@@ -758,6 +811,47 @@ def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
     )
     ralph.write_ralph_state(feature_active, state)
     (feature_active / "ralph-review.json").write_text("stale\\n", encoding="utf-8")
+    (feature_active / "rework-mode.json").write_text(
+        '{"mode": "patch"}', encoding="utf-8",
+    )
+    (feature_active / "design-changelog.json").write_text(
+        json.dumps({
+            "kind": "design-changelog",
+            "schema_version": 1,
+            "entries": [{
+                "round": 1,
+                "trigger": "initial",
+                "reason": "seed",
+                "artifacts_changed": [],
+                "added": [],
+                "removed": [],
+            }],
+        }, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    # design-packet.json's context_refs pick up design-changelog.json once it
+    # exists, so the packet/panel verdicts/accepted-design seeded by
+    # _seed_feature (before the changelog existed) must be regenerated here —
+    # otherwise the staleness cascade sees a stale design_packet and reroutes
+    # to it instead of to build, defeating the route-at-build-n=1 setup below.
+    packet = write_design_packet(feature_active)
+    zero_hash = "sha256:" + "0" * 64
+    for gate, source_path in (
+        ("design-review", packet),
+        ("trace-review", packet),
+    ):
+        write_verdict(feature_active / f"panel-{gate}.json", PanelVerdict(
+            gate=gate,
+            verdict="pass",
+            findings=[],
+            source=str(source_path),
+            source_hash=hash_file(source_path),
+            prompt_file="prompt.md",
+            prompt_hash=zero_hash,
+            harness_version=HARNESS_VERSION,
+            run_ts="2026-04-21T00:00:00+00:00",
+        ))
+    write_accepted_design(feature_active)
 
     monkeypatch.setenv("AUTODEV_PHASE5B_ROUTE_LAYER", "design")
     monkeypatch.setenv("AUTODEV_PHASE5B_ROUTE_AT", "1")
@@ -768,71 +862,55 @@ def test_build_route_skips_ralph_review(git_repo, feature_active, monkeypatch):
     assert result.success is True
     assert _count(feature_active, "build") == 1
     assert _count(feature_active, "ralph-review") == 0
-    assert not (feature_active / "design.md").exists()
-    assert not (feature_active / "scope.json").exists()
-    assert not (feature_active / "trace.md").exists()
-    assert not (feature_active / "test-plan.md").exists()
-    assert not (feature_active / "ralph-state.json").exists()
-    assert not (feature_active / "ralph-review.json").exists()
-    assert not (feature_active / "ralph-review.previous.json").exists()
-    assert not (feature_active / "ralph-iteration-context.json").exists()
-    assert not (feature_active / "build.json").exists()
+    assert _count(feature_active, "design") == 1
 
-    # The selected build diagnosis survives downstream invalidation and is
-    # wired into the next design prompt through pending_feedback.
-    route_feedback = feature_active / ROUTE_FEEDBACK_FILENAME
-    assert route_feedback.exists()
-    payload = json.loads(route_feedback.read_text(encoding="utf-8"))
-    assert payload["trigger_ref"] == "build.json#/deviations/0"
-    assert payload["scope_id"] == "t-1"
-    assert payload["deviation"]["diagnosis"]["defective_layer"] == "design"
-    assert load_state(feature_active).pending_feedback["design"] == [
-        ROUTE_FEEDBACK_FILENAME
-    ]
-    context = orch._context_artifacts_for_stage(
-        feature_active,
-        "design",
-        feature_active / "design.md",
-        [
-            feature_active / "scope.json",
-            feature_active / "trace.md",
-            feature_active / "test-plan.md",
-            feature_active / "design-changelog.json",
-        ],
+    # Nothing is deleted: every artifact from the core doc's preserved
+    # list that existed by the time routing fired is still on disk.
+    for name in (
+        "design.md", "scope.json", "trace.md", "test-plan.md",
+        "design-packet.json", "panel-design-review.json",
+        "panel-trace-review.json", "accepted-design.json", "build.json",
+        "ralph-state.json", "ralph-review.json",
+        "ralph-iteration-context.json",
+    ):
+        assert (feature_active / name).exists(), f"{name} should be preserved"
+
+    # The design agent actually produced a new round in place — proof
+    # the preseeded in-place-revision path ran to completion, not just
+    # that files survived. append-only semantics: the seeded entry is
+    # still there, and a new one lands on top of it.
+    assert (feature_active / "design-changelog.json").exists()
+    changelog = json.loads(
+        (feature_active / "design-changelog.json").read_text(encoding="utf-8")
     )
-    assert str(route_feedback) in context
+    assert len(changelog["entries"]) == 2
+    assert changelog["entries"][-1]["round"] == 2
+    assert changelog["entries"][-1]["trigger"] == "build"
 
-    # Feedback is retained until success, then consumed and its private
-    # snapshot is removed.
-    orch._consume_stage_feedback(feature_active, "design")
-    assert load_state(feature_active).pending_feedback == {}
-    assert not route_feedback.exists()
+    # rework-mode.json is the one documented exception: cleared so a
+    # routed rerun falls back to root-cause instead of inheriting a
+    # stale patch-mode computed from an already-superseded verdict.
+    assert not (feature_active / "rework-mode.json").exists()
 
+    # No route-feedback snapshot/registration mechanism: the feedback IS
+    # the file on disk (build.json), read via CONTEXT_ARTIFACTS.
+    assert not (feature_active / ".route-feedback.json").exists()
+    state_after = load_state(feature_active)
+    assert state_after.pending_feedback == {}
+    assert state_after.L["design-review"] == 1
 
-def test_legacy_deleted_build_feedback_uses_challenge_record(
-    git_repo, feature_active,
-):
-    """Recover a run routed by the buggy build.json-before-delete ordering."""
-    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
-    missing_build = feature_active / "build.json"
-    state = RevisionState()
-    state.pending_feedback = {"design": [str(missing_build)]}
-    write_state(feature_active, state)
-    challenge = feature_active / "build-challenges.md"
-    challenge.write_text("qualify repository absence as runtime-only\n")
+    design_prompt = (
+        feature_active / "scratch" / ".design.1.prompt"
+    ).read_text(encoding="utf-8")
+    for expected in (
+        "build.json", "panel-design-review.json", "panel-trace-review.json",
+        "design.md", "scope.json", "trace.md", "test-plan.md",
+        "design-changelog.json",
+    ):
+        assert str(feature_active / expected) in design_prompt
+    assert "PRE-FILLED" in design_prompt
 
-    context = orch._context_artifacts_for_stage(
-        feature_active,
-        "design",
-        feature_active / "design.md",
-        [
-            feature_active / "scope.json",
-            feature_active / "trace.md",
-            feature_active / "test-plan.md",
-            feature_active / "design-changelog.json",
-        ],
-    )
-    assert str(challenge) in context
+    assert orch._next_stage_name(feature_active) == "design_packet"
 
 
 def test_missing_pending_feedback_fails_closed(git_repo, feature_active):
@@ -946,6 +1024,42 @@ def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature
         fully_history=[set(), {"t-1"}, {"t-1", "t-2"}],
         statuses_history=[{}, {"t-1": "Fully"}, {"t-1": "Fully", "t-2": "Fully"}],
     ))
+    assert orch._next_stage_name(feature_active) == "implementation_index"
+
+    # A build that re-reports blocking (e.g. after an in-place design
+    # dispatch route) must not be treated as a completed Ralph loop even
+    # though ralph-state and ralph-review still show full coverage from
+    # the prior round.
+    (feature_active / "build.json").write_text(_json.dumps({
+        "source": str(feature_active / "scope.json"),
+        "source_hash": hash_file(feature_active / "scope.json"),
+        "written": "2026-04-21",
+        "test_cmd_run": "pytest",
+        "test_exit_code": 0,
+        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
+        "files_changed": [],
+        "lint": {"passed": True, "cmd": "n/a"},
+        "deviations": [
+            {"scope_id": "t-1", "severity": "blocking", "blocking": True, "detail": "x"},
+        ],
+        "blocking": True,
+        "workspace_dirty_at_stage_end": False,
+    }))
+    assert orch._next_stage_name(feature_active) == "build"
+
+    (feature_active / "build.json").write_text(_json.dumps({
+        "source": str(feature_active / "scope.json"),
+        "source_hash": hash_file(feature_active / "scope.json"),
+        "written": "2026-04-21",
+        "test_cmd_run": "pytest",
+        "test_exit_code": 0,
+        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
+        "files_changed": [],
+        "lint": {"passed": True, "cmd": "n/a"},
+        "deviations": [],
+        "blocking": False,
+        "workspace_dirty_at_stage_end": False,
+    }))
     assert orch._next_stage_name(feature_active) == "implementation_index"
 
 
