@@ -139,6 +139,12 @@ snapshot_repo_state() {
   git -C "$PANEL_REVIEW_CWD_VALUE" status --porcelain=v1 -z > "$(repo_state_path "$label" status)"
   git -C "$PANEL_REVIEW_CWD_VALUE" diff --no-ext-diff --binary > "$(repo_state_path "$label" diff)"
   git -C "$PANEL_REVIEW_CWD_VALUE" diff --cached --no-ext-diff --binary > "$(repo_state_path "$label" cached.diff)"
+  # A reviewer that commits, resets, or switches branches leaves status/diff
+  # clean, so also pin the checked-out ref and its commit.
+  {
+    git -C "$PANEL_REVIEW_CWD_VALUE" symbolic-ref -q HEAD || printf 'detached\n'
+    git -C "$PANEL_REVIEW_CWD_VALUE" rev-parse -q --verify HEAD || printf 'unborn\n'
+  } > "$(repo_state_path "$label" head)"
 }
 
 repo_state_changed() {
@@ -148,7 +154,7 @@ repo_state_changed() {
     return 1
   fi
 
-  for kind in status diff cached.diff; do
+  for kind in status diff cached.diff head; do
     if ! cmp -s "$(repo_state_path before "$kind")" "$(repo_state_path after "$kind")"; then
       return 0
     fi

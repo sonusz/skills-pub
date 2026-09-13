@@ -76,7 +76,9 @@ def _validate(raw: dict[str, Any]) -> None:
         raise SchemaError("arch-review.json.source_hash must start with sha256:")
 
     verdict = raw["verdict"]
-    if verdict not in _VERDICTS:
+    # isinstance first: an unhashable verdict (list/dict) must surface as
+    # SchemaError so the caller's rejection/retry path runs, not TypeError.
+    if not isinstance(verdict, str) or verdict not in _VERDICTS:
         raise SchemaError(
             f"arch-review.json.verdict must be one of {sorted(_VERDICTS)!r}"
         )
@@ -99,7 +101,7 @@ def _validate(raw: dict[str, Any]) -> None:
         if not isinstance(entry, dict):
             raise SchemaError(f"arch-review.json.findings[{i}] must be object")
         category = entry.get("category")
-        if category not in _CATEGORIES:
+        if not isinstance(category, str) or category not in _CATEGORIES:
             raise SchemaError(
                 f"arch-review.json.findings[{i}].category must be one of "
                 f"{sorted(_CATEGORIES)!r}"
