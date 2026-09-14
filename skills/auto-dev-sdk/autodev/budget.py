@@ -390,5 +390,12 @@ def minimality_review_body(feature_active: Path) -> str:
         "any other kind.\n"
         "4. A design can already be minimal. Zero findings is then the "
         "correct report — state it explicitly. Do not manufacture "
-        "cuts.\n"
+        "cuts.\n\n"
+        "Include a `Minimality evidence` section naming the scope items "
+        "you checked and the PRD clauses that justify keeping them. End "
+        "with a separate, exactly parseable verdict line: `Verdict: pass` "
+        "when there are no findings, or `Verdict: needs_revision` when "
+        "there are findings (`Verdict: fail` only when a reliable review "
+        "cannot be completed). Do not emit a per-R coverage table in this "
+        "minimality round.\n"
     )

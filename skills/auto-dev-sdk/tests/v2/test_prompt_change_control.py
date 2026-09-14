@@ -65,7 +65,7 @@ EXPECTED_HASHES = {
     "review-close-approval.md":
         "eabe4ff9745d9cdcee080c6217b1c7d64fdcc5688c9e64848783672b8e864df5",
     "synthesize.md":
-        "48a3611a75bb36a0692ea1d380e46e79a8d78e8cdd83d6c375b2342f2865308a",
+        "b42562768ac11807fdefef764ff7599111419bf2b4e9f4a32c034545969d6d12",
 }
 
 

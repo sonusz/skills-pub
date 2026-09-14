@@ -47,7 +47,7 @@ stages:
   # exploration. Effort: medium-high.
   review:
     vendor: codex
-    model: gpt-5.6-luna
+    model: gpt-5.6-terra
     probe_interval_sec: 900
     effort: high
 
@@ -55,8 +55,8 @@ stages:
   # Context: medium; mostly accepted design, implementation index, and changed
   # files. Effort: medium-high.
   spec:
-    vendor: codex
-    model: gpt-5.6-luna
+    vendor: claude
+    model: sonnet
     probe_interval_sec: 900
     effort: medium
 
@@ -83,14 +83,14 @@ panel:
       effort: max
     # Codex: code-aware reviewer, useful for implementation/design feasibility.
     - vendor: codex
-      model: gpt-5.6-sol
+      model: gpt-6-astra
       effort: medium
   # Preserves reviewer findings and performs semantic issue clustering.
   # This identity work controls rerun sizing and recurrence, so use the
   # strongest configured reasoning model rather than the extraction model.
   synthesizer:
-    vendor: codex
-    model: gpt-5.6-sol
+    vendor: claude
+    model: opus
     effort: medium
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300

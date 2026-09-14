@@ -7,8 +7,14 @@ invoker shell script so no live vendor subprocess runs.
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import signal
+import subprocess
+import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -23,6 +29,7 @@ from autodev.panel.runner import (
     FAKE_INVOKER_ENV, _compose_reviewer_prompt, _compose_synthesizer_prompt,
     _build_issue_clusters, _invoke_reviewer, _invoke_reviewer_with_retry,
     _invoke_synthesizer,
+    _PanelFailFastState, ReviewerResult,
     _synthesize_and_build_verdict,
     _read_only_native_args, run_panel_gate_internal,
 )
@@ -33,6 +40,7 @@ from autodev.vendors.config import (
 from autodev.errors import GatePending, QuotaHalt, SchemaError
 from autodev.vendors.shared_call import cli_name_for_vendor, normalize_shared_vendor
 from autodev.vendors.quota.base import QuotaResult, now_utc
+from autodev.state.process_registry import read_processes
 
 FAKE_SCRIPT = Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"
 
@@ -262,6 +270,45 @@ def test_single_reviewer_synthesizer_prompt_allows_one_response(feature_active):
     )
     assert "receive N independent reviews (N ≥ 1)" in sp
     assert "N ≥ 2" not in sp
+
+
+def test_budget_synth_prompt_allows_missing_coverage_and_extracts_verdict(
+    feature_active,
+):
+    artifact = _make_artifact(feature_active)
+    from autodev.panel.runner import ReviewerResult
+    sp = _compose_synthesizer_prompt(
+        gate="design-review", artifact_path=artifact,
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True,
+            output=(
+                "Minimality evidence\n\n"
+                "- s-1 remains required by R1.\n\n"
+                "Verdict: pass"
+            ),
+            elapsed_sec=1.0,
+        )],
+        round_type="budget",
+    )
+    assert "**Round type**: `budget`" in sp
+    assert "do not add any coverage-gap finding" in sp
+    assert "Verdict: pass" in sp
+
+
+def test_coverage_synth_prompt_still_requires_per_r_table(feature_active):
+    artifact = _make_artifact(feature_active)
+    from autodev.panel.runner import ReviewerResult
+    sp = _compose_synthesizer_prompt(
+        gate="design-review", artifact_path=artifact,
+        reviewer_results=[ReviewerResult(
+            vendor="claude", model="m", ok=True,
+            output="Verdict: pass", elapsed_sec=1.0,
+        )],
+        round_type="coverage",
+    )
+    assert "**Round type**: `coverage`" in sp
+    assert "design-review` **coverage** rounds" in sp
+    assert "coverage gap: reviewer omitted the per-R<n> coverage table" in sp
 
 
 def test_compose_synthesizer_prompt_does_not_truncate_or_inline_artifact(feature_active):
@@ -565,6 +612,223 @@ def test_quota_preflight_failure_is_rechecked_before_skip(monkeypatch):
     assert result.quota_skipped
     assert result.attempt_count == 2
     assert len(result.failure_history) == 2
+
+
+def _confirmed_quota(vendor: str = "agy") -> dict:
+    return {
+        "confirmed": True,
+        "source": "post-retry-quota-refresh",
+        "vendor": vendor,
+        "model": "fake",
+        "remaining_pct": 0.0,
+        "min_quota_pct": 0.000001,
+        "configured_min_quota_pct": 0.0,
+        "resets_at": None,
+        "fetched_at": now_utc().isoformat(),
+        "detail": "confirmed exhausted",
+        "error": None,
+    }
+
+
+def test_fail_fast_confirmed_quota_stops_after_first_dispatch(monkeypatch):
+    calls = 0
+
+    def failed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return ReviewerResult(
+            vendor="agy", model="fake", ok=False, output="",
+            elapsed_sec=0.01, failure_detail="provider exit 1",
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", failed)
+    monkeypatch.setattr(
+        "autodev.panel.runner._confirm_quota_after_failures",
+        lambda spec, result: _confirmed_quota(),
+    )
+    state = _PanelFailFastState()
+    with pytest.raises(QuotaHalt, match="panel-reviewers:design-review"):
+        _invoke_reviewer_with_retry(
+            PanelReviewerSpec(vendor="agy", model="fake"),
+            "prompt", 10, gate_label="design-review", fail_fast_state=state,
+        )
+
+    assert calls == 1
+    assert state.event.is_set()
+
+
+def test_fail_fast_unknown_quota_keeps_normal_retry(monkeypatch):
+    calls = 0
+
+    def fail_then_pass(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return ReviewerResult(
+            vendor="agy", model="fake", ok=calls == 2,
+            output="pass" if calls == 2 else "", elapsed_sec=0.01,
+            failure_detail="provider exit 1" if calls == 1 else "",
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", fail_then_pass)
+    monkeypatch.setattr(
+        "autodev.panel.runner._confirm_quota_after_failures",
+        lambda spec, result: {**_confirmed_quota(), "confirmed": False,
+                              "remaining_pct": None},
+    )
+    state = _PanelFailFastState()
+    result = _invoke_reviewer_with_retry(
+        PanelReviewerSpec(vendor="agy", model="fake"),
+        "prompt", 10, gate_label="design-review", fail_fast_state=state,
+    )
+
+    assert calls == 2
+    assert result.ok
+    assert not state.event.is_set()
+
+
+def test_fail_fast_confirmed_preflight_halts_without_retry(monkeypatch):
+    calls = 0
+
+    def quota_halt(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise QuotaHalt(
+            role="reviewer:agy",
+            diagnostics=[{
+                "vendor": "agy", "model": "fake",
+                "min_quota_pct": 10.0, "remaining_pct": 0.0,
+                "resets_at": None, "error": None,
+            }],
+        )
+
+    probes: list[tuple[str, bool]] = []
+
+    def still_exhausted(candidates, *, role, logger=None, force=False):
+        probes.append((role, force))
+        raise QuotaHalt(
+            role=role,
+            diagnostics=[{
+                "vendor": "agy", "model": "fake",
+                "min_quota_pct": 10.0, "remaining_pct": 0.0,
+                "resets_at": None, "error": None,
+            }],
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", quota_halt)
+    monkeypatch.setattr("autodev.panel.runner.resolve_candidate", still_exhausted)
+    state = _PanelFailFastState()
+    with pytest.raises(QuotaHalt, match="panel-reviewers:design-review"):
+        _invoke_reviewer_with_retry(
+            PanelReviewerSpec(vendor="agy", model="fake"),
+            "prompt", 10, gate_label="design-review", fail_fast_state=state,
+        )
+
+    # The cached preflight reading is re-probed once, cache bypassed, before
+    # the whole panel is cancelled on it.
+    assert probes == [("reviewer:agy", True)]
+    assert calls == 1
+    assert state.event.is_set()
+
+
+def test_fail_fast_cancels_dual_group_and_never_synthesizes(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    calls: list[tuple[str, threading.Event | None]] = []
+    cancelled: list[str] = []
+    first_failure = threading.Event()
+    lock = threading.Lock()
+    synth_calls = 0
+
+    def reviewer(spec, *args, cancel_event=None, **kwargs):
+        with lock:
+            calls.append((spec.vendor, cancel_event))
+            first = spec.vendor == "agy" and not first_failure.is_set()
+            if first:
+                first_failure.set()
+        if first:
+            return ReviewerResult(
+                vendor=spec.vendor, model=spec.model, ok=False, output="",
+                elapsed_sec=0.01, failure_detail="provider exit 1",
+            )
+        assert cancel_event is not None
+        assert cancel_event.wait(timeout=2), "peer reviewer was not cancelled"
+        cancelled.append(spec.vendor)
+        return ReviewerResult(
+            vendor=spec.vendor, model=spec.model, ok=False, output="",
+            elapsed_sec=0.01, failure_detail="cancelled by panel quota stop",
+        )
+
+    def synthesizer(*args, **kwargs):
+        nonlocal synth_calls
+        synth_calls += 1
+        return True, {}, ""
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", reviewer)
+    monkeypatch.setattr("autodev.panel.runner._invoke_synthesizer", synthesizer)
+    monkeypatch.setattr(
+        "autodev.panel.runner._confirm_quota_after_failures",
+        lambda spec, result: _confirmed_quota(spec.vendor),
+    )
+    strict = PanelConfig(
+        reviewers=panel_config.reviewers,
+        synthesizer=panel_config.synthesizer,
+        reviewer_probe_interval_sec=10,
+        synthesizer_probe_interval_sec=10,
+        fail_fast_confirmed_quota=True,
+    )
+    artifact = _make_artifact(feature_active)
+    with pytest.raises(QuotaHalt):
+        run_panel_gate_internal(
+            gate="design-review", feature_active=feature_active,
+            primary_artifact=artifact, prompt_file_for_audit=artifact,
+            consulted_docs=[], panel_config=strict,
+        )
+
+    assert len(calls) <= len(strict.reviewers) * 2
+    assert all(event is not None for _, event in calls)
+    assert cancelled
+    assert synth_calls == 0
+
+
+def test_cancel_event_reaps_shared_call_registry_and_preserves_neighbor(
+    git_repo, feature_active, monkeypatch,
+):
+    fake_cli = Path(__file__).resolve().parent / "fakes" / "fake_vendor_cli.sh"
+    monkeypatch.delenv(FAKE_INVOKER_ENV, raising=False)
+    monkeypatch.setenv("AUTODEV_VENDOR_BIN_CLAUDE", str(fake_cli))
+    monkeypatch.setenv("AUTODEV_FAKE_BEHAVIOR", "timeout")
+    monkeypatch.setattr(
+        "autodev.panel.runner.resolve_candidate",
+        lambda candidates, **kwargs: next(iter(candidates)),
+    )
+    stop = threading.Event()
+    registry = feature_active / ".running-pids.json"
+    neighbor = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                _invoke_reviewer,
+                PanelReviewerSpec(vendor="claude", model="fake"),
+                "prompt", 30,
+                cwd=git_repo, feature_active=feature_active,
+                cancel_event=stop,
+            )
+            deadline = time.monotonic() + 3
+            while not read_processes(registry) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert read_processes(registry)
+            stop.set()
+            result = future.result(timeout=5)
+        assert not result.ok
+        assert not registry.exists()
+        assert neighbor.poll() is None
+    finally:
+        if neighbor.poll() is None:
+            os.killpg(neighbor.pid, signal.SIGKILL)
+        neighbor.wait(timeout=2)
 
 
 def test_synthesizer_pass(fake_invoker, monkeypatch):
@@ -969,3 +1233,437 @@ def test_design_review_dual_group_writes_both_verdicts(
     assert dr.source == str(artifact)
     assert tr.source == str(artifact)
     assert dr.source_hash == tr.source_hash
+
+
+# --- cache completeness: coverage-round verdict + coverage row formats ------
+
+@pytest.mark.parametrize("verdict_line", [
+    "Verdict: pass",
+    "**Verdict:** pass",
+    "Verdict: **needs_revision**",
+    "## Verdict: fail",
+    "- Verdict: pass",
+    "**Verdict**\n\n**pass**",
+    "Overall verdict: pass",
+    "Final verdict: needs_revision — see F3",
+    "Verdict: `pass`",
+    "**Verdict:** `pass`",
+])
+def test_cached_coverage_output_accepts_decorated_verdict_lines(
+    feature_active, verdict_line,
+):
+    """Coverage prompts never mandate a bare ``Verdict:`` line, so markdown
+    decoration must not evict a valid cached success."""
+    from autodev.panel.runner import _cached_reviewer_output_is_complete
+
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n### R1: one\n\n### R2: two\n", encoding="utf-8",
+    )
+    output = (
+        "| req_id | status | evidence | notes |\n"
+        "|---|---|---|---|\n"
+        "| R1 | satisfied | x | y |\n"
+        "| R2 | satisfied | x | y |\n\n"
+        f"{verdict_line}\n"
+    )
+    assert _cached_reviewer_output_is_complete(
+        output, metadata={"round_type": "coverage"}, feature_active=feature_active,
+    )
+
+
+@pytest.mark.parametrize("bad_output", [
+    "| R1 | satisfied |\n| R2 | satisfied |\n\nVerdict: maybe\n",
+    "| R1 | satisfied |\n| R2 | satisfied |\n\nno verdict at all\n",
+])
+def test_cached_coverage_output_still_requires_a_real_verdict(
+    feature_active, bad_output,
+):
+    from autodev.panel.runner import _cached_reviewer_output_is_complete
+
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n### R1: one\n\n### R2: two\n", encoding="utf-8",
+    )
+    assert not _cached_reviewer_output_is_complete(
+        bad_output, metadata={"round_type": "coverage"},
+        feature_active=feature_active,
+    )
+
+
+def test_budget_round_cache_keeps_strict_verdict_line(feature_active):
+    """The budget prompt mandates the literal line; decoration stays invalid."""
+    from autodev.panel.runner import _cached_reviewer_output_is_complete
+
+    output = "Minimality evidence: fine\n\n**Verdict:** pass\n"
+    assert not _cached_reviewer_output_is_complete(
+        output, metadata={"round_type": "budget"}, feature_active=feature_active,
+    )
+    assert _cached_reviewer_output_is_complete(
+        output.replace("**Verdict:**", "Verdict:"),
+        metadata={"round_type": "budget"}, feature_active=feature_active,
+    )
+
+
+@pytest.mark.parametrize("rows", [
+    "| R1 | satisfied | x | y |\n| R2 | satisfied | x | y |\n",
+    "R1 | satisfied | x | y\nR2 | satisfied | x | y\n",
+    "| **R1** | satisfied | x | y |\n| `R2` | satisfied | x | y |\n",
+    "| R1: auth | satisfied | x | y |\n| R2 (audit) | satisfied | x | y |\n",
+    "| R1/R2 | satisfied | x | y |\n",
+])
+def test_cached_coverage_output_accepts_gfm_row_variants(feature_active, rows):
+    """Every PRD requirement must have a row, in any reasonable GFM shape."""
+    from autodev.panel.runner import _cached_reviewer_output_is_complete
+
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n### R1: one\n\n### R2: two\n", encoding="utf-8",
+    )
+    assert _cached_reviewer_output_is_complete(
+        rows + "\nVerdict: pass\n",
+        metadata={"round_type": "coverage"}, feature_active=feature_active,
+    )
+    assert not _cached_reviewer_output_is_complete(
+        "| R1 | satisfied | x | y |\n\nVerdict: pass\n",
+        metadata={"round_type": "coverage"}, feature_active=feature_active,
+    )
+
+
+@pytest.mark.parametrize("output", [
+    "## Minimality evidence\n\nVerdict: pass\n",
+    "Minimality evidence:\n\nVerdict: pass\n",
+    "**Minimality evidence**\n\n\nVerdict: needs_revision\n",
+    "**Minimality evidence:**\n\nVerdict: pass\n",
+])
+def test_budget_round_cache_rejects_evidence_less_output(feature_active, output):
+    """An empty evidence header must not borrow the verdict line as evidence."""
+    from autodev.panel.runner import _cached_reviewer_output_is_complete
+
+    assert not _cached_reviewer_output_is_complete(
+        output, metadata={"round_type": "budget"}, feature_active=feature_active,
+    )
+    assert _cached_reviewer_output_is_complete(
+        output.replace("\n\n", "\n- s-1 is required by R1.\n\n", 1),
+        metadata={"round_type": "budget"}, feature_active=feature_active,
+    )
+
+
+# --- fail-fast: one forced quota probe per failed attempt -------------------
+
+def test_fail_fast_probes_quota_once_per_failed_attempt(monkeypatch):
+    """The post-loop confirmation must reuse the in-loop probe, not re-probe."""
+    invocations = 0
+    probes: list[str] = []
+
+    def always_fail(*args, **kwargs):
+        nonlocal invocations
+        invocations += 1
+        return ReviewerResult(
+            vendor="agy", model="fake", ok=False, output="",
+            elapsed_sec=0.01, failure_detail=f"provider exit {invocations}",
+        )
+
+    def probe(spec, result):
+        probes.append(result.failure_detail)
+        return {**_confirmed_quota(), "confirmed": False, "remaining_pct": None}
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", always_fail)
+    monkeypatch.setattr(
+        "autodev.panel.runner._confirm_quota_after_failures", probe,
+    )
+    result = _invoke_reviewer_with_retry(
+        PanelReviewerSpec(vendor="agy", model="fake"),
+        "prompt", 10, gate_label="design-review",
+        fail_fast_state=_PanelFailFastState(),
+    )
+
+    assert invocations == 2
+    assert probes == ["provider exit 1", "provider exit 2"]
+    assert not result.ok
+    assert not result.quota_skipped
+    assert result.quota_confirmation["confirmed"] is False
+
+
+def test_without_fail_fast_probes_quota_once_after_the_loop(monkeypatch):
+    probes = 0
+
+    def always_fail(*args, **kwargs):
+        return ReviewerResult(
+            vendor="agy", model="fake", ok=False, output="",
+            elapsed_sec=0.01, failure_detail="provider exit 1",
+        )
+
+    def probe(spec, result):
+        nonlocal probes
+        probes += 1
+        return {**_confirmed_quota(), "confirmed": False, "remaining_pct": None}
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", always_fail)
+    monkeypatch.setattr(
+        "autodev.panel.runner._confirm_quota_after_failures", probe,
+    )
+    result = _invoke_reviewer_with_retry(
+        PanelReviewerSpec(vendor="agy", model="fake"), "prompt", 10,
+    )
+    assert probes == 1
+    assert not result.ok
+
+
+# --- dual group: the failing group's error wins over the peer sentinel -----
+
+def test_dual_group_reports_real_group_failure_not_peer_sentinel(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    """When the design group fails quorum and the trace group only sees the
+    broken barrier, the raised error must be the quorum failure."""
+    from autodev.panel.runner import _PeerGroupFailed
+
+    def reviewer(spec, *args, session_key=None, **kwargs):
+        if session_key and ":design-review:" in session_key:
+            return ReviewerResult(
+                vendor=spec.vendor, model=spec.model, ok=False, output="",
+                elapsed_sec=0.01, failure_detail="provider exit 1",
+            )
+        return ReviewerResult(
+            vendor=spec.vendor, model=spec.model, ok=True,
+            output="| R1 | satisfied | x | y |\n\nVerdict: pass\n",
+            elapsed_sec=0.01,
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", reviewer)
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, {}, ""),
+    )
+    artifact = _make_artifact(feature_active)
+    with pytest.raises(GatePending) as excinfo:
+        run_panel_gate_internal(
+            gate="design-review", feature_active=feature_active,
+            primary_artifact=artifact, prompt_file_for_audit=artifact,
+            consulted_docs=[], panel_config=panel_config,
+        )
+
+    assert not isinstance(excinfo.value, _PeerGroupFailed)
+    assert "peer group failed" not in excinfo.value.detail
+    assert excinfo.value.gate.endswith("design-review")
+
+
+# --- cache identity ignores volatile budget figures --------------------------
+
+def test_reviewer_cache_identity_ignores_budget_spend_lines(feature_active):
+    """Spend lines are recomputed from log.jsonl on every call and grow with
+    each dispatch; they must not invalidate the reviewer cache on resume."""
+    from autodev.panel.runner import _cache_matches, _reviewer_cache_metadata
+
+    artifact = _make_artifact(feature_active)
+    base = "## Shrink round\n\n{lines}\n\nGo through scope.json.\n"
+    first = _reviewer_cache_metadata(
+        gate_label="design-review", primary_artifact=artifact,
+        prompt_file_for_audit=artifact, consulted_docs=[], round_type="budget",
+        reviewer_prompt=base.format(
+            lines="- BUDGET_SPENT: vendor-hours 1.0h; wall span 0.5h",
+        ),
+    )
+    later = _reviewer_cache_metadata(
+        gate_label="design-review", primary_artifact=artifact,
+        prompt_file_for_audit=artifact, consulted_docs=[], round_type="budget",
+        reviewer_prompt=base.format(
+            lines="- BUDGET_SPENT: vendor-hours 3.5h; wall span 2.0h\n"
+                  "- BUDGET_TARGETS: vendor_hours 10",
+        ),
+    )
+    assert first["reviewer_prompt_hash"] == later["reviewer_prompt_hash"]
+    assert _cache_matches({**first, "reviewers": {}}, later)
+
+    reworded = _reviewer_cache_metadata(
+        gate_label="design-review", primary_artifact=artifact,
+        prompt_file_for_audit=artifact, consulted_docs=[], round_type="budget",
+        reviewer_prompt=base.format(lines="- BUDGET_SPENT: 1.0h").replace(
+            "Go through scope.json.", "Go through design.md.",
+        ),
+    )
+    assert reworded["reviewer_prompt_hash"] != first["reviewer_prompt_hash"]
+
+
+# --- fail-fast quota halt keeps the finished reviewers cached ---------------
+
+def test_fail_fast_quota_halt_persists_finished_reviewers(
+    fake_invoker, monkeypatch, feature_active, panel_config,
+):
+    """A QuotaHalt raised from a worker must not discard the other slots'
+    successful outputs; quota-resume should re-run only the halted one."""
+    lock = threading.Lock()
+    successes: dict[str, int] = {}
+    peers_done = threading.Event()
+
+    def reviewer(spec, *args, session_key=None, **kwargs):
+        group = "design-review" if ":design-review:" in (session_key or "") else "trace-review"
+        if spec.vendor == "agy":
+            # Let the healthy peers of this group finish first so the halt
+            # is raised while their results are already collected.
+            assert peers_done.wait(timeout=5), "peers never finished"
+            return ReviewerResult(
+                vendor=spec.vendor, model=spec.model, ok=False, output="",
+                elapsed_sec=0.01, failure_detail="provider exit 1",
+            )
+        with lock:
+            successes[group] = successes.get(group, 0) + 1
+            if sum(successes.values()) >= 4:
+                peers_done.set()
+        return ReviewerResult(
+            vendor=spec.vendor, model=spec.model, ok=True,
+            output="| R1 | satisfied | x | y |\n\nVerdict: pass\n",
+            elapsed_sec=0.01,
+        )
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", reviewer)
+    monkeypatch.setattr(
+        "autodev.panel.runner._invoke_synthesizer",
+        lambda *args, **kwargs: (True, {}, ""),
+    )
+    monkeypatch.setattr(
+        "autodev.panel.runner._confirm_quota_after_failures",
+        lambda spec, result: _confirmed_quota(spec.vendor),
+    )
+    strict = PanelConfig(
+        reviewers=panel_config.reviewers,
+        synthesizer=panel_config.synthesizer,
+        reviewer_probe_interval_sec=10,
+        synthesizer_probe_interval_sec=10,
+        fail_fast_confirmed_quota=True,
+    )
+    artifact = _make_artifact(feature_active)
+    with pytest.raises(QuotaHalt):
+        run_panel_gate_internal(
+            gate="design-review", feature_active=feature_active,
+            primary_artifact=artifact, prompt_file_for_audit=artifact,
+            consulted_docs=[], panel_config=strict,
+        )
+
+    for gate in ("design-review", "trace-review"):
+        cache_path = feature_active / f"panel-{gate}.reviewers.json"
+        assert cache_path.exists(), f"{gate} cache was not persisted"
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        assert set(cache["reviewers"]) == {"claude", "codex"}, gate
+        assert "agy" not in cache["reviewers"]
+
+
+def test_cached_coverage_output_ignores_pipe_delimited_prose(feature_active):
+    """Only table rows count toward coverage, not prose containing pipes."""
+    from autodev.panel.runner import _cached_reviewer_output_is_complete
+
+    (feature_active / "prd.md").write_text(
+        "# PRD\n\n### R1: one\n\n### R2: two\n### R3: three\n", encoding="utf-8",
+    )
+    prose = (
+        "| R1 | satisfied | x | y |\n"
+        "- Evidence: prd:R2 | scope:S3\n"
+        "- R3 missing | see above\n\nVerdict: pass\n"
+    )
+    assert not _cached_reviewer_output_is_complete(
+        prose, metadata={"round_type": "coverage"}, feature_active=feature_active,
+    )
+    table = (
+        "| R1 | satisfied | x | y |\n| R2 | satisfied | x | y |\n"
+        "R3 | satisfied | x | y\n\nVerdict: pass\n"
+    )
+    assert _cached_reviewer_output_is_complete(
+        table, metadata={"round_type": "coverage"}, feature_active=feature_active,
+    )
+
+
+def test_fail_fast_reprobes_cached_preflight_halt_before_cancelling(monkeypatch):
+    """A preflight halt on attempt 1 may rest on a cached quota reading; a
+    forced re-probe showing quota restored must keep the retry alive."""
+    calls = 0
+    probes: list[tuple[str, bool]] = []
+
+    def preflight_then_pass(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise QuotaHalt(
+                role="reviewer:agy",
+                diagnostics=[{
+                    "vendor": "agy", "model": "fake",
+                    "min_quota_pct": 10.0, "remaining_pct": 0.0,
+                    "resets_at": None, "error": None,
+                }],
+            )
+        return ReviewerResult(
+            vendor="agy", model="fake", ok=True, output="Verdict: pass",
+            elapsed_sec=0.01,
+        )
+
+    def restored(candidates, *, role, logger=None, force=False):
+        probes.append((role, force))
+        return candidates[0]
+
+    monkeypatch.setattr("autodev.panel.runner._invoke_reviewer", preflight_then_pass)
+    monkeypatch.setattr("autodev.panel.runner.resolve_candidate", restored)
+    state = _PanelFailFastState()
+    result = _invoke_reviewer_with_retry(
+        PanelReviewerSpec(vendor="agy", model="fake"),
+        "prompt", 10, gate_label="design-review", fail_fast_state=state,
+    )
+
+    assert probes == [("reviewer:agy", True)]
+    assert calls == 2
+    assert result.ok
+    assert not state.event.is_set()
+
+
+def test_reprobed_quota_halt_carries_fresh_resume_time():
+    """The re-probe replaces the stale preflight resume_at, not just the
+    nested diagnostics, so the pause record schedules the right time."""
+    from datetime import timedelta
+
+    from autodev.panel.runner import _reconfirm_quota_halt
+
+    stale = now_utc() - timedelta(hours=1)
+    fresh = now_utc() + timedelta(hours=2)
+    confirmation = {
+        "confirmed": True, "source": "quota-preflight",
+        "diagnostics": [{"vendor": "agy", "model": "fake",
+                         "min_quota_pct": 10.0, "remaining_pct": 0.0}],
+        "resume_at": stale.isoformat(),
+    }
+
+    def reprobe(candidates, *, role, logger=None, force=False):
+        assert force is True
+        raise QuotaHalt(
+            role=role,
+            diagnostics=[{"vendor": "agy", "model": "fake",
+                          "min_quota_pct": 10.0, "remaining_pct": 1.0,
+                          "resets_at": fresh.isoformat(), "error": None}],
+            resume_at=fresh,
+        )
+
+    import autodev.panel.runner as runner
+    original = runner.resolve_candidate
+    runner.resolve_candidate = reprobe
+    try:
+        result = _reconfirm_quota_halt(
+            PanelReviewerSpec(vendor="agy", model="fake"), confirmation,
+        )
+    finally:
+        runner.resolve_candidate = original
+
+    assert result["confirmed"] is True
+    assert result["source"] == "quota-preflight-reprobed"
+    assert result["resume_at"] == fresh.isoformat()
+
+
+def test_reviewer_cache_identity_changes_with_budget_targets(feature_active):
+    """Spend figures are excluded from the identity, but the operator's
+    ceilings are what a minimality verdict was judged against."""
+    from autodev.panel.runner import _cache_matches, _reviewer_cache_metadata
+
+    artifact = _make_artifact(feature_active)
+    common = dict(
+        gate_label="design-review", primary_artifact=artifact,
+        prompt_file_for_audit=artifact, consulted_docs=[], round_type="budget",
+        reviewer_prompt="## Shrink round\n\n- BUDGET_SPENT: 1.0h\n",
+    )
+    forty = _reviewer_cache_metadata(**common, budget_targets=[["vendor_hours", 40.0]])
+    ten = _reviewer_cache_metadata(**common, budget_targets=[["vendor_hours", 10.0]])
+    assert _cache_matches({**forty, "reviewers": {}}, forty)
+    assert not _cache_matches({**forty, "reviewers": {}}, ten)

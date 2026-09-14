@@ -90,10 +90,11 @@ or topic alone is insufficient. Each cluster contains:
   Rewording alone does not make a new issue. Do not reuse an ID merely because
   targets or categories overlap.
 
-### Coverage-completeness check (gates that mandate per-R<n> tables)
+### Coverage-completeness check (gate rounds that mandate per-R<n> tables)
 
-For gates whose reviewer prompts mandate a per-R<n> coverage table
-(currently `design-review` and `close-approval`), check each
+For gate rounds whose reviewer prompts mandate a per-R<n> coverage table
+(currently `design-review` **coverage** rounds and all `close-approval`
+rounds), check each
 reviewer's `coverage` against the active `### R<N>:` requirements
 in prd.md. For every R<n> that is in prd.md but absent from a
 reviewer's coverage list, append one extra `risk`-severity finding
@@ -127,6 +128,11 @@ instead of one finding per R<n>. That single finding is enough to
 flag the reviewer; give it `P1`, the next finding ID, `category: missing`,
 empty evidence refs, `failure_class: mainline`, and
 `missized_direction: null`; do not also enumerate every R<n>.
+
+For a `design-review` **budget** round, reviewers are intentionally asked
+for minimality evidence instead of a per-R<n> coverage table. Preserve an
+absent table as `coverage: []` and do not add any coverage-gap finding. Extract
+the reviewer's explicit `Verdict:` line and minimality findings normally.
 
 Omit reviewers who did not respond — the harness tracks them separately.
 

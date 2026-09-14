@@ -328,41 +328,55 @@ def test_build_prompt_body_mentions_prd():
     assert "PRD_HASH" in body
     assert "WRITABLE_PATHS" in body
     assert "PROTECTED_PATHS" in body
-    assert "as one work queue" in body
-    assert "do not impose an arbitrary one-scope" in body
-    assert "do not defer" in body
-    assert "subagents are available" in body
-    assert "bounded, non-overlapping\n  assignments" in body
-    assert "Implement the accepted design package\ndirectly" in body
-    assert "The accepted design package and its reviewed trace/test plan are the\n" in body
-    assert "then begin code and test work" in body
-    assert "PLAN_REVIEW_BLOCKERS" not in body
-    assert "plan-review loop" not in body
-    assert "write a concise plan" not in body
-    assert "blocking-deviation path" in body
-    assert "Mandatory iteration sizing" in body
-    assert "If the whole runnable queue can fit" in body
-    assert "largest coherent objective" in body
-    assert "it need not\n  complete an entire scope" in body
-    assert "verifiable forward status\n  delta for at least one scope" in body
-    assert "Missing toward Partial" in body
-    assert "Partial toward\n  Fully" in body
-    assert "It may\n  advance one scope or several scopes" in body
-    assert "you MUST use\n  them concurrently" in body
-    assert "Derive each bounded, self-contained\n  brief directly from the accepted design" in body
-    assert "fully completed iteration\nobjective" in body
-    assert "does not\nrequire the affected scope to reach Fully" in body
-    assert "Work outside the objective remains in the queue" in body
-    assert "sole reason no remaining active work can advance" in body
-    assert "repeat that inventory over every\nunfinished active row" in body
-    assert "A failed credential check alone is not proof" in body
-    assert "including work\n   awaiting external runtime" in body
-    assert "Name\n  the remaining rows and why each lacks a local implementation path" in body
+    assert "Implement the accepted design; do not redesign it" in body
+    assert "Do not limit\nan iteration to one scope item" in body
+    assert "Never modify protected\ninputs" in body
+    assert "authorized to run the repository's documented dev commands" in body
+    assert "Repair defects directly exposed by the dev exercise" in body
+    assert "even when no separate\nscope row names the defect" in body
+    assert "Never deploy to or mutate stg/prod" in body
+    assert "Create one\nsynchronous `WIP: <feature> iter N` commit" in body
+    assert "Never use `git add -A` or `git add .`" in body
+    assert "`defective_layer` is exactly `design`, `prd`, or `ambiguous`" in body
+    assert "<TARGET_BUILD_JSON>.tmp" in body
     assert "design_conformance.findings" in body
-    assert "For design drift, replace the differing\n  implementation method" in body
-    assert "Never use `git add -A`, `git add .`" in body
-    assert "Run every commit synchronously" in body
-    assert "Never leave a commit or hook running\n  in the background" in body
+    assert "For design drift, replace the\ndiffering implementation method" in body
+    assert "panel\nfindings with category `redundant`" in body
+    assert "read\n`design-changelog.json`" in body
+    assert "do not write `defective_layer: \"design\"` again" in body
+
+
+def test_build_prompt_omits_unbounded_iteration_history(feature_active, git_repo):
+    (feature_active / "prd.md").write_text("# prd\n", encoding="utf-8")
+    (feature_active / "log.jsonl").write_text(
+        '{"ts":"2026-08-09T00:00:00+00:00","stage":"build",'
+        '"event":"stage-complete","feature":"t","detail":{}}\n',
+        encoding="utf-8",
+    )
+
+    body = render_stage_prompt(
+        stage="build",
+        feature="t",
+        feature_active=feature_active,
+        repo_root=git_repo,
+        primary_target=feature_active / "build.json",
+        extra_targets=[],
+        context_artifacts=[feature_active / "ralph-review.json"],
+    )
+
+    assert "CONTEXT_ARTIFACTS:" in body
+    assert "## Iteration history" not in body
+
+
+def test_build_prompt_scopes_tests_and_forbids_duplicate_full_suite():
+    body = (
+        Path(__file__).resolve().parent.parent.parent
+        / "autodev" / "prompts" / "stage-implement.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Run only tests covering changed code and direct dependants" in body
+    assert "at most once for one unchanged code state" in body
+    assert "Never rerun a suite\nonly to count or reformat results" in body
 
 
 def test_ralph_prompt_allows_parallel_subagent_review():

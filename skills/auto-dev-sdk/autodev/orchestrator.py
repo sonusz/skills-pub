@@ -44,7 +44,10 @@ from autodev.state.hashing import hash_file
 from autodev.state.lock import Lock
 from autodev.state.log import JsonlLog
 from autodev.vendors.config import VendorsConfig
-from autodev.workspace import snapshot, user_visible_changes
+from autodev.vendors.session_control import reset_feature_session
+from autodev.workspace import (
+    detect_out_of_scope_writes, snapshot, stage_residue,
+)
 
 # Mapping from cascade artifact names → gate names (R4 / R4e).
 ARTIFACT_TO_GATE = {
@@ -387,13 +390,171 @@ class Orchestrator:
 
     # ---- guts -------------------------------------------------------
 
+    # Cascade stages that follow build. Cascade can select any of these while
+    # the Ralph loop is still open (build.json is "fresh" by input hashes even
+    # when the reviewer said Partial), so both the stage selector and the
+    # resume branch must consult the loop state as well.
+    _POST_BUILD_STAGES = (
+        "implementation_index", "spec", "prd_checklist", "panel_close_approval",
+    )
+
     def _next_stage_name(self, active: Path) -> str:
         next_name = StalenessCascade(active).next_stage()
-        if next_name in (
-            "implementation_index", "spec", "prd_checklist", "panel_close_approval",
-        ) and not self._ralph_loop_complete(active):
+        if (
+            next_name in self._POST_BUILD_STAGES
+            and not self._ralph_loop_complete(active)
+        ):
             return "build"
         return next_name
+
+    def _build_iteration_protected(
+        self, active: Path, primary_target: Path,
+        protected_write_paths: list[Path] | None,
+    ) -> list[Path]:
+        """The write-protected set a build attempt is held to.
+
+        Shared by the live loop and the resume-time re-validation so both
+        judge a landed build against the same inputs (context artifacts such
+        as ralph-review.json are protected on top of the design package).
+        """
+        build_context = self._context_artifacts_for_stage(
+            active, "build", primary_target, [],
+        )
+        return _protect_context_inputs(
+            protected_write_paths or [],
+            context_artifacts=build_context,
+            owned_outputs=[primary_target],
+        )
+
+    def _current_build_awaits_review(
+        self,
+        active: Path,
+        *,
+        allowed_write_paths: list[Path] | None = None,
+        protected_write_paths: list[Path] | None = None,
+    ) -> bool:
+        """Whether the landed build.json has not yet had its Ralph review.
+
+        The iteration context is written ``build_pending`` before a build and
+        ``ready_for_review`` after it lands; ``ralph-state`` records the last
+        reviewed iteration. A context one iteration ahead of the recorded
+        state is a build that was never reviewed (quota pause, reviewer
+        crash, or orchestrator restart) when it is already finalized, or when
+        it is still ``build_pending`` but build.json changed since the
+        context was prepared (the build returned, the harness died before
+        finalizing). A context whose iteration was already recorded means the
+        reviewer said Partial and the next step is the rework build — even
+        though build.json is still "fresh" by input hashes.
+        """
+        import json
+
+        context_path = active / RALPH_ITERATION_CONTEXT_FILENAME
+        if not context_path.exists():
+            return False
+        try:
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(context, dict) or context.get("schema") != 1:
+            return False
+        state = ralph.load_ralph_state(active)
+        if context.get("iteration") != state.iter + 1:
+            return False
+        status = context.get("status")
+        if status == "ready_for_review":
+            return True
+        if status != "build_pending" or "build_hash_before" not in context:
+            return False
+        # The post-build HEAD is recorded the moment the build subprocess
+        # returns. Without it the harness died mid-build (or the context
+        # predates this field) and nothing vouches for what is on disk.
+        after_ref = context.get("after_ref")
+        if not isinstance(after_ref, str) or not after_ref:
+            return False
+        build_path = active / "build.json"
+        if not build_path.exists():
+            return False
+        if hash_file(build_path) == context.get("build_hash_before"):
+            self._clear_post_build_ref(context_path)
+            return False
+        # build.json is promoted before the harness validates the attempt,
+        # so a pending build that moved the artifact must still pass the
+        # checks the normal path would have run: no writes outside its
+        # contract and no uncommitted product residue against the baseline
+        # recorded when the iteration started. Without that baseline, or
+        # when Git can no longer compare against it (the operator rewrote
+        # history), the attempt cannot be vouched for and is rebuilt.
+        baseline = self._workspace_baseline_from_context(context)
+        if baseline is None:
+            self._clear_post_build_ref(context_path)
+            return False
+        # The rejection note is written by the harness itself between the
+        # baseline and now (an earlier attempt of this iteration), so it is
+        # not an escape of the build; it is dropped below once the landed
+        # attempt validates clean.
+        note = active / "build-output-rejection.json"
+        protected = [
+            path
+            for path in self._build_iteration_protected(
+                active, build_path, protected_write_paths,
+            )
+            if path != note
+        ]
+        try:
+            current = snapshot(self.cfg.repo_root, watched_paths=protected)
+            escapes = detect_out_of_scope_writes(
+                baseline, current,
+                allowed_scope=allowed_write_paths or [self.cfg.repo_root],
+                repo_root=self.cfg.repo_root,
+                protected_scope=protected,
+            )
+            if escapes:
+                self._clear_post_build_ref(context_path)
+                return False
+            residue, _absorbed = stage_residue(
+                baseline, current, self.cfg.repo_root,
+            )
+        except PreflightError:
+            self._clear_post_build_ref(context_path)
+            return False
+        if residue:
+            # The pinned ref vouched for an attempt that did not validate;
+            # the rebuild that follows must pin its own when it returns, or
+            # a rebuild killed after committing would be sealed against
+            # this earlier commit on the next resume.
+            self._clear_post_build_ref(context_path)
+            return False
+        # A rejection note left by an earlier attempt of this iteration is
+        # stale once the landed attempt validates clean: the note is only
+        # unlinked after these checks in the normal path, so a crash in that
+        # window would otherwise prompt a needless third build to "amend"
+        # a problem the landed attempt already fixed.
+        note.unlink(missing_ok=True)
+        return True
+
+    @staticmethod
+    def _workspace_baseline_from_context(context: dict):
+        from autodev.workspace import WorkspaceState
+
+        raw = context.get("workspace_baseline")
+        if not isinstance(raw, dict) or not isinstance(raw.get("raw"), str):
+            return None
+        fingerprints = raw.get("path_fingerprints")
+        watched = raw.get("watched_fingerprints")
+        state = WorkspaceState(
+            is_git=True,
+            is_dirty=False,
+            raw=raw["raw"],
+            path_fingerprints=(
+                dict(fingerprints) if isinstance(fingerprints, dict) else {}
+            ),
+            head=raw.get("head") if isinstance(raw.get("head"), str) else None,
+            watched_fingerprints=(
+                dict(watched) if isinstance(watched, dict) else {}
+            ),
+        )
+        state.is_dirty = bool(state.user_visible_lines())
+        return state
 
     def _feature_active(self, feature: str) -> Path:
         return self.cfg.repo_root / "docs" / "features" / feature / "active"
@@ -1156,9 +1317,13 @@ class Orchestrator:
 
         primary = self._gate_primary_artifact(active, gate)
         p_prompt = prompt_path(gate)
+        # Records are appended when an override is issued. Use the latest
+        # applicable authorization without mutating the audit history; append
+        # order also remains deterministic when timestamps tie or clocks move.
         skip_record = next(
-            (r for r in overrides.active_records()
-             if r.kind == "skip_gate" and r.gate == gate),
+            (r for r in reversed(overrides.active_records())
+             if r.kind == "skip_gate" and r.gate == gate
+             and r.skipped_in_cycle == overrides.current_cycle),
             None,
         )
         v = PanelVerdict(
@@ -1274,6 +1439,39 @@ class Orchestrator:
                 continuation=continuation,
             )
 
+        # Cascade can legitimately be past build while the Ralph loop is not:
+        # the build artifact may have landed immediately before a quota pause,
+        # subprocess failure, or orchestrator restart.  Resume the review half
+        # before announcing or invoking another build subprocess.
+        #
+        # The cascade alone cannot tell "build landed, never reviewed" from
+        # "build reviewed Partial, next build pending": both leave build.json
+        # fresh. Only the former may be resumed as a review; the latter must
+        # run the next build, or the reviewer would inspect an empty diff and
+        # could declare the loop complete without the rework ever running.
+        if stage == "build":
+            self._reset_ralph_state_if_inputs_changed(active, logger, feature)
+        if (
+            stage == "build"
+            and primary_target.exists()
+            and StalenessCascade(active).next_stage() in self._POST_BUILD_STAGES
+            and not self._ralph_loop_complete(active)
+            and self._current_build_awaits_review(
+                active,
+                allowed_write_paths=allowed_write_paths,
+                protected_write_paths=protected_write_paths,
+            )
+        ):
+            return self._resume_ralph_from_current_build(
+                feature=feature,
+                active=active,
+                logger=logger,
+                stage_spec=stage_spec,
+                primary_target=primary_target,
+                allowed_write_paths=allowed_write_paths,
+                protected_write_paths=protected_write_paths,
+            )
+
         logger.emit(stage=stage, event="subprocess-dispatch", feature=feature,
                     detail={"vendor": stage_spec.vendor, "model": stage_spec.model,
                             "primary": str(primary_target),
@@ -1305,6 +1503,82 @@ class Orchestrator:
             logger.emit(stage=stage, event="stage-complete", feature=feature,
                         detail=detail)
             return AdvanceResult(stage_name=stage, success=True)
+
+        return self._advance_build_with_ralph_loop(
+            feature=feature,
+            active=active,
+            logger=logger,
+            stage_spec=stage_spec,
+            primary_target=primary_target,
+            allowed_write_paths=allowed_write_paths,
+            protected_write_paths=protected_write_paths,
+        )
+
+    def _resume_ralph_from_current_build(
+        self,
+        *,
+        feature: str,
+        active: Path,
+        logger: JsonlLog,
+        stage_spec,
+        primary_target: Path,
+        allowed_write_paths: list[Path],
+        protected_write_paths: list[Path] | None = None,
+    ) -> AdvanceResult:
+        """Review an already-landed current build before dispatching build again.
+
+        ``_advance_coding`` has already reset Ralph state on input change
+        before selecting this path.
+        """
+        import json
+
+        context_path = active / RALPH_ITERATION_CONTEXT_FILENAME
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        if context.get("status") != "ready_for_review":
+            # The build returned but the harness died before sealing the
+            # iteration: seal it now between the recorded before_ref and
+            # the post-build ref pinned when the subprocess returned.
+            context_path = self._prepare_ralph_iteration_context(
+                active,
+                protected_paths=self._build_iteration_protected(
+                    active, primary_target, protected_write_paths,
+                ),
+            )
+            self._stamp_build_sealed_ref(
+                primary_target, head=context.get("after_ref") or None,
+            )
+            context = self._finalize_ralph_iteration_context(context_path)
+        # An already-finalized context keeps its recorded after_ref: the
+        # reviewed delta is the build's own, not whatever the operator may
+        # have committed on the branch since.
+        logger.emit(
+            stage="build",
+            event="ralph-resumed-from-current-build",
+            feature=feature,
+            detail={
+                "iteration": context["iteration"],
+                "before_ref": context["before_ref"],
+                "after_ref": context["after_ref"],
+            },
+        )
+
+        route = self._enforce_build_blocking(active, logger, feature)
+        if route is not None:
+            # Same contract as the main build loop: the route only bumps
+            # L[design-review]; the design rerun itself must be dispatched
+            # here, or every resumed advance re-routes and burns an L slot
+            # until L_MAX halts the run without design ever running.
+            return self._advance_coding(feature, active, "design", logger)
+
+        review = self._run_ralph_review(
+            feature,
+            active,
+            logger,
+            iteration_context_path=context_path,
+            iteration_context=context,
+        )
+        if review["complete"]:
+            return AdvanceResult(stage_name="build", success=True)
 
         return self._advance_build_with_ralph_loop(
             feature=feature,
@@ -1733,7 +2007,9 @@ class Orchestrator:
             payload["missing_scope_ids"] = sorted(missing_ids)
         atomic_write(feedback_path, _json.dumps(payload, indent=2) + "\n")
 
-    def _prepare_ralph_iteration_context(self, active: Path) -> Path:
+    def _prepare_ralph_iteration_context(
+        self, active: Path, *, protected_paths: list[Path] | None = None,
+    ) -> Path:
         """Persist the pre-build Git ref and prior accepted Ralph output.
 
         The same Ralph iteration can be re-entered after a quota pause,
@@ -1762,17 +2038,49 @@ class Orchestrator:
             except (OSError, json.JSONDecodeError):
                 existing = {}
 
+        baseline_head = (existing.get("workspace_baseline") or {}).get("head")
         reuse = (
             existing.get("schema") == 1
             and existing.get("iteration") == iteration
             and existing.get("trace_hash") == trace_hash
             and isinstance(existing.get("before_ref"), str)
+            # History rewritten under a pending iteration (reset, rebase,
+            # gc) leaves refs Git can no longer diff against; start the
+            # iteration over from the current HEAD rather than wedge on them.
+            and self._ref_exists(existing["before_ref"])
+            and (
+                not isinstance(baseline_head, str)
+                or self._ref_exists(baseline_head)
+            )
         )
         before_ref = (
             existing["before_ref"]
             if reuse
             else (_current_git_head(self.cfg.repo_root) or "")
         )
+        # Fingerprint of build.json as it stood before this iteration's
+        # build. On re-entry the original value must survive: it is how a
+        # restart tells a build that landed (hash moved) from one that never
+        # returned (hash unchanged) while the context is still pending.
+        build_path = active / "build.json"
+        if reuse and "build_hash_before" in existing:
+            build_hash_before = existing["build_hash_before"]
+            workspace_baseline = existing.get("workspace_baseline")
+        else:
+            build_hash_before = (
+                hash_file(build_path) if build_path.exists() else None
+            )
+            baseline_snapshot = snapshot(
+                self.cfg.repo_root, watched_paths=protected_paths,
+            )
+            workspace_baseline = {
+                "raw": baseline_snapshot.raw,
+                "head": baseline_snapshot.head,
+                "path_fingerprints": dict(baseline_snapshot.path_fingerprints),
+                "watched_fingerprints": dict(
+                    baseline_snapshot.watched_fingerprints
+                ),
+            }
 
         # On a new iteration, freeze the last accepted review under a
         # different filename.  The live ralph-review.json target is replaced
@@ -1802,15 +2110,79 @@ class Orchestrator:
             "repo_root": str(self.cfg.repo_root),
             "trace_hash": trace_hash,
             "before_ref": before_ref,
-            "after_ref": None,
+            # A post-build ref recorded by an interrupted attempt survives
+            # re-entry so the resume path seals the build's own delta; a
+            # fresh attempt overwrites it when its subprocess returns. One
+            # that history rewriting made unreachable is dropped instead of
+            # being sealed into build.json and the reviewer's diff command.
+            "after_ref": (
+                existing.get("after_ref")
+                if reuse
+                and isinstance(existing.get("after_ref"), str)
+                and self._ref_exists(existing["after_ref"])
+                else None
+            ),
+            "build_hash_before": build_hash_before,
+            "workspace_baseline": workspace_baseline,
             "previous_ralph_review_path": previous_review,
             "previous_ralph_review_hash": previous_hash,
             "diff": None,
         })
         return context_path
 
+    def _ref_exists(self, ref: str) -> bool:
+        import subprocess
+
+        if not ref:
+            return False
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(self.cfg.repo_root), "cat-file", "-e",
+                 f"{ref}^{{commit}}"],
+                capture_output=True, check=False, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    def _record_post_build_ref(self, context_path: Path) -> str:
+        """Pin the HEAD the build subprocess left, before any validation.
+
+        Everything after the subprocess returns (residue check, stamping,
+        finalizing) can be interrupted; a resume must then review exactly
+        the delta the build produced, not whatever HEAD is by the time the
+        operator restarts the harness.
+        """
+        import json
+
+        from autodev.artifacts.implementation_index import _current_git_head
+        from autodev.state.atomic import atomic_write_json
+
+        after_ref = _current_git_head(self.cfg.repo_root) or ""
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return after_ref
+        if isinstance(payload, dict) and payload.get("schema") == 1:
+            payload["after_ref"] = after_ref
+            atomic_write_json(context_path, payload)
+        return after_ref
+
+    def _clear_post_build_ref(self, context_path: Path) -> None:
+        import json
+
+        from autodev.state.atomic import atomic_write_json
+
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(payload, dict) and payload.get("after_ref") is not None:
+            payload["after_ref"] = None
+            atomic_write_json(context_path, payload)
+
     def _finalize_ralph_iteration_context(self, context_path: Path) -> dict:
-        """Add the post-build ref and executable diff pointers."""
+        """Add executable diff pointers for the recorded post-build ref."""
         import json
         from datetime import datetime, timezone
 
@@ -1829,7 +2201,12 @@ class Orchestrator:
             )
 
         before_ref = payload.get("before_ref")
-        after_ref = _current_git_head(self.cfg.repo_root) or ""
+        recorded = payload.get("after_ref")
+        after_ref = (
+            recorded
+            if isinstance(recorded, str) and recorded
+            else (_current_git_head(self.cfg.repo_root) or "")
+        )
         refs_available = bool(before_ref and after_ref)
         payload.update({
             "status": "ready_for_review",
@@ -1857,7 +2234,9 @@ class Orchestrator:
         atomic_write_json(context_path, payload)
         return payload
 
-    def _stamp_build_sealed_ref(self, build_path: Path) -> None:
+    def _stamp_build_sealed_ref(
+        self, build_path: Path, *, head: str | None = None,
+    ) -> None:
         """Augment the just-written build.json with the current git HEAD.
 
         Read-modify-write the build.json file so that any WIP commits
@@ -1879,7 +2258,8 @@ class Orchestrator:
             report = load_build(build_path)
         except Exception:
             return
-        head = _current_git_head(self.cfg.repo_root) or ""
+        if head is None:
+            head = _current_git_head(self.cfg.repo_root) or ""
         if report.sealed_ref == head:
             return  # already current; avoid spurious mtime churn
         report.sealed_ref = head
@@ -1911,9 +2291,19 @@ class Orchestrator:
             from autodev.prompts_loader import render_stage_prompt
             from autodev.workspace import snapshot
 
-            ralph_context_path = self._prepare_ralph_iteration_context(active)
+            ralph_context_path = self._prepare_ralph_iteration_context(
+                active,
+                protected_paths=self._build_iteration_protected(
+                    active, primary_target, protected_write_paths,
+                ),
+            )
 
             feedback_path = active / "build-output-rejection.json"
+            # The residue baseline is taken here, not restored from the
+            # persisted iteration context: on re-entry after a pause or
+            # crash the operator may have edited the tree in the meantime,
+            # and those edits are theirs to keep, not residue for the
+            # build to clean up (which would exhaust the retry budget).
             iteration_baseline = snapshot(self.cfg.repo_root)
             result = None
             for attempt in range(1, STAGE_OUTPUT_RETRY_MAX + 1):
@@ -1967,10 +2357,21 @@ class Orchestrator:
                         pre_snap=pre_snap,
                         protected_write_paths=iteration_protected,
                     )
-                    residue = user_visible_changes(
-                        iteration_baseline,
-                        snapshot(self.cfg.repo_root),
+                    self._record_post_build_ref(ralph_context_path)
+                    after_build = snapshot(self.cfg.repo_root)
+                    residue, absorbed = stage_residue(
+                        iteration_baseline, after_build, self.cfg.repo_root,
                     )
+                    if absorbed:
+                        # Not residue, but the build folded pre-existing
+                        # user dirt into its commit against the prompt's
+                        # "never stage pre-existing user changes" rule.
+                        logger.emit(
+                            stage="build",
+                            event="baseline-dirt-committed",
+                            feature=feature,
+                            detail={"entries": absorbed[:20]},
+                        )
                     if residue:
                         raise StageOutputInvalid(
                             "build",
@@ -1981,6 +2382,10 @@ class Orchestrator:
                             f"workspace baseline restored. Changes: {residue[:10]}",
                         )
                 except StageOutputInvalid as e:
+                    # The ref pinned when this attempt returned vouched for a
+                    # build that was just rejected; a later attempt killed
+                    # mid-way must not be sealed against it on resume.
+                    self._clear_post_build_ref(ralph_context_path)
                     self._write_output_rejection_feedback(
                         feedback_path,
                         stage="build",
@@ -2003,6 +2408,31 @@ class Orchestrator:
                             },
                         )
                         raise
+                    if e.kind == "uncommitted_product_changes":
+                        # The session reset is best-effort: a helper failure
+                        # must not turn a retryable rejection into a crash.
+                        try:
+                            reset_count = reset_feature_session(active, "build")
+                        except Exception as reset_exc:  # noqa: BLE001
+                            logger.emit(
+                                stage="build",
+                                event="session-reset-failed",
+                                feature=feature,
+                                detail={
+                                    "kind": e.kind,
+                                    "error": str(reset_exc)[:300],
+                                },
+                            )
+                        else:
+                            logger.emit(
+                                stage="build",
+                                event="session-reset-after-output-rejection",
+                                feature=feature,
+                                detail={
+                                    "kind": e.kind,
+                                    "reset_count": reset_count,
+                                },
+                            )
                     logger.emit(
                         stage="build",
                         event="output-rejected-retrying",

@@ -446,3 +446,225 @@ class TestMinimalityBody:
         assert "cites only amendment text" in body
         assert "operator's call" in body
         assert "in addition to" not in body
+        assert "Minimality evidence" in body
+        assert "`Verdict: pass`" in body
+        assert "`Verdict: needs_revision`" in body
+        assert "Do not emit a per-R coverage table" in body
+
+
+class TestReviewerCacheRoundFormat:
+    @staticmethod
+    def _config():
+        from autodev.vendors.config import (
+            PanelConfig, PanelReviewerSpec, PanelSynthesizerSpec,
+        )
+        return PanelConfig(
+            reviewers=(
+                PanelReviewerSpec(vendor="codex", model="fake"),
+                PanelReviewerSpec(vendor="grok", model="fake"),
+            ),
+            synthesizer=PanelSynthesizerSpec(vendor="codex", model="fake"),
+        )
+
+    def test_budget_cache_binds_effective_body_and_reuses_only_same_prompt(
+        self, feature_active: Path, monkeypatch,
+    ) -> None:
+        from autodev.panel import runner
+        from autodev.state.hashing import hash_file
+
+        artifact = feature_active / "design-packet.json"
+        artifact.write_text("{}\n", encoding="utf-8")
+        prompt_file = feature_active / "review.md"
+        prompt_file.write_text("review\n", encoding="utf-8")
+        (feature_active / "prd.md").write_text(
+            "# PRD\n\n## Requirements\n\n### R1: Do one thing\n",
+            encoding="utf-8",
+        )
+        round_key = hash_file(artifact)
+        _write_log(feature_active, [
+            _outcome_row(0, round_key, "coverage", True),
+        ])
+        group = {
+            "name": "design-review",
+            "verdict_file": "panel-design-review.json",
+            "prompt_file_for_audit": prompt_file,
+            "consulted_docs": [],
+            "reviewer_prompt": "COVERAGE BODY",
+            "reviewer_resume_prompt": "CONTINUE",
+        }
+        round_type, prompts = runner._design_round_plan(
+            feature_active=feature_active, panel_config=self._config(),
+            round_key=round_key, base_prompt=group["reviewer_prompt"],
+            base_resume_prompt=group["reviewer_resume_prompt"],
+            gate_label="design-review", log_emit=None,
+        )
+        assert round_type == "budget"
+        assert prompts is not None
+        effective_prompt = prompts["codex"][0]
+        metadata = runner._reviewer_cache_metadata(
+            gate_label="design-review", primary_artifact=artifact,
+            prompt_file_for_audit=prompt_file,
+            reviewer_prompt=effective_prompt, consulted_docs=[],
+            round_type="budget", source_hash=round_key,
+        )
+        (feature_active / "panel-design-review.reviewers.json").write_text(
+            json.dumps({
+                **metadata,
+                "reviewers": {
+                    "codex": {
+                        "model": "fake",
+                        "output": (
+                            "Minimality evidence\n"
+                            "- s-1 is required by R1.\n\nVerdict: pass"
+                        ),
+                    },
+                    "grok": {
+                        "model": "fake",
+                        "output": (
+                            "Minimality evidence\n"
+                            "- s-1 is required by R1.\n\nVerdict: pass"
+                        ),
+                    },
+                },
+                "failures": {},
+            }),
+            encoding="utf-8",
+        )
+
+        reviewer_calls: list[str] = []
+
+        def invoke_reviewer(spec, prompt, _probe_interval_sec, **_kwargs):
+            reviewer_calls.append(spec.vendor)
+            assert "Minimality evidence" in prompt
+            assert "Verdict: pass" in prompt
+            return runner.ReviewerResult(
+                vendor=spec.vendor, model="fake", ok=True,
+                output=(
+                    "Minimality evidence\n"
+                    "- s-1 is required by R1.\n\nVerdict: pass"
+                ),
+                elapsed_sec=0.1,
+            )
+
+        def invoke_synthesizer(_spec, prompt, _probe_interval_sec, **_kwargs):
+            assert "**Round type**: `budget`" in prompt
+            assert "### Reviewer: grok" in prompt
+            assert "### Reviewer: codex" in prompt
+            return True, {
+                "per_reviewer": [
+                    {"vendor": vendor, "verdict": "pass", "findings": [],
+                     "coverage": []}
+                    for vendor in ("grok", "codex")
+                ],
+                "issue_clusters": [],
+                "decision": {
+                    "node": "design_review", "outcome": "pass",
+                    "blocking": False, "severity": "opinion",
+                    "summary": "minimal",
+                },
+            }, ""
+
+        monkeypatch.setattr(
+            runner, "_invoke_reviewer_with_retry", invoke_reviewer,
+        )
+        monkeypatch.setattr(runner, "_invoke_synthesizer", invoke_synthesizer)
+
+        verdict, _path, error = runner._run_one_group_pipeline(
+            group_spec=group, primary_artifact=artifact,
+            prompt_file_for_audit=prompt_file, panel_config=self._config(),
+            feature_active=feature_active, vendor_cwd=feature_active,
+            probe_config=None, log_emit=None,
+        )
+
+        assert error is None
+        assert verdict.verdict == "pass"
+        assert reviewer_calls == []
+
+        cache_path = feature_active / "panel-design-review.reviewers.json"
+        same_prompt_cache = json.loads(cache_path.read_text())
+        same_prompt_cache["reviewers"]["codex"]["output"] = (
+            "Minimality evidence\n- s-1 is required by R1.\n\n"
+            "## Verdict\n\npass"
+        )
+        cache_path.write_text(json.dumps(same_prompt_cache), encoding="utf-8")
+        repaired, _path, repaired_error = runner._run_one_group_pipeline(
+            group_spec=group, primary_artifact=artifact,
+            prompt_file_for_audit=prompt_file, panel_config=self._config(),
+            feature_active=feature_active, vendor_cwd=feature_active,
+            probe_config=None, log_emit=None,
+        )
+        assert repaired_error is None
+        assert repaired.verdict == "pass"
+        assert reviewer_calls == ["codex"]
+
+        reviewer_calls.clear()
+        original_body = minimality_review_body
+        monkeypatch.setattr(
+            "autodev.budget.minimality_review_body",
+            lambda active: original_body(active) + "\nFORMAT VERSION 2\n",
+        )
+        changed, _path, changed_error = runner._run_one_group_pipeline(
+            group_spec=group, primary_artifact=artifact,
+            prompt_file_for_audit=prompt_file, panel_config=self._config(),
+            feature_active=feature_active, vendor_cwd=feature_active,
+            probe_config=None, log_emit=None,
+        )
+        assert changed_error is None
+        assert changed.verdict == "pass"
+        assert reviewer_calls == ["codex", "grok"]
+
+    def test_coverage_cache_requires_verdict_and_every_active_r(
+        self, feature_active: Path,
+    ) -> None:
+        from autodev.panel import runner
+
+        artifact = feature_active / "design-packet.json"
+        artifact.write_text("{}\n", encoding="utf-8")
+        prompt_file = feature_active / "review.md"
+        prompt_file.write_text("review\n", encoding="utf-8")
+        (feature_active / "prd.md").write_text(
+            "## Requirements\n\n### R1: One\n\n### R2: Two\n",
+            encoding="utf-8",
+        )
+        metadata = runner._reviewer_cache_metadata(
+            gate_label="design-review", primary_artifact=artifact,
+            prompt_file_for_audit=prompt_file, reviewer_prompt="coverage",
+            consulted_docs=[], round_type="coverage",
+        )
+        incomplete = (
+            "| req_id | status | evidence | notes |\n"
+            "|---|---|---|---|\n"
+            "| R1 | satisfied | design:1 | |\n\nVerdict: pass"
+        )
+        complete = incomplete.replace(
+            "\n\nVerdict:",
+            "\n| R2 | satisfied | design:2 | |\n\nVerdict:",
+        )
+        heading_verdict = complete.replace(
+            "Verdict: pass", "## Verdict\n\npass",
+        )
+        cache_path = feature_active / "panel-design-review.reviewers.json"
+        cache_path.write_text(json.dumps({
+            **metadata,
+            "reviewers": {
+                "codex": {"model": "fake", "output": incomplete},
+                "grok": {"model": "fake", "output": heading_verdict},
+            },
+            "failures": {},
+        }), encoding="utf-8")
+        loaded, _failures = runner._load_reviewer_cache(
+            feature_active=feature_active, gate_label="design-review",
+            reviewer_specs=self._config().reviewers, metadata=metadata,
+        )
+        assert [result.vendor for result in loaded] == ["grok"]
+
+        payload = json.loads(cache_path.read_text())
+        payload["reviewers"]["grok"]["output"] = complete.replace(
+            "Verdict: pass", "Zero findings. Looks good.",
+        )
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded, _failures = runner._load_reviewer_cache(
+            feature_active=feature_active, gate_label="design-review",
+            reviewer_specs=self._config().reviewers, metadata=metadata,
+        )
+        assert loaded == []

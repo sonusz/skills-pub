@@ -259,7 +259,17 @@ def render_stage_prompt(
         stage in ("design", "arch-design")
         and not preseeded and not effective_context
     )
-    history = [] if fresh_design else build_iteration_history(feature_active)
+    # Build already receives the current accepted package plus the small set of
+    # stage-relevant artifacts above.  Replaying the feature's complete event
+    # ledger adds no implementation authority and grows without bound (a long
+    # feature can otherwise add hundreds of stale design/panel rows to every
+    # coding turn).  Keep the temporal manifest for stages that reconcile
+    # artifact versions, but leave it out of build prompts.
+    history = (
+        []
+        if fresh_design or stage == "build"
+        else build_iteration_history(feature_active)
+    )
     if history:
         ctx_lines.append("")
         ctx_lines.append("## Iteration history (oldest → newest)")

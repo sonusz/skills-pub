@@ -7,8 +7,8 @@ import pytest
 
 from autodev.errors import PreflightError
 from autodev.workspace import (
-    detect_out_of_scope_writes, diff_snapshots, ensure_git_repo,
-    is_git_repo, snapshot, user_visible_changes,
+    committed_baseline_dirt, detect_out_of_scope_writes, diff_snapshots,
+    ensure_git_repo, is_git_repo, snapshot, user_visible_changes,
 )
 
 
@@ -351,3 +351,107 @@ def test_detects_overwrite_of_preexisting_file_in_another_active_feature(git_rep
     )
 
     assert any("docs/features/other/active/design.md" in e for e in escapes)
+
+
+def _git(repo, *args):
+    subprocess.run(["git", *args], cwd=str(repo), check=True,
+                   capture_output=True)
+
+
+def test_committed_baseline_dirt_absorbs_dirt_committed_unchanged(git_repo):
+    """A stage committing the user's edit byte-for-byte absorbs it."""
+    tracked = git_repo / "src" / "tracked.py"
+    tracked.parent.mkdir(parents=True, exist_ok=True)
+    tracked.write_text("VALUE = 0\n", encoding="utf-8")
+    _git(git_repo, "add", "src/tracked.py")
+    _git(git_repo, "commit", "-q", "-m", "seed")
+    tracked.write_text("VALUE = 1\n", encoding="utf-8")  # user WIP
+    (git_repo / "src" / "new.py").write_text("NEW = 1\n", encoding="utf-8")
+    before = snapshot(git_repo)
+    assert set(before.user_visible_lines()) == {" M src/tracked.py", "?? src/new.py"}
+
+    _git(git_repo, "add", "src/tracked.py", "src/new.py")
+    _git(git_repo, "commit", "-q", "-m", "stage commit")
+    after = snapshot(git_repo)
+
+    absorbed = committed_baseline_dirt(before, after, git_repo)
+    assert set(absorbed) == {" M src/tracked.py", "?? src/new.py"}
+    residue = [e for e in user_visible_changes(before, after) if e not in absorbed]
+    assert residue == []
+
+
+def test_committed_baseline_dirt_keeps_discarded_user_edit_as_residue(git_repo):
+    """A stage that throws the user's edit away and commits its own content
+    did not absorb dirt: the vanished entry stays residue."""
+    tracked = git_repo / "src" / "tracked.py"
+    tracked.parent.mkdir(parents=True, exist_ok=True)
+    tracked.write_text("VALUE = 0\n", encoding="utf-8")
+    _git(git_repo, "add", "src/tracked.py")
+    _git(git_repo, "commit", "-q", "-m", "seed")
+    tracked.write_text("VALUE = 1  # user WIP\n", encoding="utf-8")
+    before = snapshot(git_repo)
+
+    tracked.write_text("VALUE = 2  # stage rewrite\n", encoding="utf-8")
+    _git(git_repo, "add", "src/tracked.py")
+    _git(git_repo, "commit", "-q", "-m", "stage commit")
+    after = snapshot(git_repo)
+
+    assert committed_baseline_dirt(before, after, git_repo) == []
+    assert user_visible_changes(before, after) == [" M src/tracked.py"]
+
+
+def test_committed_baseline_dirt_absorbs_committed_deletion(git_repo):
+    gone = git_repo / "src" / "gone.py"
+    gone.parent.mkdir(parents=True, exist_ok=True)
+    gone.write_text("X = 1\n", encoding="utf-8")
+    _git(git_repo, "add", "src/gone.py")
+    _git(git_repo, "commit", "-q", "-m", "seed")
+    gone.unlink()
+    before = snapshot(git_repo)
+    assert before.user_visible_lines() == [" D src/gone.py"]
+
+    _git(git_repo, "rm", "-q", "src/gone.py")
+    _git(git_repo, "commit", "-q", "-m", "stage commit")
+    after = snapshot(git_repo)
+
+    assert committed_baseline_dirt(before, after, git_repo) == [" D src/gone.py"]
+
+
+def test_committed_baseline_dirt_is_empty_without_head_movement(git_repo):
+    (git_repo / "new.txt").write_text("x", encoding="utf-8")
+    before = snapshot(git_repo)
+    (git_repo / "new.txt").unlink()
+    after = snapshot(git_repo)
+    assert committed_baseline_dirt(before, after, git_repo) == []
+    assert user_visible_changes(before, after) == ["?? new.txt"]
+
+
+def test_protected_touch_without_content_change_is_not_an_escape(git_repo):
+    """An mtime-only change (touch, branch round-trip) must not count as a
+    protected-input edit; content and mode changes still do."""
+    import os
+    import time
+
+    protected = git_repo / "prd.md"
+    protected.write_text("immutable", encoding="utf-8")
+    subprocess.run(["git", "add", "prd.md"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True)
+    before = snapshot(git_repo, watched_paths=[protected])
+
+    later = time.time() + 5
+    os.utime(protected, (later, later))
+    after = snapshot(git_repo, watched_paths=[protected])
+    assert before.watched_fingerprints != after.watched_fingerprints
+    assert detect_out_of_scope_writes(
+        before, after, allowed_scope=[git_repo],
+        protected_scope=[protected], repo_root=git_repo,
+    ) == []
+
+    protected.write_text("edited", encoding="utf-8")
+    edited = snapshot(git_repo, watched_paths=[protected])
+    assert any(
+        "prd.md" in entry for entry in detect_out_of_scope_writes(
+            before, edited, allowed_scope=[git_repo],
+            protected_scope=[protected], repo_root=git_repo,
+        )
+    )

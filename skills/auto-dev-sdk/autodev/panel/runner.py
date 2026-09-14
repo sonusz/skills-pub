@@ -25,8 +25,10 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -48,6 +50,14 @@ from autodev.artifacts.verdict import (
 )
 from autodev.artifacts.fingerprint_history import prior_cluster_catalog
 from autodev.errors import ConfigError, GatePending, QuotaHalt, SchemaError
+
+
+class _PeerGroupFailed(GatePending):
+    """Raised by a healthy group whose synthesis barrier was aborted by its peer.
+
+    A sentinel only: the peer's own exception carries the real cause, and the
+    dual-group runner must prefer that one when both surface together.
+    """
 from autodev.panel.anchor_filter import filter_anchor_findings
 from autodev.panel.rigor_filter import (
     RigorFilterResult, apply_rigor_filter, has_effective_blocking,
@@ -124,6 +134,33 @@ DESIGN_REVIEW_GROUPS: tuple[dict, ...] = (
 REVIEWER_CACHE_SCHEMA_VERSION = 1
 REVIEWER_ATTEMPTS_PER_RUN = 2
 QUOTA_SKIPPED_PREFIX = "[SKIPPED: quota confirmed"
+
+
+class _PanelFailFastState:
+    """One quota stop signal shared by every reviewer in every group."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self._lock = threading.Lock()
+        self._result: ReviewerResult | None = None
+
+    def trigger(self, result: ReviewerResult) -> None:
+        with self._lock:
+            if self._result is None:
+                self._result = result
+            self.event.set()
+
+    def raise_if_set(self, gate_label: str) -> None:
+        if not self.event.is_set():
+            return
+        with self._lock:
+            result = self._result
+        if result is None:
+            raise GatePending(
+                f"panel-{gate_label}",
+                f"panel {gate_label} cancelled by peer group",
+            )
+        raise _quota_halt_from_skips(gate_label, [result])
 
 DOCTOR_SCRIPT = SHARED_VENDORS_DIR / "scripts" / "doctor.sh"
 
@@ -348,6 +385,7 @@ def _reviewer_cache_metadata(
     consulted_docs: list[dict],
     round_type: str = "coverage",
     source_hash: str | None = None,
+    budget_targets: list[list] | None = None,
 ) -> dict:
     # round_type separates cache identities of a coverage round and a
     # budget round over the SAME packet — the coverage/budget cadence
@@ -363,10 +401,27 @@ def _reviewer_cache_metadata(
         "source_hash": source_hash or hash_file(primary_artifact),
         "prompt_file": str(prompt_file_for_audit),
         "prompt_hash": hash_file(prompt_file_for_audit),
-        "reviewer_prompt_hash": _hash_text(reviewer_prompt),
+        "reviewer_prompt_hash": _hash_text(_cache_identity_prompt(reviewer_prompt)),
         "consulted_docs": consulted_docs,
         "round_type": round_type,
+        # Spend lines are stripped from the prompt identity (they grow with
+        # every dispatch); the operator's ceilings are what a minimality
+        # verdict was judged against, so they enter the identity here.
+        "budget_targets": budget_targets,
     }
+
+
+_BUDGET_LINE_RE = re.compile(r"^[ \t]*-\s*BUDGET_[A-Z_]+:[^\n]*\n?", re.MULTILINE)
+
+
+def _cache_identity_prompt(prompt: str) -> str:
+    """The reviewer prompt with volatile spend figures removed.
+
+    Budget lines are recomputed from log.jsonl on every call, and the log
+    grows with each reviewer dispatch, so hashing them into the cache
+    identity would invalidate every cached slot on every resume.
+    """
+    return _BUDGET_LINE_RE.sub("", prompt)
 
 
 def _cache_matches(payload: dict, metadata: dict) -> bool:
@@ -386,10 +441,124 @@ def _cache_matches(payload: dict, metadata: dict) -> bool:
     # Compared with a default: every cache written before round types
     # existed was a coverage round, and strict equality would discard all
     # pre-upgrade caches of in-flight rounds (a full reviewer re-run each).
-    return (
+    if (
         payload.get("round_type", "coverage")
-        == metadata.get("round_type", "coverage")
-    )
+        != metadata.get("round_type", "coverage")
+    ):
+        return False
+    return payload.get("budget_targets") == metadata.get("budget_targets")
+
+
+# The budget round mandates the literal ``Verdict: <value>`` line, so its
+# cache check stays strict. Coverage-round prompts only say "state your
+# verdict", so reviewers legitimately decorate the line with markdown
+# (``**Verdict:** pass``, ``## Verdict: pass``, ``- Verdict: **pass**``);
+# rejecting those would drop valid cache entries and re-dispatch reviewers on
+# every resume, which the fallback parser downstream never required.
+_EXPLICIT_VERDICT_RE = re.compile(
+    r"^\s*Verdict:\s*(?:pass|needs_revision|fail)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_DECORATED_VERDICT_RE = re.compile(
+    r"^\s*(?:[-*]\s+)?(?:#{1,6}\s*)?(?:\*\*)?(?:[A-Za-z]+\s+)?Verdict(?:\*\*)?"
+    r"\s*:\s*(?:\*\*)?\s*`?\s*(?:pass|needs_revision|fail)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_VERDICT_LABEL_RE = re.compile(
+    r"^\s*(?:[-*]\s+)?(?:#{1,6}\s*)?(?:\*\*)?(?:[A-Za-z]+\s+)?Verdict(?:\*\*)?"
+    r"\s*:?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Coverage rows: the leading pipe is optional (GFM allows omitting it and the
+# close-approval prompt's example table omits it); the first cell may wrap
+# the id in bold/backticks, add a label (``R1: auth``) or list several ids
+# (``R7/R8``). Every ``R<n>`` token in that first cell counts.
+# A row needs at least two cells after the id cell so pipe-delimited prose
+# ("- Evidence: prd:R2 | scope:S3") does not count as coverage.
+_COVERAGE_ROW_RE = re.compile(
+    r"^\s*\|?([^|\n]*\bR\d+\b[^|\n]*)\|[^|\n]*\|", re.MULTILINE,
+)
+_REQ_ID_RE = re.compile(r"\bR\d+\b")
+
+
+def _coverage_row_ids(output: str) -> set[str]:
+    return {
+        req_id
+        for cell in _COVERAGE_ROW_RE.findall(output)
+        for req_id in _REQ_ID_RE.findall(cell)
+    }
+
+
+# The label's trailing whitespace must not cross a newline: otherwise an
+# evidence-less header swallows the next non-blank line (often the verdict)
+# as its "evidence" and the tail scan below never runs.
+_MINIMALITY_EVIDENCE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*\*)?Minimality evidence(?:\*\*)?[ \t]*:?[ \t]*"
+    r"(?:\*\*)?[ \t]*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _has_labeled_verdict(output: str) -> bool:
+    """Accept an explicit verdict on the label line or its next content line."""
+    if _EXPLICIT_VERDICT_RE.search(output) is not None:
+        return True
+    if _DECORATED_VERDICT_RE.search(output) is not None:
+        return True
+    match = _VERDICT_LABEL_RE.search(output)
+    if match is None:
+        return False
+    for line in output[match.end():].splitlines():
+        value = line.strip().strip("*`").strip().lower()
+        if not value:
+            continue
+        return value in {"pass", "needs_revision", "fail"}
+    return False
+
+
+def _cached_reviewer_output_is_complete(
+    output: str, *, metadata: dict, feature_active: Path,
+) -> bool:
+    """Whether a cached success satisfies its harness-selected round format.
+
+    Cache metadata, rather than reviewer prose, selects the round. Invalid old
+    successes are treated as unsettled slots so normal reviewer dispatch repairs
+    them without requiring operators to edit cache artifacts.
+
+    A coverage-round success must carry a verdict and one coverage row per
+    PRD requirement (the same set ``prd-checklist.json`` is built from), in
+    any GFM table shape; a budget-round success must carry the literal
+    ``Verdict:`` line and non-empty minimality evidence.
+    """
+    if metadata.get("round_type", "coverage") == "budget":
+        if _EXPLICIT_VERDICT_RE.search(output) is None:
+            return False
+        match = _MINIMALITY_EVIDENCE_RE.search(output)
+        if match is None:
+            return False
+        if match.group(1).strip().strip("*").strip():
+            return True
+        tail = output[match.end():]
+        for line in tail.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower().startswith("verdict:"):
+                return False
+            return True
+        return False
+
+    if not _has_labeled_verdict(output):
+        return False
+    try:
+        from autodev.artifacts.prd_checklist import build_prd_checklist
+
+        required = {
+            req.req_id for req in build_prd_checklist(feature_active).requirements
+        }
+    except (OSError, ValueError):
+        return False
+    return required <= _coverage_row_ids(output)
 
 
 def _load_reviewer_cache(
@@ -398,6 +567,7 @@ def _load_reviewer_cache(
     gate_label: str,
     reviewer_specs: tuple[PanelReviewerSpec, ...],
     metadata: dict,
+    log_emit: Callable[[dict], None] | None = None,
 ) -> tuple[list[ReviewerResult], dict[str, dict]]:
     """Load reusable successful reviewer slots for this exact panel input.
 
@@ -434,6 +604,22 @@ def _load_reviewer_cache(
                 continue
             output = entry.get("output")
             if not isinstance(output, str) or not output.strip():
+                continue
+            if not _cached_reviewer_output_is_complete(
+                output, metadata=metadata, feature_active=feature_active,
+            ):
+                if log_emit is not None:
+                    try:
+                        log_emit({
+                            "event": "panel-cache-entry-dropped",
+                            "stage": "gate",
+                            "gate": gate_label,
+                            "vendor": vendor,
+                            "round_type": metadata.get("round_type", "coverage"),
+                            "reason": "cached output fails round format check",
+                        })
+                    except Exception:
+                        pass
                 continue
             results.append(
                 ReviewerResult(
@@ -742,6 +928,7 @@ def _invoke_reviewer(
     session_key: str | None = None,
     resume_prompt: str | None = None,
     force_quota: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> ReviewerResult:
     """Run one reviewer CLI. Captures stdout; empty on failure.
 
@@ -784,7 +971,7 @@ def _invoke_reviewer(
                 env=env, timeout=timeout_sec,
             )
         else:
-            idle_callback = (
+            probe_idle_callback = (
                 _build_idle_callback(
                     stage=f"panel-reviewer-{spec.vendor}",
                     stage_probe_interval_sec=probe_interval_sec,
@@ -800,6 +987,15 @@ def _invoke_reviewer(
                 if probe_config is not None
                 else None
             )
+            if cancel_event is not None:
+                def idle_callback(**kwargs):
+                    if cancel_event.is_set():
+                        return "kill"
+                    if probe_idle_callback is not None:
+                        return probe_idle_callback(**kwargs)
+                    return "continue"
+            else:
+                idle_callback = probe_idle_callback
             hard_backstop = (
                 _hard_backstop_sec(probe_interval_sec)
                 if probe_config is not None
@@ -819,6 +1015,7 @@ def _invoke_reviewer(
                 # guard in panel/__init__.py backstops any stray mutation.
                 yolo=True,
                 idle_callback=idle_callback,
+                idle_check_interval_sec=1 if cancel_event is not None else 10,
                 process_registry=(
                     registry_path(feature_active)
                     if feature_active is not None else None
@@ -912,6 +1109,28 @@ def _quota_halt_confirmation(exc: QuotaHalt) -> dict:
     }
 
 
+def _reconfirm_quota_halt(spec: PanelReviewerSpec, confirmation: dict) -> dict:
+    """Re-run the preflight resolver with the quota cache bypassed.
+
+    Same resolver, same fallback chain, same ``QuotaHalt`` shape as the
+    preflight itself, so the confirmation (including ``resume_at``) reflects
+    a fresh reading rather than a cached one.
+    """
+    try:
+        resolve_candidate(
+            build_candidates(spec), role=f"reviewer:{spec.vendor}", force=True,
+        )
+    except QuotaHalt as exc:
+        fresh = _quota_halt_confirmation(exc)
+        fresh["source"] = "quota-preflight-reprobed"
+        return fresh
+    return {
+        **confirmation,
+        "confirmed": False,
+        "source": "quota-preflight-reprobed",
+    }
+
+
 def _quota_floor_for_result(
     spec: PanelReviewerSpec, result: ReviewerResult,
 ) -> float:
@@ -972,13 +1191,20 @@ def _invoke_reviewer_with_retry(
     log_emit: Callable[[dict], None] | None = None,
     session_key: str | None = None,
     resume_prompt: str | None = None,
+    gate_label: str = "panel",
+    fail_fast_state: _PanelFailFastState | None = None,
 ) -> ReviewerResult:
     """Try a reviewer twice, then omit it only on confirmed quota exhaustion."""
     prior_attempts, history = _prior_failure_audit(prior_failure)
     elapsed = 0.0
     last_result: ReviewerResult | None = None
+    # Fail-fast probes quota after every failed attempt; the final result
+    # reuses that probe rather than hitting the vendor endpoint again.
+    last_confirmation: dict | None = None
 
     for attempt in range(1, REVIEWER_ATTEMPTS_PER_RUN + 1):
+        if fail_fast_state is not None:
+            fail_fast_state.raise_if_set(gate_label)
         try:
             result = _invoke_reviewer(
                 spec,
@@ -991,13 +1217,41 @@ def _invoke_reviewer_with_retry(
                 session_key=session_key,
                 resume_prompt=resume_prompt,
                 force_quota=attempt > 1,
+                cancel_event=(
+                    fail_fast_state.event if fail_fast_state is not None else None
+                ),
             )
         except QuotaHalt as exc:
             confirmation = _quota_halt_confirmation(exc)
+            if (
+                fail_fast_state is not None
+                and confirmation["confirmed"]
+                and attempt == 1
+            ):
+                # Attempt 1's preflight may have read a cached quota figure
+                # from before the vendor's window reset; cancelling every
+                # in-flight reviewer on it would be premature. Fail-fast
+                # promises a fresh probe, so take one now.
+                confirmation = _reconfirm_quota_halt(spec, confirmation)
             history.append(
                 f"attempt {attempt}: quota preflight halted "
                 f"(confirmed={confirmation['confirmed']})"
             )
+            if fail_fast_state is not None and confirmation["confirmed"]:
+                skipped = ReviewerResult(
+                    vendor=spec.vendor,
+                    model=spec.model,
+                    ok=False,
+                    output="",
+                    elapsed_sec=elapsed,
+                    failure_detail="quota exhausted before reviewer launch",
+                    attempt_count=prior_attempts + attempt,
+                    failure_history=tuple(history),
+                    quota_skipped=True,
+                    quota_confirmation=confirmation,
+                )
+                fail_fast_state.trigger(skipped)
+                fail_fast_state.raise_if_set(gate_label)
             if (
                 confirmation["confirmed"]
                 and attempt == REVIEWER_ATTEMPTS_PER_RUN
@@ -1039,11 +1293,34 @@ def _invoke_reviewer_with_retry(
 
         last_result = result
         history.append(f"attempt {attempt}: {result.failure_detail or 'no output'}")
+        if fail_fast_state is not None:
+            fail_fast_state.raise_if_set(gate_label)
+            confirmation = _confirm_quota_after_failures(spec, result)
+            last_confirmation = confirmation
+            if confirmation["confirmed"]:
+                skipped = ReviewerResult(
+                    vendor=result.vendor,
+                    model=result.model,
+                    ok=False,
+                    output="",
+                    elapsed_sec=elapsed,
+                    failure_detail=result.failure_detail,
+                    attempt_count=prior_attempts + attempt,
+                    failure_history=tuple(history),
+                    quota_skipped=True,
+                    quota_confirmation=confirmation,
+                )
+                fail_fast_state.trigger(skipped)
+                fail_fast_state.raise_if_set(gate_label)
         if attempt < REVIEWER_ATTEMPTS_PER_RUN:
             continue
 
     assert last_result is not None
-    confirmation = _confirm_quota_after_failures(spec, last_result)
+    confirmation = (
+        last_confirmation
+        if last_confirmation is not None
+        else _confirm_quota_after_failures(spec, last_result)
+    )
     return ReviewerResult(
         vendor=last_result.vendor,
         model=last_result.model,
@@ -1147,17 +1424,16 @@ def _dispatch_reviewer_slots(
     probe_config: ProbeConfig | None,
     log_emit: Callable[[dict], None] | None,
     per_vendor_prompts: dict[str, tuple[str, str]] | None = None,
+    fail_fast_state: _PanelFailFastState | None = None,
 ) -> None:
     """Dispatch unsettled slots in parallel; each slot owns its retry.
 
     ``per_vendor_prompts`` maps a vendor to its own ``(prompt,
     resume_prompt)`` pair, REPLACING the shared prompts for that vendor
     (shrink rounds hand every reviewer a dedicated minimality-review
-    prompt, not the coverage prompt plus an addendum). It is
-    deliberately excluded from the reviewer-cache metadata hash: the
-    round's cache identity is the shared base prompt, and the shrink
-    cadence is round-key-stable, so a resumed round re-issues the same
-    role.
+    prompt, not the coverage prompt plus an addendum). The caller binds
+    that effective prompt into reviewer-cache metadata so a budget-body
+    change invalidates every slot from the prior prompt version.
     """
     to_run = _missing_reviewers(panel_config.reviewers, reviewer_results)
     if not to_run:
@@ -1187,11 +1463,23 @@ def _dispatch_reviewer_slots(
                 resume_prompt=overrides.get(
                     spec.vendor, ("", reviewer_resume_prompt),
                 )[1],
+                gate_label=gate_label,
+                fail_fast_state=fail_fast_state,
             )
             for spec in to_run
         ]
+        # A fail-fast quota halt is raised from inside a worker. Keep
+        # draining the other slots (the shared cancel event makes them
+        # return promptly) so their outputs reach reviewer_results, then
+        # re-raise; the caller persists the cache before propagating.
+        pending_error: BaseException | None = None
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
+            try:
+                result = future.result()
+            except BaseException as exc:  # noqa: BLE001
+                if pending_error is None:
+                    pending_error = exc
+                continue
             reviewer_results.append(result)
             # Panel calls never pass through the stage-subprocess path, so
             # they would otherwise be invisible to budget metering
@@ -1212,6 +1500,8 @@ def _dispatch_reviewer_slots(
                     })
                 except Exception:
                     pass
+        if pending_error is not None:
+            raise pending_error
 
 
 def _quota_skip_raw(result: ReviewerResult) -> str:
@@ -1321,6 +1611,7 @@ def _require_panel_quorum(
 def _compose_synthesizer_prompt(
     *, gate: str, artifact_path: Path, reviewer_results: list[ReviewerResult],
     feature_active: Path | None = None,
+    round_type: str = "coverage",
 ) -> str:
     """Build the prompt for the synthesizer given reviewer outputs."""
     base = synthesize_prompt_path().read_text(encoding="utf-8")
@@ -1333,6 +1624,7 @@ def _compose_synthesizer_prompt(
     out = base + "\n\n---\n\n"
     out += f"## Context for this synthesis\n\n"
     out += f"- **Gate**: `{gate}`\n"
+    out += f"- **Round type**: `{round_type}`\n"
     out += f"- **Artifact path**: `{artifact_path}`\n"
     if artifact_path.exists():
         out += f"- **Artifact hash**: `{hash_file(artifact_path)}`\n"
@@ -1739,6 +2031,7 @@ def _synthesize_and_build_verdict(
         gate=gate_label, artifact_path=primary_artifact,
         reviewer_results=reviewer_results,
         feature_active=feature_active,
+        round_type=round_type,
     )
 
     synth_ok, synth_parsed, synth_detail = _invoke_synthesizer(
@@ -1966,6 +2259,8 @@ def _run_one_group_pipeline(
     vendor_cwd: Path,
     probe_config: ProbeConfig | None,
     log_emit: Callable[[dict], None] | None,
+    fail_fast_state: _PanelFailFastState | None = None,
+    synthesis_barrier: threading.Barrier | None = None,
 ) -> tuple[PanelVerdict, Path, str | None]:
     """Run one reviewer group: retried reviewers, quorum, then synthesis.
 
@@ -1993,20 +2288,36 @@ def _run_one_group_pipeline(
             gate_label=group_spec["name"],
             log_emit=log_emit,
         )
+    budget_targets: list[list] | None = None
+    if round_type == "budget":
+        try:
+            from autodev.budget import load_targets
+
+            # No ceilings -> None, matching metadata built without the field.
+            budget_targets = [
+                [key, value] for key, value in sorted(load_targets(feature_active).items())
+            ] or None
+        except Exception:
+            budget_targets = None
     metadata = _reviewer_cache_metadata(
         gate_label=group_spec["name"],
         primary_artifact=primary_artifact,
         prompt_file_for_audit=group_spec["prompt_file_for_audit"],
-        reviewer_prompt=group_spec["reviewer_prompt"],
+        reviewer_prompt=(
+            next(iter(per_vendor_prompts.values()))[0]
+            if per_vendor_prompts else group_spec["reviewer_prompt"]
+        ),
         consulted_docs=group_spec["consulted_docs"],
         round_type=round_type,
         source_hash=round_key,
+        budget_targets=budget_targets,
     )
     reviewer_results, prior_failures = _load_reviewer_cache(
         feature_active=feature_active,
         gate_label=group_spec["name"],
         reviewer_specs=cfg.reviewers,
         metadata=metadata,
+        log_emit=log_emit,
     )
 
     if group_spec["name"] == "design-review":
@@ -2028,35 +2339,44 @@ def _run_one_group_pipeline(
             except Exception:
                 pass
 
-    _dispatch_reviewer_slots(
-        gate_label=group_spec["name"],
-        reviewer_prompt=group_spec["reviewer_prompt"],
-        reviewer_resume_prompt=group_spec["reviewer_resume_prompt"],
-        reviewer_results=reviewer_results,
-        prior_failures=prior_failures,
-        panel_config=cfg,
-        feature_active=feature_active,
-        vendor_cwd=vendor_cwd,
-        probe_config=probe_config,
-        log_emit=log_emit,
-        per_vendor_prompts=per_vendor_prompts,
-    )
+    def persist_cache() -> None:
+        # Sort by configured vendor order for stable audit output.
+        order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
+        reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+        _write_reviewer_cache(
+            feature_active=feature_active,
+            gate_label=group_spec["name"],
+            reviewer_specs=cfg.reviewers,
+            metadata=metadata,
+            reviewer_results=reviewer_results,
+            prior_failures=prior_failures,
+        )
 
-    # Sort by configured vendor order for stable audit output.
-    order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
-    reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+    try:
+        _dispatch_reviewer_slots(
+            gate_label=group_spec["name"],
+            reviewer_prompt=group_spec["reviewer_prompt"],
+            reviewer_resume_prompt=group_spec["reviewer_resume_prompt"],
+            reviewer_results=reviewer_results,
+            prior_failures=prior_failures,
+            panel_config=cfg,
+            feature_active=feature_active,
+            vendor_cwd=vendor_cwd,
+            probe_config=probe_config,
+            log_emit=log_emit,
+            per_vendor_prompts=per_vendor_prompts,
+            fail_fast_state=fail_fast_state,
+        )
+    except BaseException:
+        # A fail-fast quota halt must not discard the reviewers that did
+        # finish: persist them so quota-resume re-runs only the missing slot.
+        persist_cache()
+        raise
+    persist_cache()
 
     per_vendor_raw = _per_vendor_raw(reviewer_results)
 
     out_path = feature_active / group_spec["verdict_file"]
-    _write_reviewer_cache(
-        feature_active=feature_active,
-        gate_label=group_spec["name"],
-        reviewer_specs=cfg.reviewers,
-        metadata=metadata,
-        reviewer_results=reviewer_results,
-        prior_failures=prior_failures,
-    )
     _require_panel_quorum(
         gate_label=group_spec["name"],
         reviewer_results=reviewer_results,
@@ -2064,7 +2384,22 @@ def _run_one_group_pipeline(
         log_emit=log_emit,
     )
 
-    # Healthy → synthesize immediately (no barrier waiting for other group).
+    if fail_fast_state is not None:
+        fail_fast_state.raise_if_set(group_spec["name"])
+    if synthesis_barrier is not None:
+        try:
+            synthesis_barrier.wait()
+        except threading.BrokenBarrierError:
+            if fail_fast_state is not None:
+                fail_fast_state.raise_if_set(group_spec["name"])
+            raise _PeerGroupFailed(
+                f"panel-{group_spec['name']}",
+                f"panel {group_spec['name']} peer group failed before synthesis",
+            )
+
+    # Healthy: synthesize. Without fail-fast this happens as soon as this
+    # group's reviewers are done; with fail-fast the barrier above has
+    # already held until the peer group's reviewers settled too.
     return _synthesize_and_build_verdict(
         gate_label=group_spec["name"],
         round_type=round_type,
@@ -2131,15 +2466,21 @@ def _run_dual_group_design_review(
         })
 
     # Run two group pipelines concurrently; each is reviewers → synthesizer
-    # in sequence WITHIN the group, but groups run independently — no barrier.
+    # in sequence WITHIN the group. Groups run independently unless
+    # fail_fast_confirmed_quota is set, in which case a barrier before
+    # synthesis lets a confirmed quota halt in one group cancel the other
+    # before either spends a synthesizer call.
     pipeline_results: dict[str, tuple[PanelVerdict, Path, str | None]] = {}
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(group_specs),
-        thread_name_prefix="panel-group",
-    ) as pool:
-        future_to_name = {
-            pool.submit(
-                _run_one_group_pipeline,
+    fail_fast_state = (
+        _PanelFailFastState() if panel_config.fail_fast_confirmed_quota else None
+    )
+    synthesis_barrier = (
+        threading.Barrier(len(group_specs)) if fail_fast_state is not None else None
+    )
+
+    def run_group(gs: dict) -> tuple[PanelVerdict, Path, str | None]:
+        try:
+            return _run_one_group_pipeline(
                 group_spec=gs,
                 primary_artifact=primary_artifact,
                 prompt_file_for_audit=prompt_file_for_audit,
@@ -2148,11 +2489,47 @@ def _run_dual_group_design_review(
                 vendor_cwd=vendor_cwd,
                 probe_config=probe_config,
                 log_emit=log_emit,
+                fail_fast_state=fail_fast_state,
+                synthesis_barrier=synthesis_barrier,
+            )
+        except BaseException:
+            # Any exit path must break the barrier, or the peer group parks
+            # in an untimed wait and the executor shutdown never returns.
+            if synthesis_barrier is not None:
+                synthesis_barrier.abort()
+            raise
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(group_specs),
+        thread_name_prefix="panel-group",
+    ) as pool:
+        future_to_name = {
+            pool.submit(
+                run_group,
+                gs,
             ): gs["name"]
             for gs in group_specs
         }
+        errors: list[Exception] = []
         for fut in concurrent.futures.as_completed(future_to_name):
-            pipeline_results[future_to_name[fut]] = fut.result()
+            try:
+                pipeline_results[future_to_name[fut]] = fut.result()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            # The group that actually failed and the group that merely saw
+            # the barrier break finish within microseconds of each other, so
+            # ``as_completed`` order is arbitrary. Rank the causes: a quota
+            # halt first, then the real failure, and the peer-failed sentinel
+            # only when nothing else explains the abort.
+            quota_error = next(
+                (exc for exc in errors if isinstance(exc, QuotaHalt)), None
+            )
+            primary_error = next(
+                (exc for exc in errors if not isinstance(exc, _PeerGroupFailed)),
+                None,
+            )
+            raise quota_error or primary_error or errors[0]
 
     # Write verdicts in declared order; collect any synth infra errors.
     written: dict[str, PanelVerdict] = {}
@@ -2258,33 +2635,44 @@ def run_panel_gate_internal(
         gate_label=gate,
         reviewer_specs=cfg.reviewers,
         metadata=metadata,
-    )
-    _dispatch_reviewer_slots(
-        gate_label=gate,
-        reviewer_prompt=reviewer_prompt,
-        reviewer_resume_prompt=reviewer_resume_prompt,
-        reviewer_results=reviewer_results,
-        prior_failures=prior_failures,
-        panel_config=cfg,
-        feature_active=feature_active,
-        vendor_cwd=vendor_cwd,
-        probe_config=probe_config,
         log_emit=log_emit,
     )
-    # Preserve reviewer order as declared in config (stable audit).
-    order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
-    reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+    fail_fast_state = (
+        _PanelFailFastState() if cfg.fail_fast_confirmed_quota else None
+    )
+    def persist_cache() -> None:
+        # Preserve reviewer order as declared in config (stable audit).
+        order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
+        reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+        _write_reviewer_cache(
+            feature_active=feature_active,
+            gate_label=gate,
+            reviewer_specs=cfg.reviewers,
+            metadata=metadata,
+            reviewer_results=reviewer_results,
+            prior_failures=prior_failures,
+        )
+
+    try:
+        _dispatch_reviewer_slots(
+            gate_label=gate,
+            reviewer_prompt=reviewer_prompt,
+            reviewer_resume_prompt=reviewer_resume_prompt,
+            reviewer_results=reviewer_results,
+            prior_failures=prior_failures,
+            panel_config=cfg,
+            feature_active=feature_active,
+            vendor_cwd=vendor_cwd,
+            probe_config=probe_config,
+            log_emit=log_emit,
+            fail_fast_state=fail_fast_state,
+        )
+    except BaseException:
+        persist_cache()
+        raise
+    persist_cache()
 
     per_vendor_raw = _per_vendor_raw(reviewer_results)
-
-    _write_reviewer_cache(
-        feature_active=feature_active,
-        gate_label=gate,
-        reviewer_specs=cfg.reviewers,
-        metadata=metadata,
-        reviewer_results=reviewer_results,
-        prior_failures=prior_failures,
-    )
     _require_panel_quorum(
         gate_label=gate,
         reviewer_results=reviewer_results,

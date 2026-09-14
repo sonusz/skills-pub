@@ -45,7 +45,7 @@
 stages:
   design:
     vendor: codex
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     probe_interval_sec: 1200
     effort: high
     # Example quota gate: prefer codex while it has >=20% of its window left;
@@ -57,7 +57,7 @@ stages:
         effort: high
         min_quota_pct: 15
       - vendor: cursor
-        model: gpt-5.6-sol-xhigh
+        model: gpt-6-astra-xhigh
         effort: max
         min_quota_pct: 10
 
@@ -98,7 +98,7 @@ panel:
       effort: high
   synthesizer:
     vendor: codex
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     effort: medium
   reviewer_probe_interval_sec: 600
   synthesizer_probe_interval_sec: 300

@@ -32,7 +32,7 @@ intentionally override the harness defaults.
 stages:
   design:
     vendor: codex
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     probe_interval_sec: 1200
     effort: high
   build:
@@ -66,7 +66,7 @@ stages:
       model: gemini-3.1-pro-high
       effort: high
     - vendor: codex
-      model: gpt-5.6-sol
+      model: gpt-6-astra
       effort: high
   synthesizer:
     vendor: codex

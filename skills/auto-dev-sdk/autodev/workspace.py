@@ -16,12 +16,13 @@ from __future__ import annotations
 import fnmatch
 import os
 import stat
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from autodev.errors import PreflightError
-from autodev.state.hashing import hash_file
+from autodev.state.hashing import hash_bytes, hash_file
 
 # Harness-internal filename patterns — NOT considered "dirty" for the
 # pipeline-blocking check. Per-feature state + subprocess byproducts.
@@ -261,10 +262,120 @@ def user_visible_changes(
     This keeps pre-existing user dirt as a baseline while still noticing a
     stage that adds, stages, removes, or rewrites a product file. Active
     feature artifacts and harness internals remain excluded by the same rules
-    used for the preflight dirty check.
+    used for the preflight dirty check. The comparison is symmetric: a
+    baseline entry that vanished is reported too. Callers that accept a
+    stage committing pre-existing dirt subtract ``committed_baseline_dirt``.
     """
     visible = set(before.user_visible_lines()) | set(after.user_visible_lines())
     return [entry for entry in diff_snapshots(before, after) if entry in visible]
+
+
+def _fingerprint_content_hash(fingerprint: str | None) -> str | None:
+    if not fingerprint or not fingerprint.startswith("file:"):
+        return None
+    marker = ":hash="
+    index = fingerprint.rfind(marker)
+    return fingerprint[index + len(marker):] if index >= 0 else None
+
+
+def _committed_blob_sha256(repo_root: Path, ref: str, path: str) -> str | None:
+    """``hash_file``-format digest of ``path`` at ``ref``; None if absent."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "blob", f"{ref}:{path}"],
+            capture_output=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return hash_bytes(proc.stdout)
+
+
+_MTIME_FIELD_RE = re.compile(r":mtime_ns=\d+")
+
+
+def _watched_changed(before: str | None, after: str | None) -> bool:
+    """Whether a watched path materially changed between two fingerprints.
+
+    Fingerprints embed mtime alongside mode/owner/size/content hash. A touch
+    or a branch round-trip that leaves bytes and mode identical must not
+    count as a protected-input edit, so mtime alone is ignored; mode, owner
+    and content changes still count.
+    """
+    if before == after:
+        return False
+    if before is None or after is None:
+        return True
+    return _MTIME_FIELD_RE.sub("", before) != _MTIME_FIELD_RE.sub("", after)
+
+
+def stage_residue(
+    before: WorkspaceState,
+    after: WorkspaceState,
+    repo_root: Path,
+) -> tuple[list[str], list[str]]:
+    """Return ``(residue, absorbed)`` for a stage that ran between snapshots.
+
+    ``residue`` is every user-visible change the stage left behind that is
+    not explained by committing pre-existing dirt unchanged; ``absorbed`` is
+    that committed dirt (see ``committed_baseline_dirt``). The build loop and
+    the resume-time re-validation share the rule; they differ only in which
+    baseline they hold the stage to (loop entry vs. the persisted iteration
+    start).
+    """
+    absorbed = committed_baseline_dirt(before, after, repo_root)
+    absorbed_set = set(absorbed)
+    residue = [
+        entry for entry in user_visible_changes(before, after)
+        if entry not in absorbed_set
+    ]
+    return residue, absorbed
+
+
+def committed_baseline_dirt(
+    before: WorkspaceState,
+    after: WorkspaceState,
+    repo_root: Path,
+) -> list[str]:
+    """Baseline entries the stage absorbed by committing them unchanged.
+
+    A user-visible entry present in ``before`` and absent from ``after``
+    counts only when its path is in ``git diff before.head..after.head``
+    AND the committed blob has exactly the content the baseline worktree
+    held (or the baseline deletion is now committed). A stage that threw
+    the user's edit away and committed its own version of the file is not
+    absorbing dirt — that entry stays residue so the attempt is rejected
+    instead of silently losing the user's work.
+    """
+    if not before.head or not after.head or before.head == after.head:
+        return []
+    committed_paths = {
+        path
+        for entry in _committed_path_entries(before, after, repo_root)
+        for path in _parse_porcelain_paths(entry)
+    }
+    if not committed_paths:
+        return []
+    after_entries = set(after.lines())
+    absorbed: list[str] = []
+    for entry in before.user_visible_lines():
+        if entry in after_entries:
+            continue
+        paths = _parse_porcelain_paths(entry)
+        if len(paths) != 1 or paths[0] not in committed_paths:
+            continue  # renames and unparsable entries stay residue
+        path = paths[0]
+        baseline = before.path_fingerprints.get(path)
+        committed = _committed_blob_sha256(repo_root, after.head, path)
+        if baseline == "missing":
+            if committed is None:
+                absorbed.append(entry)  # baseline deletion now committed
+            continue
+        baseline_hash = _fingerprint_content_hash(baseline)
+        if baseline_hash is not None and baseline_hash == committed:
+            absorbed.append(entry)
+    return absorbed
 
 
 def _committed_path_entries(
@@ -333,8 +444,10 @@ def detect_out_of_scope_writes(
         if (
             key in before.watched_fingerprints
             and key in after.watched_fingerprints
-            and before.watched_fingerprints[key]
-            != after.watched_fingerprints[key]
+            and _watched_changed(
+                before.watched_fingerprints[key],
+                after.watched_fingerprints[key],
+            )
         ):
             # Synthetic porcelain-shaped entry: direct protected-path
             # fingerprints must remain effective even when Git status is
@@ -370,8 +483,10 @@ def detect_out_of_scope_writes(
                 for key in watched_keys
             )
             content_changed = any(
-                before.watched_fingerprints.get(key)
-                != after.watched_fingerprints.get(key)
+                _watched_changed(
+                    before.watched_fingerprints.get(key),
+                    after.watched_fingerprints.get(key),
+                )
                 for key in watched_keys
             )
             # A committed tree change is a mutation even when file bytes are

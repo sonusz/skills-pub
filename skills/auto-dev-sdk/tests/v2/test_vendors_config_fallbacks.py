@@ -21,18 +21,18 @@ def _load(yml: str):
 _GOOD = """
 stages:
   design: {vendor: claude, model: claude-fable-5, effort: max, min_quota_pct: 20,
-           fallbacks: [{vendor: cursor, model: gpt-5.6-sol-xhigh, effort: max, min_quota_pct: 15},
-                       {vendor: codex, model: gpt-5.6-sol, min_quota_pct: 10}]}
-  build: {vendor: cursor, model: gpt-5.6-sol-xhigh, effort: max}
+           fallbacks: [{vendor: cursor, model: gpt-6-astra-xhigh, effort: max, min_quota_pct: 15},
+                       {vendor: codex, model: gpt-6-astra, min_quota_pct: 10}]}
+  build: {vendor: cursor, model: gpt-6-astra-xhigh, effort: max}
   review: {vendor: claude, model: claude-fable-5, effort: high}
-  spec: {vendor: cursor, model: gpt-5.6-sol-xhigh, effort: medium}
+  spec: {vendor: cursor, model: gpt-6-astra-xhigh, effort: medium}
 panel:
   reviewers:
     - {vendor: claude, model: claude-fable-5, effort: max, min_quota_pct: 25,
        fallbacks: [{vendor: cursor, model: gemini-3.1-pro, min_quota_pct: 10}]}
     - {vendor: cursor, model: gemini-3.1-pro, effort: max}
   synthesizer: {vendor: claude, model: claude-sonnet-5, effort: high, min_quota_pct: 30,
-                fallbacks: [{vendor: codex, model: gpt-5.6-sol, min_quota_pct: 10}]}
+                fallbacks: [{vendor: codex, model: gpt-6-astra, min_quota_pct: 10}]}
 probe: {vendor: claude, model: claude-haiku-4-5, effort: low, min_quota_pct: 5,
         fallbacks: [{vendor: codex, model: gpt-5.6-luna, min_quota_pct: 5}]}
 """
@@ -47,6 +47,7 @@ def test_parses_all_roles():
     assert [f.vendor for f in c.panel.reviewers[0].fallbacks] == ["cursor"]
     assert c.panel.synthesizer.min_quota_pct == 30.0
     assert c.panel.min_responding_reviewers == 2
+    assert c.panel.fail_fast_confirmed_quota is False
     assert [f.vendor for f in c.panel.synthesizer.fallbacks] == ["codex"]
     assert c.probe.min_quota_pct == 5.0
     assert [f.vendor for f in c.probe.fallbacks] == ["codex"]
@@ -71,6 +72,25 @@ def test_backward_compatible_without_quota_fields():
     assert c.stages["design"].min_quota_pct is None
     assert c.stages["design"].fallbacks == ()
     assert c.panel.min_responding_reviewers == 2
+    assert c.panel.fail_fast_confirmed_quota is False
+
+
+def test_parses_panel_fail_fast_confirmed_quota():
+    c = _load(_GOOD.replace(
+        "panel:\n", "panel:\n  fail_fast_confirmed_quota: true\n", 1,
+    ))
+    assert c.panel.fail_fast_confirmed_quota is True
+
+
+@pytest.mark.parametrize("value", ["yes", 1, [], {}])
+def test_rejects_non_boolean_panel_fail_fast_confirmed_quota(value):
+    rendered = repr(value).lower()
+    with pytest.raises(ConfigError, match="fail_fast_confirmed_quota"):
+        _load(_GOOD.replace(
+            "panel:\n",
+            f"panel:\n  fail_fast_confirmed_quota: {rendered}\n",
+            1,
+        ))
 
 
 def test_accepts_explicit_single_reviewer_quorum():

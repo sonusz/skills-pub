@@ -27,7 +27,7 @@ STAGES = ("design", "build", "spec", "review")
 # Vendors allowed for coding (R3: agy excluded; panel-review handles it separately).
 # `openai` and `codex` both route through the Codex CLI in shared/vendors.
 # `cursor` (cursor-agent) is allowed for stages too — it pins a model SKU with
-# effort encoded in the model id (e.g. `gpt-5.6-sol-high`); the `--effort` flag has
+# effort encoded in the model id (e.g. `gpt-6-astra-high`); the `--effort` flag has
 # no cursor analog (see shared/vendors/vendors.conf).
 ALLOWED_VENDORS = {"claude", "codex", "openai", "cursor", "grok"}
 
@@ -211,6 +211,10 @@ class PanelConfig:
     # this only controls how many independent responses are required when a
     # retried reviewer is confirmed quota-exhausted.
     min_responding_reviewers: int = DEFAULT_PANEL_MIN_RESPONDING_REVIEWERS
+    # Opt-in transport fail-fast. A reviewer transport failure is force-probed
+    # immediately; positively confirmed quota exhaustion cancels the whole
+    # panel before retries or synthesis. Default preserves quorum behavior.
+    fail_fast_confirmed_quota: bool = False
 
 
 @dataclass(frozen=True)
@@ -496,6 +500,12 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
             f"configured reviewer count {len(reviewers)}"
         )
 
+    fail_fast_confirmed_quota = raw.get("fail_fast_confirmed_quota", False)
+    if not isinstance(fail_fast_confirmed_quota, bool):
+        raise ConfigError(
+            f"{path}: panel.fail_fast_confirmed_quota must be bool"
+        )
+
     return PanelConfig(
         reviewers=reviewers,
         synthesizer=synthesizer,
@@ -506,6 +516,7 @@ def _parse_panel(raw: Any, path: Path) -> PanelConfig:
             "synthesizer_probe_interval_sec", DEFAULT_PANEL_SYNTHESIZER_TIMEOUT_SEC
         ),
         min_responding_reviewers=min_responding,
+        fail_fast_confirmed_quota=fail_fast_confirmed_quota,
     )
 
 
