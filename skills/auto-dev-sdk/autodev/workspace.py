@@ -21,8 +21,9 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from autodev.artifacts.design_packet import _ref_content_hash
 from autodev.errors import PreflightError
-from autodev.state.hashing import hash_bytes, hash_file
+from autodev.state.hashing import hash_file
 
 # Harness-internal filename patterns — NOT considered "dirty" for the
 # pipeline-blocking check. Per-feature state + subprocess byproducts.
@@ -278,20 +279,6 @@ def _fingerprint_content_hash(fingerprint: str | None) -> str | None:
     return fingerprint[index + len(marker):] if index >= 0 else None
 
 
-def _committed_blob_sha256(repo_root: Path, ref: str, path: str) -> str | None:
-    """``hash_file``-format digest of ``path`` at ``ref``; None if absent."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo_root), "cat-file", "blob", f"{ref}:{path}"],
-            capture_output=True, check=False, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return hash_bytes(proc.stdout)
-
-
 _MTIME_FIELD_RE = re.compile(r":mtime_ns=\d+")
 
 
@@ -367,7 +354,7 @@ def committed_baseline_dirt(
             continue  # renames and unparsable entries stay residue
         path = paths[0]
         baseline = before.path_fingerprints.get(path)
-        committed = _committed_blob_sha256(repo_root, after.head, path)
+        committed = _ref_content_hash(repo_root, after.head, path)
         if baseline == "missing":
             if committed is None:
                 absorbed.append(entry)  # baseline deletion now committed

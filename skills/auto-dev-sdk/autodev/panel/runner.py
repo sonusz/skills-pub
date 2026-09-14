@@ -1504,6 +1504,57 @@ def _dispatch_reviewer_slots(
             raise pending_error
 
 
+def _dispatch_slots_and_persist_cache(
+    *,
+    gate_label: str,
+    reviewer_prompt: str,
+    reviewer_resume_prompt: str,
+    reviewer_results: list[ReviewerResult],
+    prior_failures: dict[str, dict],
+    panel_config: PanelConfig,
+    feature_active: Path,
+    vendor_cwd: Path,
+    probe_config: ProbeConfig | None,
+    log_emit: Callable[[dict], None] | None,
+    metadata: dict,
+    per_vendor_prompts: dict[str, tuple[str, str]] | None = None,
+    fail_fast_state: _PanelFailFastState | None = None,
+) -> None:
+    """Dispatch unsettled slots, then persist the reviewer cache — always.
+
+    Persisting in ``finally`` means a fail-fast quota halt raised from a
+    worker does not discard the reviewers that did finish: quota-resume
+    re-runs only the missing slot. Results are sorted into configured
+    vendor order first so the audit output is stable.
+    """
+    try:
+        _dispatch_reviewer_slots(
+            gate_label=gate_label,
+            reviewer_prompt=reviewer_prompt,
+            reviewer_resume_prompt=reviewer_resume_prompt,
+            reviewer_results=reviewer_results,
+            prior_failures=prior_failures,
+            panel_config=panel_config,
+            feature_active=feature_active,
+            vendor_cwd=vendor_cwd,
+            probe_config=probe_config,
+            log_emit=log_emit,
+            per_vendor_prompts=per_vendor_prompts,
+            fail_fast_state=fail_fast_state,
+        )
+    finally:
+        order = {r.vendor: i for i, r in enumerate(panel_config.reviewers)}
+        reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
+        _write_reviewer_cache(
+            feature_active=feature_active,
+            gate_label=gate_label,
+            reviewer_specs=panel_config.reviewers,
+            metadata=metadata,
+            reviewer_results=reviewer_results,
+            prior_failures=prior_failures,
+        )
+
+
 def _quota_skip_raw(result: ReviewerResult) -> str:
     confirmation = result.quota_confirmation or {}
     source = confirmation.get("source", "quota-check")
@@ -2339,40 +2390,21 @@ def _run_one_group_pipeline(
             except Exception:
                 pass
 
-    def persist_cache() -> None:
-        # Sort by configured vendor order for stable audit output.
-        order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
-        reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
-        _write_reviewer_cache(
-            feature_active=feature_active,
-            gate_label=group_spec["name"],
-            reviewer_specs=cfg.reviewers,
-            metadata=metadata,
-            reviewer_results=reviewer_results,
-            prior_failures=prior_failures,
-        )
-
-    try:
-        _dispatch_reviewer_slots(
-            gate_label=group_spec["name"],
-            reviewer_prompt=group_spec["reviewer_prompt"],
-            reviewer_resume_prompt=group_spec["reviewer_resume_prompt"],
-            reviewer_results=reviewer_results,
-            prior_failures=prior_failures,
-            panel_config=cfg,
-            feature_active=feature_active,
-            vendor_cwd=vendor_cwd,
-            probe_config=probe_config,
-            log_emit=log_emit,
-            per_vendor_prompts=per_vendor_prompts,
-            fail_fast_state=fail_fast_state,
-        )
-    except BaseException:
-        # A fail-fast quota halt must not discard the reviewers that did
-        # finish: persist them so quota-resume re-runs only the missing slot.
-        persist_cache()
-        raise
-    persist_cache()
+    _dispatch_slots_and_persist_cache(
+        gate_label=group_spec["name"],
+        reviewer_prompt=group_spec["reviewer_prompt"],
+        reviewer_resume_prompt=group_spec["reviewer_resume_prompt"],
+        reviewer_results=reviewer_results,
+        prior_failures=prior_failures,
+        panel_config=cfg,
+        feature_active=feature_active,
+        vendor_cwd=vendor_cwd,
+        probe_config=probe_config,
+        log_emit=log_emit,
+        metadata=metadata,
+        per_vendor_prompts=per_vendor_prompts,
+        fail_fast_state=fail_fast_state,
+    )
 
     per_vendor_raw = _per_vendor_raw(reviewer_results)
 
@@ -2640,37 +2672,20 @@ def run_panel_gate_internal(
     fail_fast_state = (
         _PanelFailFastState() if cfg.fail_fast_confirmed_quota else None
     )
-    def persist_cache() -> None:
-        # Preserve reviewer order as declared in config (stable audit).
-        order = {r.vendor: i for i, r in enumerate(cfg.reviewers)}
-        reviewer_results.sort(key=lambda r: order.get(r.vendor, 999))
-        _write_reviewer_cache(
-            feature_active=feature_active,
-            gate_label=gate,
-            reviewer_specs=cfg.reviewers,
-            metadata=metadata,
-            reviewer_results=reviewer_results,
-            prior_failures=prior_failures,
-        )
-
-    try:
-        _dispatch_reviewer_slots(
-            gate_label=gate,
-            reviewer_prompt=reviewer_prompt,
-            reviewer_resume_prompt=reviewer_resume_prompt,
-            reviewer_results=reviewer_results,
-            prior_failures=prior_failures,
-            panel_config=cfg,
-            feature_active=feature_active,
-            vendor_cwd=vendor_cwd,
-            probe_config=probe_config,
-            log_emit=log_emit,
-            fail_fast_state=fail_fast_state,
-        )
-    except BaseException:
-        persist_cache()
-        raise
-    persist_cache()
+    _dispatch_slots_and_persist_cache(
+        gate_label=gate,
+        reviewer_prompt=reviewer_prompt,
+        reviewer_resume_prompt=reviewer_resume_prompt,
+        reviewer_results=reviewer_results,
+        prior_failures=prior_failures,
+        panel_config=cfg,
+        feature_active=feature_active,
+        vendor_cwd=vendor_cwd,
+        probe_config=probe_config,
+        log_emit=log_emit,
+        metadata=metadata,
+        fail_fast_state=fail_fast_state,
+    )
 
     per_vendor_raw = _per_vendor_raw(reviewer_results)
     _require_panel_quorum(

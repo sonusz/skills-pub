@@ -414,18 +414,6 @@ def _seed_feature(active: Path, *, ids: list[str]) -> None:
     write_accepted_design(active)
 
 
-def _baseline_payload(repo_root: Path) -> dict:
-    """The workspace_baseline an iteration context records at prepare time."""
-    from autodev.workspace import snapshot
-
-    snap = snapshot(repo_root)
-    return {
-        "raw": snap.raw,
-        "head": snap.head,
-        "path_fingerprints": dict(snap.path_fingerprints),
-    }
-
-
 def _count(active: Path, stage: str) -> int:
     p = active / "scratch" / f".{stage}.count"
     return int(p.read_text()) if p.exists() else 0
@@ -1177,65 +1165,6 @@ def test_next_stage_requires_completed_ralph_loop_before_index(git_repo, feature
     assert orch._next_stage_name(feature_active) == "implementation_index"
 
 
-def test_restart_reviews_current_build_without_dispatching_build_vendor(
-    git_repo, feature_active, monkeypatch,
-):
-    _seed_feature(feature_active, ids=["t-1"])
-    # The fake vendor script lives in the repo root; write it before the
-    # baseline is recorded or the predicate rightly reports it as residue.
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-    (feature_active / "build.json").write_text(json.dumps({
-        "source": str(feature_active / "scope.json"),
-        "source_hash": hash_file(feature_active / "scope.json"),
-        "written": "2026-04-21",
-        "test_cmd_run": "pytest",
-        "test_exit_code": 0,
-        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
-        "files_changed": ["src/generated.py"],
-        "lint": {"passed": True, "cmd": "n/a"},
-        "deviations": [],
-        "blocking": False,
-        "workspace_dirty_at_stage_end": False,
-    }), encoding="utf-8")
-    (feature_active / "ralph-iteration-context.json").write_text(json.dumps({
-        "schema": 1,
-        "iteration": 1,
-        "status": "build_pending",
-        "written_at": "2026-04-21T00:00:00+00:00",
-        "repo_root": str(git_repo),
-        "trace_hash": hash_file(feature_active / "trace.md"),
-        "before_ref": head,
-        "after_ref": head,  # recorded when the build subprocess returned
-        "build_hash_before": None,
-        "workspace_baseline": _baseline_payload(git_repo),
-        "previous_ralph_review_path": None,
-        "previous_ralph_review_hash": None,
-        "diff": None,
-    }), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-
-    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 0
-    assert _count(feature_active, "ralph-review") == 1
-    context = json.loads(
-        (feature_active / "ralph-iteration-context.json").read_text(encoding="utf-8")
-    )
-    assert context["status"] == "ready_for_review"
-    assert context["before_ref"] == head
-    assert context["after_ref"] == head
-
-
 def test_resume_reruns_partially_persisted_iteration(git_repo, feature_active, monkeypatch):
     _seed_feature(feature_active, ids=["t-1"])
     ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
@@ -1517,481 +1446,6 @@ def test_build_retry_survives_session_reset_helper_failure(
     )
 
 
-def test_pending_context_with_unchanged_build_json_reruns_build(
-    git_repo, feature_active, monkeypatch,
-):
-    """A pending iteration whose build never returned is built, not reviewed."""
-    _seed_feature(feature_active, ids=["t-1"])
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-    build_path = feature_active / "build.json"
-    build_path.write_text(json.dumps({
-        "source": str(feature_active / "scope.json"),
-        "source_hash": hash_file(feature_active / "scope.json"),
-        "written": "2026-04-21",
-        "test_cmd_run": "pytest",
-        "test_exit_code": 0,
-        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
-        "files_changed": ["src/generated.py"],
-        "lint": {"passed": True, "cmd": "n/a"},
-        "deviations": [],
-        "blocking": False,
-        "workspace_dirty_at_stage_end": False,
-    }), encoding="utf-8")
-    (feature_active / "ralph-iteration-context.json").write_text(json.dumps({
-        "schema": 1,
-        "iteration": 1,
-        "status": "build_pending",
-        "written_at": "2026-04-21T00:00:00+00:00",
-        "repo_root": str(git_repo),
-        "trace_hash": hash_file(feature_active / "trace.md"),
-        "before_ref": head,
-        "after_ref": None,
-        # build.json is exactly what it was when the iteration started.
-        "build_hash_before": hash_file(build_path),
-        "previous_ralph_review_path": None,
-        "previous_ralph_review_hash": None,
-        "diff": None,
-    }), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-
-    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-    context = json.loads(
-        (feature_active / "ralph-iteration-context.json").read_text(encoding="utf-8")
-    )
-    assert context["iteration"] == 1
-    assert context["before_ref"] == head
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def test_rejected_build_with_pending_context_is_retried_not_reviewed(
-    git_repo, feature_active, monkeypatch,
-):
-    """build.json is promoted before the residue check rejects the attempt.
-
-    If the harness dies before the retry lands, the pending context and a
-    moved build.json look like a landed build; the residue still on disk
-    says otherwise, so the restart must run build again, not review it.
-    """
-    _seed_feature(feature_active, ids=["t-1"])
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    (feature_active / "build-output-rejection.json").write_text(json.dumps({
-        "stage": "build", "attempt": 1, "kind": "uncommitted_product_changes",
-        "detail": "left src/x.py staged",
-    }), encoding="utf-8")
-    leftover = git_repo / "src" / "x.py"
-    leftover.parent.mkdir(parents=True, exist_ok=True)
-    leftover.write_text("VALUE = 1\n", encoding="utf-8")
-    subprocess.run(["git", "add", "--", "src/x.py"], cwd=str(git_repo), check=True)
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
-
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-    assert not (feature_active / "build-output-rejection.json").exists()
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def test_stale_rejection_note_does_not_block_resume_of_clean_landed_build(
-    git_repo, feature_active, monkeypatch,
-):
-    """Attempt 2 fixed attempt 1's residue and landed; the harness died
-    before unlinking the note. The clean landed build is reviewed, not
-    rebuilt against a stale amendment request."""
-    _seed_feature(feature_active, ids=["t-1"])
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    note = feature_active / "build-output-rejection.json"
-    note.write_text(json.dumps({
-        "stage": "build", "attempt": 1, "kind": "uncommitted_product_changes",
-        "detail": "left src/x.py staged",
-    }), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 0
-    assert _count(feature_active, "ralph-review") == 1
-    assert not note.exists()
-    assert any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def test_pending_build_without_recorded_post_build_ref_is_rebuilt(
-    git_repo, feature_active, monkeypatch,
-):
-    """No post-build ref means the harness died mid-build: nothing vouches
-    for build.json, so it is rebuilt even though its hash moved."""
-    _seed_feature(feature_active, ids=["t-1"])
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    context_path = feature_active / "ralph-iteration-context.json"
-    context = json.loads(context_path.read_text(encoding="utf-8"))
-    context["after_ref"] = None
-    context_path.write_text(json.dumps(context), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def test_unreachable_baseline_head_rebuilds_instead_of_crashing(
-    git_repo, feature_active, monkeypatch,
-):
-    """History rewritten under a pending iteration must not wedge the run."""
-    _seed_feature(feature_active, ids=["t-1"])
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    context_path = feature_active / "ralph-iteration-context.json"
-    context = json.loads(context_path.read_text(encoding="utf-8"))
-    context["workspace_baseline"]["head"] = "0" * 40
-    context_path.write_text(json.dumps(context), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-    assert orch._current_build_awaits_review(feature_active) is False
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-
-
-def test_interrupted_seal_resumes_with_recorded_post_build_ref(
-    git_repo, feature_active, monkeypatch,
-):
-    """The harness dies after the build returned but before the iteration
-    is sealed; the operator commits on the branch; the resumed review must
-    cover the build's own delta, not the operator's commit."""
-    _seed_feature(feature_active, ids=["t-1"])
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    monkeypatch.setenv("AUTODEV_PHASE5B_AMEND_BUILD", "1")
-    monkeypatch.setenv("AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]))
-    orch = _orch(git_repo, vendor_bin)
-
-    def crash(context_path):
-        raise RuntimeError("harness died before sealing")
-
-    monkeypatch.setattr(orch, "_finalize_ralph_iteration_context", crash)
-    with pytest.raises(RuntimeError, match="before sealing"):
-        orch.advance_one("demo")
-    context_path = feature_active / "ralph-iteration-context.json"
-    pending = json.loads(context_path.read_text(encoding="utf-8"))
-    assert pending["status"] == "build_pending"
-    build_head = pending["after_ref"]
-    assert build_head == subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-
-    unrelated = git_repo / "docs" / "operator-note.md"
-    unrelated.write_text("hotfix while the harness was down\n", encoding="utf-8")
-    subprocess.run(["git", "add", "--", "docs/operator-note.md"], cwd=str(git_repo), check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "operator hotfix"], cwd=str(git_repo), check=True)
-    operator_head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-    assert operator_head != build_head
-
-    resumed = _orch(git_repo, vendor_bin)
-    result = resumed.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-    sealed = json.loads(context_path.read_text(encoding="utf-8"))
-    assert sealed["status"] == "ready_for_review"
-    assert sealed["after_ref"] == build_head
-    assert operator_head not in sealed["diff"]["patch_command"]
-    from autodev.artifacts.build import load_build
-    assert load_build(feature_active / "build.json").sealed_ref == build_head
-
-
-def test_pending_context_with_unchanged_build_json_reruns_build(
-    git_repo, feature_active, monkeypatch,
-):
-    """A pending iteration whose build never returned is built, not reviewed."""
-    _seed_feature(feature_active, ids=["t-1"])
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-    build_path = feature_active / "build.json"
-    build_path.write_text(json.dumps({
-        "source": str(feature_active / "scope.json"),
-        "source_hash": hash_file(feature_active / "scope.json"),
-        "written": "2026-04-21",
-        "test_cmd_run": "pytest",
-        "test_exit_code": 0,
-        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
-        "files_changed": ["src/generated.py"],
-        "lint": {"passed": True, "cmd": "n/a"},
-        "deviations": [],
-        "blocking": False,
-        "workspace_dirty_at_stage_end": False,
-    }), encoding="utf-8")
-    (feature_active / "ralph-iteration-context.json").write_text(json.dumps({
-        "schema": 1,
-        "iteration": 1,
-        "status": "build_pending",
-        "written_at": "2026-04-21T00:00:00+00:00",
-        "repo_root": str(git_repo),
-        "trace_hash": hash_file(feature_active / "trace.md"),
-        "before_ref": head,
-        "after_ref": None,
-        # build.json is exactly what it was when the iteration started.
-        "build_hash_before": hash_file(build_path),
-        "previous_ralph_review_path": None,
-        "previous_ralph_review_hash": None,
-        "diff": None,
-    }), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-
-    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-    context = json.loads(
-        (feature_active / "ralph-iteration-context.json").read_text(encoding="utf-8")
-    )
-    assert context["iteration"] == 1
-    assert context["before_ref"] == head
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def test_rejected_build_with_pending_context_is_retried_not_reviewed(
-    git_repo, feature_active, monkeypatch,
-):
-    """build.json is promoted before the residue check rejects the attempt.
-
-    If the harness dies before the retry lands, the pending context and a
-    moved build.json look like a landed build; the rejection note on disk
-    says otherwise, so the restart must run build again, not review it.
-    """
-    _seed_feature(feature_active, ids=["t-1"])
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-    build_path = feature_active / "build.json"
-    build_path.write_text(json.dumps({
-        "source": str(feature_active / "scope.json"),
-        "source_hash": hash_file(feature_active / "scope.json"),
-        "written": "2026-04-21",
-        "test_cmd_run": "pytest",
-        "test_exit_code": 0,
-        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
-        "files_changed": ["src/generated.py"],
-        "lint": {"passed": True, "cmd": "n/a"},
-        "deviations": [],
-        "blocking": False,
-        "workspace_dirty_at_stage_end": False,
-    }), encoding="utf-8")
-    (feature_active / "ralph-iteration-context.json").write_text(json.dumps({
-        "schema": 1,
-        "iteration": 1,
-        "status": "build_pending",
-        "written_at": "2026-04-21T00:00:00+00:00",
-        "repo_root": str(git_repo),
-        "trace_hash": hash_file(feature_active / "trace.md"),
-        "before_ref": head,
-        "after_ref": None,
-        "build_hash_before": None,
-        "previous_ralph_review_path": None,
-        "previous_ralph_review_hash": None,
-        "diff": None,
-    }), encoding="utf-8")
-    (feature_active / "build-output-rejection.json").write_text(json.dumps({
-        "stage": "build", "attempt": 1, "kind": "uncommitted_product_changes",
-        "detail": "left src/x.py staged",
-    }), encoding="utf-8")
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
-
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-    assert not (feature_active / "build-output-rejection.json").exists()
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def _seed_landed_pending_iteration(git_repo: Path, feature_active: Path) -> str:
-    """build.json landed under a still-pending context; returns HEAD."""
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
-    ).strip()
-    baseline = _baseline_payload(git_repo)
-    (feature_active / "build.json").write_text(json.dumps({
-        "source": str(feature_active / "scope.json"),
-        "source_hash": hash_file(feature_active / "scope.json"),
-        "written": "2026-04-21",
-        "test_cmd_run": "pytest",
-        "test_exit_code": 0,
-        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
-        "files_changed": ["src/generated.py"],
-        "lint": {"passed": True, "cmd": "n/a"},
-        "deviations": [],
-        "blocking": False,
-        "workspace_dirty_at_stage_end": False,
-    }), encoding="utf-8")
-    (feature_active / "ralph-iteration-context.json").write_text(json.dumps({
-        "schema": 1,
-        "iteration": 1,
-        "status": "build_pending",
-        "written_at": "2026-04-21T00:00:00+00:00",
-        "repo_root": str(git_repo),
-        "trace_hash": hash_file(feature_active / "trace.md"),
-        "before_ref": head,
-        "after_ref": head,  # recorded when the build subprocess returned
-        "build_hash_before": None,
-        "workspace_baseline": baseline,
-        "previous_ralph_review_path": None,
-        "previous_ralph_review_hash": None,
-        "diff": None,
-    }), encoding="utf-8")
-    return head
-
-
-def test_pending_build_with_uncommitted_residue_is_rebuilt_not_reviewed(
-    git_repo, feature_active, monkeypatch,
-):
-    """The harness died after build.json landed but before the residue
-    check: the landed build left product changes uncommitted, so it must be
-    rebuilt, never reviewed. The rebuild is held to the iteration's
-    persisted baseline, so it has to commit what the interrupted attempt
-    left behind (here the fake vendor commits the staged leftover)."""
-    _seed_feature(feature_active, ids=["t-1"])
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    leftover = git_repo / "src" / "leftover.py"
-    leftover.parent.mkdir(parents=True, exist_ok=True)
-    leftover.write_text("VALUE = 1\n", encoding="utf-8")
-    subprocess.run(["git", "add", "--", "src/leftover.py"], cwd=str(git_repo), check=True)
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-
-    orch = _orch(git_repo, vendor_bin)
-    assert orch._current_build_awaits_review(feature_active) is False
-    monkeypatch.setenv("AUTODEV_PHASE5B_COMMIT_BASELINE_ONCE", "1")
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
-
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert _count(feature_active, "ralph-review") == 1
-    assert subprocess.check_output(
-        ["git", "status", "--short", "--", "src/leftover.py"],
-        cwd=str(git_repo), text=True,
-    ) == ""
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
-def test_pending_build_with_out_of_scope_write_is_rebuilt_not_reviewed(
-    git_repo, feature_active, monkeypatch,
-):
-    """A landed build that escaped its write contract must not be reviewed."""
-    _seed_feature(feature_active, ids=["t-1"])
-    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
-    orch = _orch(git_repo, vendor_bin)
-    monkeypatch.setenv(
-        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
-    )
-
-    # Clean tree: the landed build is resumable as-is ...
-    assert orch._current_build_awaits_review(feature_active) is True
-
-    # ... unless the write-contract check reports an escape for it.
-    monkeypatch.setattr(
-        "autodev.orchestrator.detect_out_of_scope_writes",
-        lambda *args, **kwargs: ["P  docs/features/demo/active/prd.md"],
-    )
-    assert orch._current_build_awaits_review(feature_active) is False
-
-    result = orch.advance_one("demo")
-
-    assert result.success is True
-    assert _count(feature_active, "build") == 1
-    assert not any(
-        event.get("event") == "ralph-resumed-from-current-build"
-        for event in _read_log(feature_active)
-    )
-
-
 def test_restart_after_reviewer_crash_keeps_recorded_after_ref(
     git_repo, feature_active, monkeypatch,
 ):
@@ -2038,27 +1492,180 @@ def test_restart_after_reviewer_crash_keeps_recorded_after_ref(
     assert event["detail"]["after_ref"] == sealed["after_ref"]
 
 
-def test_rejected_pending_build_clears_pinned_post_build_ref(
+def _seed_iteration_context(
+    git_repo: Path, feature_active: Path, *, status: str,
+) -> str:
+    """Seed build.json plus an iteration-1 context in ``status``; returns HEAD."""
+    from autodev.orchestrator import _ralph_inputs_hash
+
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), text=True,
+    ).strip()
+    (feature_active / "build.json").write_text(json.dumps({
+        "source": str(feature_active / "scope.json"),
+        "source_hash": hash_file(feature_active / "scope.json"),
+        "written": "2026-04-21",
+        "test_cmd_run": "pytest",
+        "test_exit_code": 0,
+        "test_results": {"passed": 1, "failed": 0, "skipped": 0},
+        "files_changed": ["src/generated.py"],
+        "lint": {"passed": True, "cmd": "n/a"},
+        "deviations": [],
+        "blocking": False,
+        "workspace_dirty_at_stage_end": False,
+    }), encoding="utf-8")
+    sealed = status == "ready_for_review"
+    (feature_active / "ralph-iteration-context.json").write_text(json.dumps({
+        "schema": 1,
+        "iteration": 1,
+        "status": status,
+        "written_at": "2026-04-21T00:00:00+00:00",
+        "repo_root": str(git_repo),
+        "trace_hash": hash_file(feature_active / "trace.md"),
+        "inputs_hash": _ralph_inputs_hash(feature_active),
+        "before_ref": head,
+        "after_ref": head if sealed else None,
+        "previous_ralph_review_path": None,
+        "previous_ralph_review_hash": None,
+        "diff": {
+            "available": True,
+            "patch_command": ["git", "-C", str(git_repo), "diff",
+                              "--no-ext-diff", head, head, "--"],
+            "changed_files_command": ["git", "-C", str(git_repo), "diff",
+                                      "--no-ext-diff", "--name-status",
+                                      head, head, "--"],
+        } if sealed else None,
+    }), encoding="utf-8")
+    return head
+
+
+def test_restart_reviews_sealed_build_without_dispatching_build_vendor(
     git_repo, feature_active, monkeypatch,
 ):
-    """When the resume predicate rejects a landed attempt, the ref it pinned
-    must go with it: a rebuild killed after committing would otherwise be
-    sealed against this earlier commit on the next restart."""
+    """A finalized (sealed) iteration-1 context is reviewed as recorded."""
     _seed_feature(feature_active, ids=["t-1"])
     vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    leftover = git_repo / "src" / "leftover.py"
-    leftover.parent.mkdir(parents=True, exist_ok=True)
-    leftover.write_text("VALUE = 1\n", encoding="utf-8")
-    subprocess.run(["git", "add", "--", "src/leftover.py"], cwd=str(git_repo), check=True)
+    head = _seed_iteration_context(git_repo, feature_active, status="ready_for_review")
     ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
     orch = _orch(git_repo, vendor_bin)
-    context_path = feature_active / "ralph-iteration-context.json"
-    assert json.loads(context_path.read_text(encoding="utf-8"))["after_ref"]
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
 
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 0
+    assert _count(feature_active, "ralph-review") == 1
+    context = json.loads(
+        (feature_active / "ralph-iteration-context.json").read_text(encoding="utf-8")
+    )
+    assert context["status"] == "ready_for_review"
+    assert context["before_ref"] == head
+    assert context["after_ref"] == head
+    assert any(
+        event.get("event") == "ralph-resumed-from-current-build"
+        for event in _read_log(feature_active)
+    )
+
+
+def test_pending_context_is_rebuilt_not_reviewed(
+    git_repo, feature_active, monkeypatch,
+):
+    """An unsealed context is rebuilt whatever build.json looks like: the
+    harness may have died before validating it. The original before_ref is
+    kept so the reviewer still sees the whole iteration's delta."""
+    _seed_feature(feature_active, ids=["t-1"])
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    head = _seed_iteration_context(git_repo, feature_active, status="build_pending")
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    orch = _orch(git_repo, vendor_bin)
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    assert StalenessCascade(feature_active).next_stage() == "implementation_index"
     assert orch._current_build_awaits_review(feature_active) is False
 
-    assert json.loads(context_path.read_text(encoding="utf-8"))["after_ref"] is None
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 1
+    assert _count(feature_active, "ralph-review") == 1
+    context = json.loads(
+        (feature_active / "ralph-iteration-context.json").read_text(encoding="utf-8")
+    )
+    assert context["iteration"] == 1
+    assert context["before_ref"] == head
+    assert not any(
+        event.get("event") == "ralph-resumed-from-current-build"
+        for event in _read_log(feature_active)
+    )
+
+
+def test_crash_before_seal_rebuilds_then_reviews_once(
+    git_repo, feature_active, monkeypatch,
+):
+    """Dying between the build returning and the seal costs one rebuild;
+    the operator's later commit is not folded into the reviewed delta."""
+    _seed_feature(feature_active, ids=["t-1"])
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    monkeypatch.setenv("AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]))
+    orch = _orch(git_repo, vendor_bin)
+
+    def crash(context_path):
+        raise RuntimeError("harness died before sealing")
+
+    monkeypatch.setattr(orch, "_finalize_ralph_iteration_context", crash)
+    with pytest.raises(RuntimeError, match="before sealing"):
+        orch.advance_one("demo")
+    context_path = feature_active / "ralph-iteration-context.json"
+    pending = json.loads(context_path.read_text(encoding="utf-8"))
+    assert pending["status"] == "build_pending"
+    assert _count(feature_active, "build") == 1
+
+    resumed = _orch(git_repo, vendor_bin)
+    result = resumed.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 2
+    assert _count(feature_active, "ralph-review") == 1
+    sealed = json.loads(context_path.read_text(encoding="utf-8"))
+    assert sealed["status"] == "ready_for_review"
+    assert sealed["before_ref"] == pending["before_ref"]
+    assert not any(
+        event.get("event") == "ralph-resumed-from-current-build"
+        for event in _read_log(feature_active)
+    )
+
+
+def test_sealed_context_with_unresolvable_refs_is_rebuilt(
+    git_repo, feature_active, monkeypatch,
+):
+    """History rewritten under a sealed iteration must not hand the reviewer
+    a failing diff command; the iteration is rebuilt from the current HEAD."""
+    _seed_feature(feature_active, ids=["t-1"])
+    vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
+    _seed_iteration_context(git_repo, feature_active, status="ready_for_review")
+    context_path = feature_active / "ralph-iteration-context.json"
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    context["before_ref"] = "0" * 40
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    ov.record_acknowledge_dirty(feature_active, reason="pytest", who="pytest")
+    orch = _orch(git_repo, vendor_bin)
+    monkeypatch.setenv(
+        "AUTODEV_PHASE5B_SEQUENCE", json.dumps([{"t-1": "Fully"}]),
+    )
+    assert orch._current_build_awaits_review(feature_active) is False
+
+    result = orch.advance_one("demo")
+
+    assert result.success is True
+    assert _count(feature_active, "build") == 1
+    assert _count(feature_active, "ralph-review") == 1
+    rebuilt = json.loads(context_path.read_text(encoding="utf-8"))
+    assert rebuilt["before_ref"] != "0" * 40
 
 
 def test_operator_edits_during_pause_are_not_build_residue(
@@ -2069,11 +1676,7 @@ def test_operator_edits_during_pause_are_not_build_residue(
     loop entry, so that file is theirs to keep, not residue."""
     _seed_feature(feature_active, ids=["t-1"])
     vendor_bin = _write_fake_vendor(git_repo / "fake_vendor.py")
-    _seed_landed_pending_iteration(git_repo, feature_active)
-    context_path = feature_active / "ralph-iteration-context.json"
-    context = json.loads(context_path.read_text(encoding="utf-8"))
-    context["after_ref"] = None  # the build never returned
-    context_path.write_text(json.dumps(context), encoding="utf-8")
+    _seed_iteration_context(git_repo, feature_active, status="build_pending")
     notes = git_repo / "src" / "notes.py"
     notes.parent.mkdir(parents=True, exist_ok=True)
     notes.write_text("# operator scratch\n", encoding="utf-8")
@@ -2093,3 +1696,33 @@ def test_operator_edits_during_pause_are_not_build_residue(
         event.get("event") == "output-rejected-retrying"
         for event in _read_log(feature_active)
     )
+
+
+def test_design_change_before_first_review_starts_a_fresh_iteration_context(
+    git_repo, feature_active,
+):
+    """Re-entry is keyed on every Ralph input, not trace.md alone: a design
+    edit with an unchanged trace on iteration 1 (where the ralph-state reset
+    cannot fire yet) must not carry the old before_ref forward."""
+    _seed_feature(feature_active, ids=["t-1"])
+    orch = _orch(git_repo, _write_fake_vendor(git_repo / "fake_vendor.py"))
+    context_path = orch._prepare_ralph_iteration_context(feature_active)
+    original = json.loads(context_path.read_text(encoding="utf-8"))
+
+    # Unrelated commit moves HEAD, then design.md changes (trace untouched).
+    moved = git_repo / "src" / "moved.py"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    moved.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "src/moved.py"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "moved"], cwd=git_repo, check=True)
+    design = feature_active / "design.md"
+    design.write_text(
+        design.read_text(encoding="utf-8") + "\n<!-- revised -->\n", encoding="utf-8",
+    )
+
+    same_path = orch._prepare_ralph_iteration_context(feature_active)
+    fresh = json.loads(same_path.read_text(encoding="utf-8"))
+    assert fresh["iteration"] == 1
+    assert fresh["inputs_hash"] != original["inputs_hash"]
+    assert fresh["before_ref"] != original["before_ref"]
+    assert fresh["trace_hash"] == original["trace_hash"]
