@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Helpers for reading panel-review/vendors.yaml.
+# Helpers for reading the panel vendor config (vendors.yaml, or sample-vendors.yaml as fallback).
 #
 # This is intentionally a tiny parser for the fixed config shape in this skill,
 # not a general YAML implementation.
@@ -10,7 +10,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   exit 2
 fi
 
-PANEL_SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# A caller skill that reuses these scripts through a skills/panel-review link
+# (multi-lens-review) presets PANEL_SKILL_DIR so its own vendors.yaml /
+# sample-vendors.yaml and shared/vendors are used.
+PANEL_SKILL_DIR="${PANEL_SKILL_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PANEL_VENDORS_DIR="$PANEL_SKILL_DIR/shared/vendors"
 PANEL_VENDOR_CALL="$PANEL_VENDORS_DIR/scripts/call.sh"
 
@@ -119,11 +122,29 @@ panel_yaml_synthesis_id() {
   ' "$yaml_file"
 }
 
+# Machine-local config wins; the tracked sample (every vendor) is the fallback.
+panel_default_config() {
+  local local_yaml="$PANEL_SKILL_DIR/vendors.yaml"
+  local sample_yaml="$PANEL_SKILL_DIR/sample-vendors.yaml"
+
+  if [ -r "$local_yaml" ]; then
+    printf "%s\n" "$local_yaml"
+    return 0
+  fi
+  printf "note: %s not found; using %s (every vendor). Generate a local file with\n" \
+    "$local_yaml" "$sample_yaml" >&2
+  printf "      python3 %s/scripts/init-vendors.py --sample %s --out %s\n" \
+    "$PANEL_VENDORS_DIR" "$sample_yaml" "$local_yaml" >&2
+  printf "%s\n" "$sample_yaml"
+}
+
 panel_require_config() {
   local yaml_file="$1"
 
   if [ ! -r "$yaml_file" ]; then
-    printf "FAIL: cannot read vendors.yaml at %s\n" "$yaml_file" >&2
+    printf "FAIL: cannot read vendors config at %s\n" "$yaml_file" >&2
+    printf "      Generate one from the sample: python3 %s/scripts/init-vendors.py --sample %s/sample-vendors.yaml --out %s/vendors.yaml\n" \
+      "$PANEL_VENDORS_DIR" "$PANEL_SKILL_DIR" "$PANEL_SKILL_DIR" >&2
     return 2
   fi
   if [ ! -x "$PANEL_VENDOR_CALL" ]; then

@@ -1,0 +1,50 @@
+# sample-vendors.yaml — every vendor panel-review can call. Tracked by git.
+#
+# The scripts read `vendors.yaml` (machine-local, git-ignored). Generate it
+# from this file, keeping only the vendors that work on this machine:
+#
+#   python3 shared/vendors/scripts/init-vendors.py \
+#     --sample skills/panel-review/sample-vendors.yaml \
+#     --out    skills/panel-review/vendors.yaml
+#   bash skills/panel-review/scripts/doctor.sh      # then delete entries that fail
+#
+# When `vendors.yaml` is absent the scripts fall back to this sample and every
+# listed vendor is attempted; a call that fails is marked failed, and a run
+# needs at least two successful panel outputs.
+#
+# Each entry under `panel` receives the same manifest-only review prompt in
+# parallel and reads reviewed files from the configured audit root. The
+# `synthesis` entry receives that prompt plus panel outputs and produces the
+# final comparative report. Effort uses the shared vendor scale:
+# min, low, medium, high, xhigh, max. Vendor ids, CLI binaries, and known
+# model ids are catalogued in shared/vendors/sample-vendors.yaml.
+
+panel:
+  - id: openai
+    vendor: openai
+    effort: max
+    model: gpt-6-astra
+  - id: claude
+    vendor: claude
+    effort: max
+    model: opus
+  - id: agy
+    vendor: agy
+    effort: max
+    model: gemini-3.1-pro-high
+  - id: grok
+    vendor: grok
+    effort: max
+    model: grok-4.5
+  # Cursor ignores `effort`; the SKU in `model` carries it. List ids with
+  # `cursor-agent --list-models`.
+  - id: cursor
+    vendor: cursor
+    effort: medium
+    model: gemini-3.1-pro
+
+synthesis:
+  id: synthesis
+  vendor: claude
+  effort: high
+  model: claude-sonnet-5

@@ -66,7 +66,7 @@ Trigger the pre-flight when the user says "write a PRD", "draft requirements", "
 
 ## CLI install check
 
-Before invoking any `autodev` verb, run `autodev --help` or `command -v autodev`. If unavailable or broken, read [references/install.md](references/install.md) and install the Python package from this skill root. Use the installed `autodev` path immediately; do not invent `vendors.yml` model choices for target repos. If the SDK-root `vendors.yml` is missing, ask the user whether to copy `vendors.yml.example` or pass `AUTODEV_VENDORS_YML`.
+Before invoking any `autodev` verb, run `autodev --help` or `command -v autodev`. If unavailable or broken, read [references/install.md](references/install.md) and install the Python package from this skill root. Use the installed `autodev` path immediately; do not invent `vendors.yml` model choices for target repos. If the SDK-root `vendors.yml` is missing, ask the user whether to generate it from `sample-vendors.yml` (`python3 shared/vendors/scripts/init-vendors.py --sample sample-vendors.yml --out vendors.yml`) or pass `AUTODEV_VENDORS_YML`.
 
 In the whitelist below, `autodev` means either the PATH command or the resolved installed binary from the install reference.
 

@@ -79,12 +79,25 @@ while [ "$#" -gt 0 ]; do
 done
 
 PROMPT_FILE="${1:-}"
-VENDORS_YAML="${2:-$SCRIPT_DIR/../vendors.yaml}"
+VENDORS_YAML="${2:-$(panel_default_config)}"
 RUN_DIR="${3:-}"
 PANEL_CALL_TIMEOUT="${PANEL_CALL_TIMEOUT:-300}"
 # At the timeout deadline, keep waiting in windows of this many seconds while
 # the vendor is still producing output; kill only after a silent window.
 PANEL_CALL_TIMEOUT_EXTEND="${PANEL_CALL_TIMEOUT_EXTEND:-300}"
+# Optional cheap-model idle probe (shared/vendors README, "Idle Probe"): when a
+# call is silent past its timeout, ask this vendor whether to extend or kill
+# instead of killing mechanically. Unset keeps the mechanical watchdog.
+PANEL_IDLE_PROBE_ARGS=()
+if [ -n "${PANEL_IDLE_PROBE_VENDOR:-}" ]; then
+  PANEL_IDLE_PROBE_ARGS+=(--idle-probe-vendor "$PANEL_IDLE_PROBE_VENDOR")
+  if [ -n "${PANEL_IDLE_PROBE_MODEL:-}" ]; then
+    PANEL_IDLE_PROBE_ARGS+=(--idle-probe-model "$PANEL_IDLE_PROBE_MODEL")
+  fi
+  if [ -n "${PANEL_IDLE_PROBE_EFFORT:-}" ]; then
+    PANEL_IDLE_PROBE_ARGS+=(--idle-probe-effort "$PANEL_IDLE_PROBE_EFFORT")
+  fi
+fi
 
 if [ -z "$PROMPT_FILE" ] || [ -z "$RUN_DIR" ]; then
   usage >&2
@@ -198,6 +211,7 @@ launch_one() {
     --id "$id" \
     --timeout "$PANEL_CALL_TIMEOUT" \
     --timeout-extend "$PANEL_CALL_TIMEOUT_EXTEND" \
+    ${PANEL_IDLE_PROBE_ARGS[@]+"${PANEL_IDLE_PROBE_ARGS[@]}"} \
     --prompt-file "$PROMPT_FILE" \
     --output-dir "$RUN_DIR" \
     --min-success 1 > "$wrapper_log" 2>&1; then

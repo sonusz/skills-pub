@@ -28,6 +28,20 @@ panel reviewers, panel synthesizer, and the idle-timeout probe.
 Target repos do not need their own vendor config unless they
 intentionally override the harness defaults.
 
+`vendors.yml` is machine-local and git-ignored. The tracked template is
+`sample-vendors.yml`, which lists every vendor in every role; generate the
+local file from it and then edit by hand:
+
+```bash
+python3 shared/vendors/scripts/init-vendors.py \
+  --sample sample-vendors.yml --out vendors.yml
+```
+
+The generator removes panel reviewers whose CLI is not installed and clamps
+`min_responding_reviewers`; it only warns about `stages`, `synthesizer`, and
+`probe`, because a coding stage needs a vendor. Vendor ids and known model
+ids are catalogued in `shared/vendors/sample-vendors.yaml`.
+
 ```yaml
 stages:
   design:
@@ -311,4 +325,5 @@ runtime package, vendor config example, and tests:
 - `shared/vendors/` — bundled unified vendor shell adapter used by all
   harness-owned LLM calls
 - `tests/` — offline regression tests plus explicitly marked live tests
-- `vendors.yml.example` — current per-repo vendor config template
+- `sample-vendors.yml` — tracked template listing every vendor in every
+  role; `vendors.yml` (git-ignored) is generated from it per machine

@@ -35,7 +35,7 @@ require_value() {
   fi
 }
 
-VENDORS_YAML="$SCRIPT_DIR/../vendors.yaml"
+VENDORS_YAML="$(panel_default_config)"
 PROBE_TIMEOUT="${PANEL_DOCTOR_TIMEOUT:-60}"
 PROBE_PROMPT="reply with the single word READY"
 TROUBLESHOOTING_FILE="$PANEL_VENDORS_DIR/TROUBLESHOOTING.md"
@@ -142,7 +142,7 @@ probe_call() {
 }
 
 printf "Panel-review readiness probe (timeout: %ss per configured call)\n" "$PROBE_TIMEOUT"
-printf "  Config: %s\n" "$(cd "$(dirname "$VENDORS_YAML")" && pwd)/$(basename "$VENDORS_YAML")"
+printf "  Config: %s\n" "$(cd "$(dirname "$VENDORS_YAML")" && pwd -P)/$(basename "$VENDORS_YAML")"
 printf "  Vendor module: %s\n" "$PANEL_VENDOR_CALL"
 printf "  Probing configured calls in parallel...\n"
 if [ "$KEEP_OUTPUT" -eq 1 ]; then

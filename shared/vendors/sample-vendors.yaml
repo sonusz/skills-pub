@@ -1,0 +1,92 @@
+# shared/vendors/sample-vendors.yaml — reference catalog of every vendor the
+# shared module supports, with the model ids this repo has used. Tracked by
+# git. Copy entries from here into a skill's local `vendors.yaml` / `vendors.yml`
+# when you change vendors or models; do not edit a skill's sample to suit one
+# machine.
+#
+# Mental model
+#   shared/vendors/            one module that knows how to drive EVERY vendor CLI
+#   skills/<skill>/sample-vendors.yaml   tracked: every vendor that skill can use
+#   skills/<skill>/vendors.yaml          git-ignored: the sample pruned to what
+#                                        works on THIS machine
+#   shared/vendors/scripts/init-vendors.py   generates the local file from the
+#                                        sample (keeps vendors whose CLI is on PATH)
+#   skills/<skill>/scripts/doctor.sh     proves each configured call is ready;
+#                                        delete local entries that fail
+#
+# Effort scale (all vendors): min, low, medium, high, xhigh, max. The module
+# maps it to the nearest native setting; Cursor ignores it (see below).
+# Default model per vendor when a config omits `model`: shared/vendors/vendors.conf.
+# Readiness for a whole module: shared/vendors/scripts/doctor.sh.
+#
+# This file is also a valid panel-review-shaped config, so
+#   bash skills/panel-review/scripts/doctor.sh shared/vendors/sample-vendors.yaml
+# probes every vendor at once.
+
+panel:
+  # ── openai (alias: codex) ────────────────────────────────────────────────
+  # CLI: codex            install: npm i -g @openai/codex     auth: codex login
+  # Runs `codex exec` non-interactively. Models seen in this repo:
+  #   gpt-6-astra        (default in vendors.conf; needs a recent codex CLI —
+  #                       codex 0.146 rejects it with "requires a newer version")
+  #   gpt-5.6-terra
+  #   gpt-5.6-sol
+  # Effort maps to codex reasoning effort; `gpt-6-astra-high` style SKUs also work.
+  - id: openai
+    vendor: openai
+    effort: max
+    model: gpt-6-astra
+
+  # ── claude ──────────────────────────────────────────────────────────────
+  # CLI: claude           install: npm i -g @anthropic-ai/claude-code   auth: claude login
+  # Runs `claude -p` headless with --permission-mode bypassPermissions under --yolo.
+  # Models seen in this repo (aliases resolve to the current release):
+  #   opus | sonnet | haiku          aliases
+  #   claude-fable-5, claude-sonnet-5, claude-haiku-4-5
+  - id: claude
+    vendor: claude
+    effort: max
+    model: opus
+
+  # ── agy (Antigravity / Gemini) ───────────────────────────────────────────
+  # CLI: agy              auth: agy login (loopback quota summary must respond)
+  # Print mode has a fixed 5-minute turn timeout inside the CLI; long repo-scale
+  # reviews may return partial output. Omit `model` to use agy's own selection.
+  # Models seen in this repo:
+  #   gemini-3.1-pro-high
+  #   gemini-3.1-pro
+  - id: agy
+    vendor: agy
+    effort: max
+    model: gemini-3.1-pro-high
+
+  # ── grok (xAI Grok Build CLI) ────────────────────────────────────────────
+  # CLI: grok             auth: grok login (ACP billing must be readable)
+  # Streaming JSON transport; --yolo and native --cwd are honored.
+  # Models seen in this repo:
+  #   grok-4.5
+  - id: grok
+    vendor: grok
+    effort: max
+    model: grok-4.5
+
+  # ── cursor (Cursor Agent) ────────────────────────────────────────────────
+  # CLI: cursor-agent     auth: cursor-agent login  (or CURSOR_API_KEY)
+  # Proxies a backing provider under Cursor's auth; the SKU in `model` encodes
+  # effort/thinking/speed/context (`-medium`, `-thinking`, `-fast`, `-1M`), so
+  # the `effort` field is informational. List ids: cursor-agent --list-models.
+  # Panel diversity is judged on the backing provider (a gemini SKU counts as
+  # Gemini), so pair it with a different provider. Models seen in this repo:
+  #   gemini-3.1-pro
+  #   claude-sonnet-5-medium
+  - id: cursor
+    vendor: cursor
+    effort: medium
+    model: gemini-3.1-pro
+
+# Synthesis needs schema-constrained output: claude, openai/codex, or grok.
+synthesis:
+  id: synthesis
+  vendor: claude
+  effort: high
+  model: claude-sonnet-5

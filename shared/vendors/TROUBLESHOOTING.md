@@ -238,10 +238,12 @@ configuration, not in this module.
 
 ## Panel Review Notes
 
-`panel-review` is a caller of this module. Its `vendors.yaml` defines three
-panel calls and one synthesis call. `panel-review/scripts/doctor.sh` probes all
-four configured calls through `vendors/scripts/call.sh` and requires at least
-two ready panel calls plus a ready synthesis call.
+`panel-review` is a caller of this module. Its tracked `sample-vendors.yaml`
+lists every vendor; the machine-local, git-ignored `vendors.yaml` (generated
+by `scripts/init-vendors.py`) defines the panel calls and one synthesis call
+actually made on this host. `panel-review/scripts/doctor.sh` probes every
+configured call through `vendors/scripts/call.sh` and requires at least two
+ready panel calls plus a ready synthesis call; delete local entries that fail.
 
 Panel-review should not duplicate vendor CLI flags or workarounds. Add new
 vendor transport fixes here, then let panel-review keep its config focused on

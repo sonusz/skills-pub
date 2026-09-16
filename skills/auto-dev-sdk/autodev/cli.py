@@ -376,7 +376,9 @@ def _orch(args) -> Orchestrator:
     )
     if cfg_vendors is None:
         raise ConfigError(
-            "vendors config not found; create auto-dev-sdk vendors.yml, set "
+            "vendors config not found; generate the SDK-root vendors.yml from "
+            "sample-vendors.yml (python3 shared/vendors/scripts/init-vendors.py "
+            "--sample sample-vendors.yml --out vendors.yml), set "
             f"{VENDORS_YML_ENV}, or pass --vendors-yml"
         )
     cfg = OrchestratorConfig(repo_root=repo_root, vendors=cfg_vendors)

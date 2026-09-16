@@ -17,7 +17,38 @@ The stable module entrypoints are:
 - `scripts/nested-test.sh` for a guarded real nested integration test where
   each selected outer vendor is asked to run the selected inner `call.sh`.
 - `vendors.conf` for default model mapping.
+- `sample-vendors.yaml` as the reference catalog of every vendor, its CLI,
+  and the model ids this repo has used; it is also a valid panel-shaped
+  config, so `skills/panel-review/scripts/doctor.sh shared/vendors/sample-vendors.yaml`
+  probes every vendor at once.
+- `scripts/init-vendors.py` to generate a skill's machine-local
+  `vendors.yaml` from its tracked `sample-vendors.yaml` (see Configuration).
 - `TROUBLESHOOTING.md` for reusable vendor and caller debugging notes.
+
+## Configuration
+
+This module supports every vendor; each calling skill decides which ones to
+use through two files in the skill directory:
+
+- `sample-vendors.yaml` — tracked, lists every vendor the skill can call.
+- `vendors.yaml` — git-ignored, machine-local: the sample pruned to the vendors
+  that work on this host. Skill scripts read it and fall back to the sample
+  (all vendors) when it is absent.
+
+```bash
+python3 shared/vendors/scripts/init-vendors.py \
+  --sample skills/panel-review/sample-vendors.yaml \
+  --out    skills/panel-review/vendors.yaml      # keeps vendors whose CLI is on PATH
+bash skills/panel-review/scripts/doctor.sh       # then delete entries that fail
+```
+
+`init-vendors.py --vendor openai --vendor claude` keeps an explicit list
+instead of probing PATH; `--force` overwrites; `--out -` prints. It preserves
+comments, re-points a `synthesis` entry whose vendor was removed at the first
+kept panel entry, and for the auto-dev-sdk shape prunes `panel.reviewers` and
+clamps `min_responding_reviewers` while only warning about `stages`. Consult
+`sample-vendors.yaml` in this directory for vendor ids, CLI binaries, login
+commands, and known model ids when editing a local file by hand.
 
 ## Call Interface
 

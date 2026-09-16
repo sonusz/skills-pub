@@ -55,8 +55,13 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
   panel calls. If the workspace changes, stop and report it. Do not
   auto-revert or commit unless the user explicitly asks.
 - Keep local-machine setup such as SSL certificates, proxies, auth refreshes,
-  and vendor sandbox workarounds outside this skill source and outside
-  `vendors.yaml`.
+  and vendor sandbox workarounds outside this skill source and outside the
+  vendor config. Which vendors run on this machine is the one thing that IS
+  machine-local: the tracked `sample-vendors.yaml` lists every vendor, and the
+  git-ignored `vendors.yaml` is that sample pruned to what works here
+  (`python3 shared/vendors/scripts/init-vendors.py --sample sample-vendors.yaml --out vendors.yaml`,
+  then delete entries the doctor fails). Scripts fall back to the sample when
+  `vendors.yaml` is absent.
 
 ## Workflow
 
@@ -65,7 +70,7 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
 1. **Artifact + specific review question defined?** Concrete artifact (code, spec, config, policy) and a specific question. Missing either → STOP. Panel review is a gate, not a generator.
 2. **Action on disagreement defined?** One of: refine & retry, reject, investigate & verify, escalate to human, accept with documented risk. Vague → STOP. Without a planned action, divergence just produces noise.
 3. **Answerable by execution?** YES → STOP, run the tests. Partially → execute what you can, panel-review the rest. NO → proceed.
-4. **At least 2 panel calls and the synthesis call ready?** Run `scripts/doctor.sh vendors.yaml` — **once per session only**. If the doctor already passed earlier in this conversation, skip this step and proceed; vendor CLIs rarely come and go mid-session, so re-checking each invocation is wasted effort. With only one panel vendor you have a single-model run, not a panel — no divergence signal is possible. If fewer than 2 panel calls or the synthesis call are ready, STOP and report the failing configured calls. Doctor failures keep diagnostics and point to `shared/vendors/TROUBLESHOOTING.md`.
+4. **At least 2 panel calls and the synthesis call ready?** Run `scripts/doctor.sh` (it reads `vendors.yaml`, or `sample-vendors.yaml` when no local file exists) — **once per session only**. If the doctor already passed earlier in this conversation, skip this step and proceed; vendor CLIs rarely come and go mid-session, so re-checking each invocation is wasted effort. With only one panel vendor you have a single-model run, not a panel — no divergence signal is possible. If fewer than 2 panel calls or the synthesis call are ready, STOP and report the failing configured calls. Doctor failures keep diagnostics and point to `shared/vendors/TROUBLESHOOTING.md`.
 
 ### 2. Build the prompt
 
@@ -96,13 +101,13 @@ The configured panel calls run with repo/tool access from the selected
 configured synthesis call. Before launching, show the user: (1) review
 question, (2) repo/source cwd, (3) artifact list (paths + sizes, not full
 text), (4) redactions/exclusions applied, and (5) configured calls from
-`vendors.yaml`. Wait for explicit approval. Re-ask when the prompt materially
+`vendors.yaml` (or the sample fallback). Wait for explicit approval. Re-ask when the prompt materially
 changes (different artifact, question, cwd, redactions, or added vendor).
 Minor reformatting does not need re-approval.
 
 ### 4. Launch panel calls in parallel
 
-The five configured calls live in [vendors.yaml](vendors.yaml): four `panel` calls and one `synthesis` call, each with vendor/model/effort settings. Vendor CLI differences are handled by the packaged module at `shared/vendors`; panel-review should not duplicate vendor-specific CLI flags or quirks.
+The configured calls live in `vendors.yaml` (machine-local; see [sample-vendors.yaml](sample-vendors.yaml) for every vendor): the `panel` calls and one `synthesis` call, each with vendor/model/effort settings. Vendor CLI differences are handled by the packaged module at `shared/vendors`; panel-review should not duplicate vendor-specific CLI flags or quirks.
 
 A configured call that fails mid-run is marked failed and never substituted —
 substitution would silently weaken the divergence signal. `launch.sh` aborts
@@ -117,10 +122,10 @@ Path-based discovery drives `shared/vendors/scripts/call.sh` with
 `--cwd <repo/source>` and `--yolo` for each panel vendor. The shared wrapper
 maps that access per vendor: Codex gets
 `--dangerously-bypass-approvals-and-sandbox`, Claude gets
-`--permission-mode bypassPermissions`, and Agy gets
-`--dangerously-skip-permissions`; Grok gets `--yolo`. `--cwd` is honored by
-Codex via `--cd`, by Grok via native `--cwd`, and by Claude/Agy through the
-wrapper's cwd execution.
+`--permission-mode bypassPermissions`, Agy gets
+`--dangerously-skip-permissions`, Grok gets `--yolo`, and Cursor gets
+`--trust` plus `--yolo`. `--cwd` is honored by Codex via `--cd`, by Grok via
+native `--cwd`, and by Claude/Agy/Cursor through the wrapper's cwd execution.
 
 Keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
 rejects in-worktree output dirs, then records git status/diff snapshots under

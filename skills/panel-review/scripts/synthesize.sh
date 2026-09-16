@@ -9,12 +9,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/panel-config.sh"
 
 PROMPT_FILE="${1:-}"
-VENDORS_YAML="${2:-$SCRIPT_DIR/../vendors.yaml}"
+VENDORS_YAML="${2:-$(panel_default_config)}"
 RUN_DIR="${3:-}"
 SYNTHESIS_CALL_TIMEOUT="${SYNTHESIS_CALL_TIMEOUT:-300}"
 # At the timeout deadline, keep waiting in windows of this many seconds while
 # the vendor is still producing output; kill only after a silent window.
 SYNTHESIS_CALL_TIMEOUT_EXTEND="${SYNTHESIS_CALL_TIMEOUT_EXTEND:-300}"
+# Optional cheap-model idle probe, same env contract as launch.sh.
+PANEL_IDLE_PROBE_ARGS=()
+if [ -n "${PANEL_IDLE_PROBE_VENDOR:-}" ]; then
+  PANEL_IDLE_PROBE_ARGS+=(--idle-probe-vendor "$PANEL_IDLE_PROBE_VENDOR")
+  if [ -n "${PANEL_IDLE_PROBE_MODEL:-}" ]; then
+    PANEL_IDLE_PROBE_ARGS+=(--idle-probe-model "$PANEL_IDLE_PROBE_MODEL")
+  fi
+  if [ -n "${PANEL_IDLE_PROBE_EFFORT:-}" ]; then
+    PANEL_IDLE_PROBE_ARGS+=(--idle-probe-effort "$PANEL_IDLE_PROBE_EFFORT")
+  fi
+fi
 
 if [ -z "$PROMPT_FILE" ] || [ -z "$RUN_DIR" ]; then
   printf "Usage: synthesize.sh <prompt_file> <vendors_yaml> <run_dir>\n" >&2
@@ -119,6 +130,7 @@ if "$PANEL_VENDOR_CALL" \
   --id "$SYNTHESIS_ID" \
   --timeout "$SYNTHESIS_CALL_TIMEOUT" \
   --timeout-extend "$SYNTHESIS_CALL_TIMEOUT_EXTEND" \
+  ${PANEL_IDLE_PROBE_ARGS[@]+"${PANEL_IDLE_PROBE_ARGS[@]}"} \
   --prompt-file "$SYNTHESIS_PROMPT" \
   --output-dir "$RUN_DIR" \
   --min-success 1 > "$SYNTHESIS_CALL_LOG" 2>&1; then
