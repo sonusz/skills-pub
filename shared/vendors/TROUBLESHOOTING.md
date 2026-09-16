@@ -117,6 +117,32 @@ needs Claude tool controls, pass native args explicitly, for example
 `--native-arg --allowedTools --native-arg Read,Glob,Grep,LS`. Avoid Claude's
 variadic `--tools` unless you have tested the exact argv shape.
 
+### Claude PTY Launch Fails With A `script` Usage Error
+
+Symptom (in the Claude call's `out` or `log`):
+
+```text
+script: illegal option -- f
+usage: script [-aeFkpqr] [-t time] [file [command ...]]
+```
+
+or, on Linux:
+
+```text
+script: unexpected number of arguments
+```
+
+Cause: the launcher runs Claude under `script` for a PTY and selects the
+`script` userland from the host OS (`vendors_host_os`, i.e. `uname -s`): the
+BSD form on macOS, the util-linux form on Linux. It does not retry the other
+form on those platforms, so this message means the first `script` on `PATH` is
+not the host's native one, typically a Homebrew util-linux `script` on macOS
+or a BusyBox `script` on Linux.
+
+Fix: make the system `script` win on `PATH` for the process running `call.sh`
+(`/usr/bin/script` on macOS, the util-linux one on Linux), then rerun
+`scripts/smoke-test.sh`, which asserts the host's form is launched exactly once.
+
 ### Agy Fails In Headless Runs
 
 Cause: Agy may need a one-time interactive sign-in, or a requested model name

@@ -19,8 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from autodev.state.atomic import atomic_write_json
+from autodev.state.hostos import _host_os
 
 REGISTRY_FILENAME = ".running-pids.json"
+
+# Linux procfs root. A module constant so tests can point it at a fake tree.
+_PROC_ROOT = Path("/proc")
+# ``ps -o lstart=`` format on macOS, e.g. ``Wed Sep 16 11:00:33 2026``.
+_PS_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
 
 _REGISTRY_LOCK = threading.RLock()
 
@@ -29,16 +35,63 @@ def registry_path(feature_active: Path) -> Path:
     return Path(feature_active) / REGISTRY_FILENAME
 
 
-def _process_start_id(pid: int) -> str | None:
-    """Return Linux's immutable per-PID start tick, when available."""
+def _linux_process_start_id(pid: int) -> str | None:
+    """Linux's immutable per-PID start tick from ``/proc/<pid>/stat``."""
     try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        raw = (_PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8")
         # comm is parenthesized and may contain spaces. Fields after the final
         # ')' begin with field 3 (state); starttime is field 22 => index 19.
         rest = raw[raw.rfind(")") + 2 :].split()
         return rest[19]
     except (OSError, IndexError):
         return None
+
+
+def _darwin_process_start_id(pid: int) -> str | None:
+    """macOS process start time as epoch seconds, from ``ps -o lstart=``.
+
+    ``lstart`` is the kernel's process start time (not the ``ps`` sampling
+    time), so a recycled PID gets a different value from its predecessor.
+    """
+    ps = shutil.which("ps")
+    if not ps:
+        return None
+    try:
+        result = subprocess.run(
+            [ps, "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            # ``lstart`` is locale-formatted; pin C so strptime's English
+            # month/day names always match (same as shared session-state.py).
+            env={**os.environ, "LC_ALL": "C"},
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        # strptime tolerates the space-padded day ("Sep  6"); strip() drops
+        # the trailing padding ps appends to the column.
+        started = time.strptime(result.stdout.strip(), _PS_LSTART_FORMAT)
+        return str(int(time.mktime(started)))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _process_start_id(pid: int) -> str | None:
+    """Return an immutable per-PID start identity, or None when unknown.
+
+    The registry compares it before signalling, so a recycled PID is never
+    mistaken for the process that was registered.
+    """
+    host = _host_os()
+    if host == "linux":
+        return _linux_process_start_id(pid)
+    if host == "darwin":
+        return _darwin_process_start_id(pid)
+    return None
 
 
 def _load_unlocked(path: Path) -> list[dict]:
@@ -157,31 +210,53 @@ def _process_group_alive_via_ps(pgid: int) -> bool | None:
     return False
 
 
+def _process_group_alive_via_proc(pgid: int) -> bool | None:
+    """Linux: scan ``/proc`` for a non-zombie member of ``pgid``.
+
+    Returns None when ``/proc`` is not mounted or nothing could be scanned,
+    so the caller can fall back to ``ps``.
+    """
+    if not _PROC_ROOT.is_dir():
+        return None
+    scanned = False
+    try:
+        for stat_path in _PROC_ROOT.glob("[0-9]*/stat"):
+            try:
+                raw = stat_path.read_text(encoding="utf-8")
+                rest = raw[raw.rfind(")") + 2 :].split()
+                state = rest[0]
+                process_group = int(rest[2])
+            except (OSError, IndexError, ValueError):
+                continue
+            scanned = True
+            if process_group == pgid and state != "Z":
+                return True
+        if scanned:
+            # A group containing only zombies has no executable work left;
+            # its parent will reap it while abort unwinds.
+            return False
+    except OSError:
+        pass
+    return None
+
+
 def process_group_alive(pgid: int) -> bool:
-    proc_root = Path("/proc")
-    if proc_root.is_dir():
-        scanned = False
-        try:
-            for stat_path in proc_root.glob("[0-9]*/stat"):
-                try:
-                    raw = stat_path.read_text(encoding="utf-8")
-                    rest = raw[raw.rfind(")") + 2 :].split()
-                    state = rest[0]
-                    process_group = int(rest[2])
-                except (OSError, IndexError, ValueError):
-                    continue
-                scanned = True
-                if process_group == pgid and state != "Z":
-                    return True
-            if scanned:
-                # A group containing only zombies has no executable work left;
-                # its parent will reap it while abort unwinds.
-                return False
-        except OSError:
-            pass
-    ps_alive = _process_group_alive_via_ps(pgid)
-    if ps_alive is not None:
-        return ps_alive
+    host = _host_os()
+    if host == "linux":
+        alive = _process_group_alive_via_proc(pgid)
+        if alive is None:
+            # /proc not mounted (minimal containers, chroots): use ps.
+            alive = _process_group_alive_via_ps(pgid)
+    elif host == "darwin":
+        # macOS killpg(pgid, 0) reports EPERM for a zombie-only group, which
+        # the last-resort probe below would misread as "alive". A successful
+        # ps scan is therefore authoritative here; killpg is consulted only
+        # when ps itself is unavailable.
+        alive = _process_group_alive_via_ps(pgid)
+    else:
+        alive = _process_group_alive_via_ps(pgid)
+    if alive is not None:
+        return alive
     try:
         os.killpg(pgid, 0)
         return True

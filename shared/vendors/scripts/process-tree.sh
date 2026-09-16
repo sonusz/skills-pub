@@ -11,14 +11,21 @@
 # ("illegal option -- -" / "cmd: keyword not found"), which silently degrades
 # the probe's input to nothing and biases it toward a false-positive kill.
 #
-# This helper is portable across macOS (BSD ps) and Linux (GNU ps):
+# This helper is portable across macOS (BSD ps) and Linux (procps ps). Both
+# are supported targets, and the same commands run unchanged on each, so there
+# is no per-OS branch here:
 #   - child enumeration uses `pgrep -P` (mirrors call.sh's kill_tree), not
 #     `ps --forest`;
-#   - per-process detail uses `ps -o pid,ppid,state,etime,command -p`, all of
-#     which are keywords common to BSD and GNU ps (NOT the GNU-only `cmd`).
+#   - per-process detail uses `ps -o pid=,ppid=,state=,etime=,command= -p`,
+#     all keywords common to BSD and procps ps.
 #
-# NOTE: this repo is developed and supported on macOS only (see repo README).
-# The GNU fallbacks here are best-effort portability, not a supported target.
+# Do NOT introduce any of these; each exists on only one userland:
+#   - `--forest` or any other `--long` option (procps-only; BSD ps has none);
+#   - `etimes` (procps-only; BSD ps has only `etime`, the [[dd-]hh:]mm:ss form);
+#   - `cmd` (procps-only; use `command`).
+# If a genuinely per-OS command is ever needed, select it by `uname -s` in the
+# `vendors_host_os` shape from vendor-launch.sh (darwin | linux | other), never
+# by running one platform's form and sniffing its error output.
 set -eo pipefail
 
 MAX_DEPTH=20  # defensive: pgrep -P is acyclic, but cap recursion regardless.

@@ -5,6 +5,39 @@ The shell wrapper owns process launch; this helper owns the small amount of
 state needed to turn an opaque caller-provided session key into a provider
 conversation id.  State is local-machine runtime state (vendor sessions are
 local too), never a repository artifact.
+
+Process and boot identity
+-------------------------
+Post-mortem recovery (``recover-interrupted``) compares identities written by
+an external guard against what this helper observes now, so writer and reader
+must use the same definitions.  ``_host_os()`` selects the operating system
+branch up front; there is no probing for ``/proc`` and no fall-through from
+one operating system's method to another's.
+
+``start_id`` (a digit string)
+    linux:  ``/proc/<pid>/stat`` ``starttime`` -- field 22, i.e. ``rest[19]``
+            of the whitespace split after the closing ``)``.
+    darwin: process start time in epoch seconds:
+            ``LC_ALL=C ps -o lstart= -p <pid>`` parsed with
+            ``time.strptime(s.strip(), "%a %b %d %H:%M:%S %Y")`` and rendered
+            as ``str(int(time.mktime(...)))``.  Resolution is one second.
+``pgid`` and ``state``
+    linux:  ``/proc/<pid>/stat`` fields 5 and 3 (``rest[2]`` and ``rest[0]``).
+    darwin: ``LC_ALL=C ps -o lstart=,pgid=,stat= -p <pid>`` split on
+            whitespace and read from the right: last token = ``stat``,
+            second-last = ``pgid``, the rest = ``lstart``.  ``state`` is the
+            first character of ``stat``; ``Z`` marks a zombie on both.
+    A pid is *absent* only when linux raises ``FileNotFoundError`` for its
+    ``stat`` file or darwin ``ps`` exits 1 with empty stdout.  Every other
+    failure to read or parse an identity is fatal (fail closed).
+``boot_id``
+    linux:  ``/proc/sys/kernel/random/boot_id``.
+    darwin: ``sysctl -n kern.bootsessionuuid`` (a per-boot UUID); if that key
+            is missing, the ``sec = N`` value of ``sysctl -n kern.boottime``.
+process-group members (non-zombie pids)
+    linux:  walk ``/proc/<pid>/stat`` (``ps -axo pid=,pgid=,stat=`` only when
+            ``/proc`` is not mounted).
+    darwin: ``ps -axo pid=,pgid=,stat=``.
 """
 
 from __future__ import annotations
@@ -12,12 +45,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -442,27 +477,50 @@ def cmd_credit_turn(args: argparse.Namespace) -> int:
     return 0
 
 
-def _process_group_members(pgid: int) -> set[int]:
-    """Return non-zombie members of a process group."""
+# The one definition of host-OS detection is shared/os/hostos.py, reached from
+# this file's physical location (<scripts>/../../os). A materialized copy of the
+# vendors module shipped without shared/os keeps the inline logic in _host_os.
+_SHARED_HOSTOS = Path(__file__).resolve().parents[2] / "os" / "hostos.py"
+_shared_hostos: Any = None
+_shared_hostos_loaded = False
 
-    proc_root = Path("/proc")
-    if proc_root.is_dir():
-        members: set[int] = set()
-        scanned = False
-        for stat_path in proc_root.glob("[0-9]*/stat"):
-            try:
-                raw = stat_path.read_text(encoding="utf-8")
-                rest = raw[raw.rfind(")") + 2 :].split()
-                state = rest[0]
-                process_group = int(rest[2])
-                pid = int(stat_path.parent.name)
-            except (OSError, IndexError, ValueError):
-                continue
-            scanned = True
-            if process_group == pgid and state not in {"Z", "X"}:
-                members.add(pid)
-        if scanned:
-            return members
+
+def _shared_hostos_module() -> Any:
+    """Load shared/os/hostos.py by path once; None when it is absent."""
+    global _shared_hostos, _shared_hostos_loaded
+    if not _shared_hostos_loaded:
+        _shared_hostos_loaded = True
+        if _SHARED_HOSTOS.is_file():
+            spec = importlib.util.spec_from_file_location("vendors_shared_hostos", _SHARED_HOSTOS)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _shared_hostos = module
+    return _shared_hostos
+
+
+def _host_os() -> str:
+    """'linux', 'darwin', or the raw sys.platform for anything else."""
+    shared = _shared_hostos_module()
+    if shared is not None:
+        return shared.host_os()
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "darwin"
+    return sys.platform
+
+
+def _c_locale_env() -> dict[str, str]:
+    """Environment for ``ps``: ``lstart`` is locale-formatted, so pin C."""
+
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    return env
+
+
+def _ps_process_group_members(pgid: int) -> set[int]:
+    """Scan ``ps -axo pid=,pgid=,stat=`` for non-zombie members of a group."""
 
     try:
         scanner = subprocess.Popen(
@@ -476,7 +534,7 @@ def _process_group_members(pgid: int) -> set[int]:
         raise SystemExit(f"cannot verify process-group membership: {exc}")
     if scanner.returncode != 0:
         raise SystemExit("cannot verify process-group membership: ps failed")
-    members = set()
+    members: set[int] = set()
     for line in stdout.splitlines():
         fields = line.split()
         if len(fields) < 3:
@@ -495,19 +553,96 @@ def _process_group_members(pgid: int) -> set[int]:
     return members
 
 
+def _process_group_members(pgid: int) -> set[int]:
+    """Return non-zombie members of a process group."""
+
+    host_os = _host_os()
+    if host_os == "linux":
+        proc_root = Path("/proc")
+        if proc_root.is_dir():
+            members: set[int] = set()
+            scanned = False
+            for stat_path in proc_root.glob("[0-9]*/stat"):
+                try:
+                    raw = stat_path.read_text(encoding="utf-8")
+                    rest = raw[raw.rfind(")") + 2 :].split()
+                    state = rest[0]
+                    process_group = int(rest[2])
+                    pid = int(stat_path.parent.name)
+                except (OSError, IndexError, ValueError):
+                    continue
+                scanned = True
+                if process_group == pgid and state not in {"Z", "X"}:
+                    members.add(pid)
+            if scanned:
+                return members
+        # /proc is not mounted (rare containers): use the portable ps scan.
+        return _ps_process_group_members(pgid)
+    if host_os == "darwin":
+        return _ps_process_group_members(pgid)
+    raise SystemExit(f"unsupported platform for process-group membership: {host_os}")
+
+
+def _darwin_start_id(lstart: str) -> str:
+    """Epoch seconds of a C-locale ``ps -o lstart=`` timestamp, as digits."""
+
+    parsed = time.strptime(lstart.strip(), "%a %b %d %H:%M:%S %Y")
+    return str(int(time.mktime(parsed)))
+
+
+def _parse_darwin_ps_identity(stdout: str) -> tuple[str, int, str]:
+    """Parse one ``ps -o lstart=,pgid=,stat=`` line from the right."""
+
+    lines = stdout.strip().splitlines()
+    if len(lines) != 1:
+        raise ValueError(f"expected one ps line, got {len(lines)}")
+    fields = lines[0].split()
+    if len(fields) < 3:
+        raise ValueError(f"unexpected ps fields: {lines[0]!r}")
+    stat = fields[-1]
+    process_group = int(fields[-2])
+    start_id = _darwin_start_id(" ".join(fields[:-2]))
+    return start_id, process_group, stat[0]
+
+
 def _strict_process_identity(pid: int) -> tuple[str, int, str] | None:
-    """Read one Linux identity; only a vanished proc entry means absent."""
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise SystemExit(f"cannot verify recovery process {pid}: {exc}")
-    try:
-        fields = raw[raw.rfind(")") + 2:].split()
-        return fields[19], int(fields[2]), fields[0]
-    except (IndexError, ValueError) as exc:
-        raise SystemExit(f"cannot parse recovery process {pid}: {exc}")
+    """Read one process identity as ``(start_id, pgid, state)``.
+
+    Only a genuinely absent process yields ``None``; any failure to read or
+    parse the identity fails closed with ``SystemExit`` so recovery never
+    mistakes an unverifiable pid for a dead one.
+    """
+    host_os = _host_os()
+    if host_os == "linux":
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SystemExit(f"cannot verify recovery process {pid}: {exc}")
+        try:
+            fields = raw[raw.rfind(")") + 2:].split()
+            return fields[19], int(fields[2]), fields[0]
+        except (IndexError, ValueError) as exc:
+            raise SystemExit(f"cannot parse recovery process {pid}: {exc}")
+    if host_os == "darwin":
+        try:
+            probe = subprocess.run(
+                ["ps", "-o", "lstart=,pgid=,stat=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5, env=_c_locale_env(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SystemExit(f"cannot verify recovery process {pid}: {exc}")
+        if probe.returncode == 1 and not probe.stdout.strip():
+            return None
+        if probe.returncode != 0:
+            detail = probe.stderr.strip() or f"ps exited {probe.returncode}"
+            raise SystemExit(f"cannot verify recovery process {pid}: {detail}")
+        try:
+            return _parse_darwin_ps_identity(probe.stdout)
+        except (ValueError, OverflowError) as exc:
+            raise SystemExit(f"cannot parse recovery process {pid}: {exc}")
+    raise SystemExit(f"unsupported platform for process identity: {host_os}")
 
 
 def _require_absent_identity(pid: int, start_id: str, label: str) -> None:
@@ -518,17 +653,28 @@ def _require_absent_identity(pid: int, start_id: str, label: str) -> None:
 
 
 def _require_empty_process_group(pgid: int) -> None:
-    proc = Path("/proc")
-    if not proc.is_dir():
-        raise SystemExit("cannot verify recovery process group without /proc")
-    if _strict_process_identity(pgid) is not None:
-        raise SystemExit("recovery process-group leader pid was reused")
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        identity = _strict_process_identity(int(entry.name))
-        if identity is not None and identity[1] == pgid and identity[2] not in {"Z", "X"}:
+    """Refuse recovery while the lease owner's group leader or members live."""
+    host_os = _host_os()
+    if host_os == "linux":
+        proc = Path("/proc")
+        if not proc.is_dir():
+            raise SystemExit("cannot verify recovery process group without /proc")
+        if _strict_process_identity(pgid) is not None:
+            raise SystemExit("recovery process-group leader pid was reused")
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            identity = _strict_process_identity(int(entry.name))
+            if identity is not None and identity[1] == pgid and identity[2] not in {"Z", "X"}:
+                raise SystemExit("recovery process group still has live members")
+        return
+    if host_os == "darwin":
+        if _strict_process_identity(pgid) is not None:
+            raise SystemExit("recovery process-group leader pid was reused")
+        if _process_group_members(pgid):
             raise SystemExit("recovery process group still has live members")
+        return
+    raise SystemExit(f"unsupported platform for process-group verification: {host_os}")
 
 
 def _signal_members(pids: set[int], signal_number: int) -> None:
@@ -623,12 +769,46 @@ def cmd_interrupt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _darwin_boot_id() -> str:
+    """Per-boot identity: ``kern.bootsessionuuid``, else ``kern.boottime`` seconds."""
+
+    def query(key: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["sysctl", "-n", key], capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SystemExit(f"cannot verify local boot identity: {exc}")
+
+    session = query("kern.bootsessionuuid")
+    if session.returncode == 0 and session.stdout.strip():
+        return session.stdout.strip()
+    boottime = query("kern.boottime")
+    match = (
+        re.search(r"\bsec\s*=\s*(\d+)", boottime.stdout)
+        if boottime.returncode == 0 else None
+    )
+    if match is None:
+        raise SystemExit(
+            "cannot verify local boot identity: sysctl kern.bootsessionuuid and "
+            "kern.boottime are unavailable"
+        )
+    return match.group(1)
+
+
 def _host_boot() -> tuple[str, str]:
+    """Return ``(hostname, boot_id)`` for the operating system in use."""
     host = socket.gethostname().strip()
-    try:
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    except OSError as exc:
-        raise SystemExit(f"cannot verify local boot identity: {exc}")
+    host_os = _host_os()
+    if host_os == "linux":
+        try:
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError as exc:
+            raise SystemExit(f"cannot verify local boot identity: {exc}")
+    elif host_os == "darwin":
+        boot = _darwin_boot_id()
+    else:
+        raise SystemExit(f"unsupported platform for boot identity: {host_os}")
     if not host or not boot:
         raise SystemExit("cannot verify local host and boot identity")
     return host, boot

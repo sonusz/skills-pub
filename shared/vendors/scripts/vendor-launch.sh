@@ -26,6 +26,39 @@ vendors_lower() {
   printf "%s" "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+# Host OS for OS-specific branches: darwin | linux | other. Call sites select
+# the platform's command from this value; they must not launch one platform's
+# form and sniff its error to try the other. `other` branches keep the
+# pre-detection behavior so unknown platforms are no worse off.
+#
+# The one definition is `host_os` in shared/os/host-os.sh, found relative to
+# this file's physical directory (<scripts>/../../os). Walk the symlink chain
+# first (bash 3.2, no readlink -f on macOS); a materialized copy of the vendors
+# module shipped without shared/os keeps the inline case below.
+VENDORS_HOST_OS_LIB=$(
+  src="${BASH_SOURCE[0]}"
+  while [ -L "$src" ]; do
+    dir=$(cd "$(dirname "$src")" && pwd -P) || exit 0
+    src=$(readlink "$src") || exit 0
+    [ "${src#/}" != "$src" ] || src="$dir/$src"   # relative link target
+  done
+  cd "$(dirname "$src")" 2>/dev/null || exit 0
+  printf '%s/../../os/host-os.sh' "$(pwd -P)"
+)
+if [ -r "$VENDORS_HOST_OS_LIB" ]; then
+  # shellcheck source=../../os/host-os.sh
+  . "$VENDORS_HOST_OS_LIB"
+  vendors_host_os() { host_os; }
+else
+  vendors_host_os() {
+    case "$(uname -s 2>/dev/null)" in
+      Darwin) printf 'darwin\n' ;;
+      Linux)  printf 'linux\n' ;;
+      *)      printf 'other\n' ;;
+    esac
+  }
+fi
+
 vendors_read_models() {
   local config_file="$1"
 
@@ -695,6 +728,21 @@ vendors_write_stdin_runner() {
   chmod +x "$runner_file"
 }
 
+# BSD `script` (macOS): the command is a trailing positional list.
+vendors_pty_script_bsd() {
+  local runner_file="$1"
+  local output_file="$2"
+  script -q /dev/null "$runner_file" > "$output_file" 2>&1
+}
+
+# util-linux `script` (Linux): the command goes through `-c`; `-e` returns the
+# child's exit status, `-f` flushes, `-E never` disables echo.
+vendors_pty_script_util_linux() {
+  local runner_file="$1"
+  local output_file="$2"
+  script -qefE never -c "$runner_file" /dev/null > "$output_file" 2>&1
+}
+
 vendors_run_stdin_with_pty() {
   local prompt_file="$1"
   local output_file="$2"
@@ -705,13 +753,25 @@ vendors_run_stdin_with_pty() {
 
   runner_file="$(dirname "$output_file")/$(basename "$output_file").runner.sh"
   vendors_write_stdin_runner "$runner_file" "$prompt_file" "${command[@]}"
-  script -q /dev/null "$runner_file" > "$output_file" 2>&1 || status=$?
-  if [ "$status" -ne 0 ] \
-      && grep -Eqi 'illegal option|invalid option|unrecognized option|usage: script|unexpected number of arguments' "$output_file"; then
-    status=0
-    script -qefE never -c "$runner_file" /dev/null > "$output_file" 2>&1 \
-      || status=$?
-  fi
+  # `script` has two incompatible userlands. Pick the host's form from
+  # `vendors_host_os`; only an unknown platform keeps the historical
+  # launch-BSD-then-sniff-the-usage-error sequence.
+  case "$(vendors_host_os)" in
+    darwin)
+      vendors_pty_script_bsd "$runner_file" "$output_file" || status=$?
+      ;;
+    linux)
+      vendors_pty_script_util_linux "$runner_file" "$output_file" || status=$?
+      ;;
+    *)
+      vendors_pty_script_bsd "$runner_file" "$output_file" || status=$?
+      if [ "$status" -ne 0 ] \
+          && grep -Eqi 'illegal option|invalid option|unrecognized option|usage: script|unexpected number of arguments' "$output_file"; then
+        status=0
+        vendors_pty_script_util_linux "$runner_file" "$output_file" || status=$?
+      fi
+      ;;
+  esac
   rm -f "$runner_file"
   if command -v perl >/dev/null 2>&1; then
     perl -0pi -e 's/\r//g; s/\^D//g; s/\x04\x08\x08//g; s/\x04//g; s/\x08//g; s/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g; s/\e[78]//g' "$output_file"

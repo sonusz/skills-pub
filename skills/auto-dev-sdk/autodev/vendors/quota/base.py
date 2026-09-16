@@ -19,6 +19,8 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from autodev.state.hostos import _host_os
+
 
 @dataclass(frozen=True)
 class QuotaResult:
@@ -130,6 +132,8 @@ def http_json(url, *, method="GET", headers=None, body=None, timeout=10):
 def keychain_password(service: str, account: str | None = None) -> str | None:
     """macOS Keychain generic-password lookup (`security find-generic-password`).
     Returns the secret, or None if unavailable / not on macOS."""
+    if _host_os() != "darwin":
+        return None
     args = ["/usr/bin/security", "find-generic-password", "-s", service]
     if account:
         args += ["-a", account]

@@ -624,7 +624,9 @@ def cmd_abort(args) -> int:
 
     from autodev.state.lock import Lock, read_owner
     from autodev.state.process_registry import (
+        process_group_alive,
         registry_path,
+        terminate_process_group,
         terminate_registered_processes,
     )
 
@@ -672,30 +674,32 @@ def cmd_abort(args) -> int:
         try:
             content = pid_file.read_text().strip().splitlines()
             pid = int(content[0])
+            if pid <= 0:
+                raise ValueError(f"invalid pid {pid}")
             killed_stage = content[1] if len(content) > 1 else "unknown"
-            # Send SIGTERM to the whole process group
-            try:
-                os.killpg(pid, signal.SIGTERM)
-                killed_pid = pid
-            except ProcessLookupError:
-                killed_pid = None  # process already exited
-            # 5s grace
-            if killed_pid is not None:
-                for _ in range(50):
-                    _time.sleep(0.1)
-                    try:
-                        os.killpg(pid, 0)
-                    except ProcessLookupError:
-                        break
-                else:
-                    try:
-                        os.killpg(pid, signal.SIGKILL)
-                        reaped = True
-                    except ProcessLookupError:
-                        pass
-            pid_file.unlink(missing_ok=True)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, IndexError) as e:
             print(f"warning: couldn't parse {pid_file}: {e}", file=sys.stderr)
+        else:
+            # Signal through the registry's terminator rather than a bare
+            # killpg: on macOS killpg reports EPERM for a zombie-only group,
+            # which used to surface as the parse warning above and leave
+            # the pid file behind. Bookkeeping: killed_pid is the group we
+            # signalled (None when it had already exited); reaped follows
+            # the registered-group convention below (no live member left).
+            if process_group_alive(pid):
+                killed_pid = pid
+                stopped = terminate_process_group(pid, grace_sec=5.0)
+                reaped = stopped
+            else:
+                stopped = True
+            if stopped:
+                pid_file.unlink(missing_ok=True)
+            else:
+                print(
+                    f"warning: legacy process group {pid} ({pid_file}) "
+                    "survived SIGKILL; leaving the pid file for a retry",
+                    file=sys.stderr,
+                )
 
     # Step 3: stop the ORCHESTRATOR itself (the `autodev run` process holding
     # the feature lock) — not just its vendor child. An orchestrator that has

@@ -60,7 +60,9 @@ done
 git diff --check -- shared/vendors
 ```
 
-The smoke test uses fake CLIs and must not spend real model calls. Use
+The smoke test uses fake CLIs and must not spend real model calls. It also
+asserts that `vendors_host_os` matches `uname -s` and that the PTY launcher
+runs this host's `script` form exactly once (through a fake `script`). Use
 `doctor.sh`, `hello-test.sh`, and guarded `nested-test.sh` only when the relevant
 real integration is intentionally being tested.
 
@@ -85,8 +87,23 @@ real integration is intentionally being tested.
 - Avoid associative arrays; macOS Bash 3.2 does not support them.
 - Keep `set -eo pipefail` in `call.sh`; nounset has caused false failures with
   the module's Bash 3.2 array handling.
-- Preserve the BSD `script -q /dev/null <runner>` path and Linux fallback for
-  Claude PTY execution.
+- OS-specific behavior is selected by `vendors_host_os` (shell, `uname -s`) /
+  `_host_os()` (Python, `sys.platform`), never by trial-and-error or by
+  probing for `/proc`. Both return `darwin`, `linux`, or `other`. Add a new
+  platform difference as a branch on that value, and keep the `other` branch
+  equal to the pre-detection behavior so unknown platforms are no worse off.
+- Claude PTY execution is one such branch: `darwin` runs only the BSD
+  `script -q /dev/null <runner>` form, `linux` runs only the util-linux
+  `script -qefE never -c <runner> /dev/null` form, and `other` keeps the
+  historical launch-BSD-then-sniff-the-usage-error sequence.
+- Process identity in `session-state.py` has one shape on both platforms
+  (`start_id` = process start time, `boot_id` = boot identifier) with per-OS
+  sources. Linux: `start_id` is the start-ticks field of `/proc/<pid>/stat`,
+  `boot_id` is `/proc/sys/kernel/random/boot_id`. macOS: `start_id` is epoch
+  seconds derived from `ps -o lstart= -p <pid>`, `boot_id` is
+  `sysctl -n kern.bootsessionuuid`. An external guard that writes leases or
+  interruption events for `recover-interrupted` must produce exactly these
+  values for the host, or the recovery match fails closed.
 - Strip PTY control bytes before parsing JSON.
 - Preserve line-by-line JSON extraction for CLIs that mix progress text with
   JSON.
@@ -145,7 +162,7 @@ real integration is intentionally being tested.
 | Symptom | Likely cause or required fix |
 |---|---|
 | `${1,,}: bad substitution` or an unbound array failure | Bash 4 syntax or nounset was introduced; restore the Bash 3.2-compatible form |
-| `script: invalid option` | The BSD/Linux PTY fallback was removed or reordered |
+| `script: illegal option -- f` (macOS) or `script: unexpected number of arguments` (Linux) | The PTY launcher ran the other userland's `script` form: `vendors_host_os` was bypassed, or a foreign `script` (Homebrew util-linux, BusyBox) shadows the system one on `PATH` |
 | Stray `^D` or `^H` bytes | PTY control-character cleanup is missing |
 | JSON parsing fails after progress lines | The line-by-line JSON extraction fallback is missing |
 | Synthesizer reads empty schema output | The normalized `structured_output` envelope was lost |

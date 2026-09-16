@@ -35,19 +35,31 @@ SHARED_CALL = Path(__file__).resolve().parents[4] / "shared" / "vendors" / "scri
 SESSION_HELPER = SHARED_CALL.with_name("session-state.py")
 
 
+def _load_session_helper():
+    """Import session-state.py as a module so tests share its OS branches."""
+    spec = importlib.util.spec_from_file_location("session_state_under_test", SESSION_HELPER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 def _proc_identity(pid: int) -> tuple[str, int]:
-    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    fields = raw[raw.rfind(")") + 2:].split()
-    return fields[19], int(fields[2])
+    """Evidence must come from the same reader the recovery command uses."""
+    identity = _load_session_helper()._strict_process_identity(pid)
+    assert identity is not None, f"pid {pid} vanished before its identity was read"
+    return identity[0], identity[1]
+
+
+def _host_boot() -> tuple[str, str]:
+    return _load_session_helper()._host_boot()
 
 
 def _write_recovery_evidence(
     root: Path, *, plan_path: Path, owner_pid: int, owner_start: str,
     owner_pgid: int, guard_pid: int, guard_start: str, guard_pgid: int,
 ) -> tuple[Path, Path, Path]:
-    host = socket.gethostname()
-    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    host, boot = _host_boot()
     run_digest = hashlib.sha256(b"test-run-token").hexdigest()
     guard = {"pid": guard_pid, "start_id": guard_start, "pgid": guard_pgid,
              "run_token_sha256": run_digest}
@@ -132,7 +144,7 @@ def test_postmortem_recovery_preserves_session_and_is_idempotent(tmp_path: Path)
         evidence[0].write_text(json.dumps(owner_doc) + "\n")
         historical = subprocess.run(command, capture_output=True, text=True)
         assert historical.returncode != 0 and "another host or boot" in historical.stderr
-        owner_doc["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        owner_doc["boot_id"] = _host_boot()[1]
         evidence[0].write_text(json.dumps(owner_doc, sort_keys=True) + "\n")
         result_doc = json.loads(evidence[2].read_text())
         result_doc["guard_owner_sha256"] = hashlib.sha256(evidence[0].read_bytes()).hexdigest()
@@ -195,18 +207,28 @@ def test_postmortem_recovery_rejects_reused_pid_identity(tmp_path: Path) -> None
 
 
 def test_postmortem_recovery_rejects_unknown_proc_read(monkeypatch) -> None:
-    spec = importlib.util.spec_from_file_location("session_state_under_test", SESSION_HELPER)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    original = module.Path.read_text
+    module = _load_session_helper()
+    host_os = module._host_os()
+    if host_os == "linux":
+        original = module.Path.read_text
 
-    def denied(path, *args, **kwargs):
-        if str(path).startswith("/proc/"):
-            raise PermissionError("synthetic denied proc read")
-        return original(path, *args, **kwargs)
+        def denied(path, *args, **kwargs):
+            if str(path).startswith("/proc/"):
+                raise PermissionError("synthetic denied proc read")
+            return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(module.Path, "read_text", denied)
+        monkeypatch.setattr(module.Path, "read_text", denied)
+    elif host_os == "darwin":
+        def denied_run(argv, *args, **kwargs):
+            if argv[0] == "ps":
+                raise OSError("synthetic denied ps")
+            raise AssertionError(f"unexpected command {argv!r}")
+
+        monkeypatch.setattr(module.subprocess, "run", denied_run)
+    else:
+        with pytest.raises(SystemExit, match="unsupported platform"):
+            module._strict_process_identity(12345)
+        return
     with pytest.raises(SystemExit, match="cannot verify recovery process"):
         module._strict_process_identity(12345)
 
@@ -234,6 +256,266 @@ def test_postmortem_recovery_rejects_reused_process_group_leader(tmp_path: Path)
     ]
     refused = subprocess.run(command, capture_output=True, text=True)
     assert refused.returncode != 0 and "leader pid was reused" in refused.stderr
+
+
+LINUX_STAT_LINE = (
+    "{pid} (python3) {state} 1 {pgid} 123 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 "
+    "987654 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+)
+DARWIN_PS_LINE = "Wed Sep 16 11:00:33 2026     56525 Ss\n"
+DARWIN_PS_ZOMBIE_LINE = "Tue Sep  8 19:18:45 2026     14989 Z\n"
+DARWIN_BOOT_UUID = "7A2032B5-1343-44C2-8BA8-BD63EE1FBB83"
+DARWIN_BOOTTIME = "{ sec = 1788759298, usec = 839381 } Sun Sep  6 22:34:58 2026\n"
+
+
+def _epoch(lstart: str) -> str:
+    return str(int(time.mktime(time.strptime(lstart, "%a %b %d %H:%M:%S %Y"))))
+
+
+@pytest.fixture()
+def session_state():
+    return _load_session_helper()
+
+
+def _fake_linux_proc(monkeypatch, module, stat_lines: dict[int, str]) -> None:
+    """Serve synthetic /proc content; every other path stays real."""
+    original = module.Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        text = str(path)
+        if text == "/proc/sys/kernel/random/boot_id":
+            return "0f7c1c8e-linux-boot\n"
+        if text.startswith("/proc/") and text.endswith("/stat"):
+            pid = int(text.split("/")[2])
+            if pid not in stat_lines:
+                raise FileNotFoundError(text)
+            return stat_lines[pid]
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_host_os", lambda: "linux")
+    monkeypatch.setattr(module.Path, "read_text", read_text)
+
+
+class _FakeDarwinCommands:
+    """Scripted ``subprocess.run`` for ps/sysctl on a pretend macOS host."""
+
+    def __init__(self, *, processes: dict[int, str], sysctl: dict[str, tuple[int, str]]):
+        self.processes = processes
+        self.sysctl = sysctl
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv, *args, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        if argv[:4] == ["ps", "-o", "lstart=,pgid=,stat=", "-p"]:
+            stdout = self.processes.get(int(argv[4]))
+            if stdout is None:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+        if argv[:2] == ["sysctl", "-n"]:
+            returncode, stdout = self.sysctl.get(argv[2], (1, ""))
+            stderr = "" if returncode == 0 else f"sysctl: unknown oid '{argv[2]}'\n"
+            return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+        raise AssertionError(f"unexpected command {argv!r}")
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("linux", "linux"), ("linux2", "linux"), ("darwin", "darwin"), ("win32", "win32")],
+)
+def test_host_os_normalizes_sys_platform(session_state, monkeypatch, platform, expected) -> None:
+    monkeypatch.setattr(session_state.sys, "platform", platform)
+    assert session_state._host_os() == expected
+
+
+def test_strict_identity_linux_branch_reads_proc_stat(session_state, monkeypatch) -> None:
+    module = session_state
+    _fake_linux_proc(monkeypatch, module, {
+        123: LINUX_STAT_LINE.format(pid=123, state="S", pgid=123),
+        125: LINUX_STAT_LINE.format(pid=125, state="Z", pgid=123),
+    })
+    assert module._strict_process_identity(123) == ("987654", 123, "S")
+    assert module._strict_process_identity(125) == ("987654", 123, "Z")
+    assert module._strict_process_identity(124) is None
+    assert module._host_boot() == (socket.gethostname().strip(), "0f7c1c8e-linux-boot")
+
+
+def test_strict_identity_darwin_branch_parses_ps_from_the_right(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "darwin")
+    fake = _FakeDarwinCommands(
+        processes={56525: DARWIN_PS_LINE, 14989: DARWIN_PS_ZOMBIE_LINE}, sysctl={},
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake)
+    live = module._strict_process_identity(56525)
+    assert live == (_epoch("Wed Sep 16 11:00:33 2026"), 56525, "S")
+    assert live[0].isdigit()
+    # The space-padded day (``Sep  8``) must parse, and a zombie keeps its start.
+    assert module._strict_process_identity(14989) == (_epoch("Tue Sep  8 19:18:45 2026"), 14989, "Z")
+    assert module._strict_process_identity(99999) is None
+    argv, kwargs = fake.calls[0]
+    assert argv == ["ps", "-o", "lstart=,pgid=,stat=", "-p", "56525"]
+    assert kwargs["env"]["LC_ALL"] == "C"
+    assert kwargs["timeout"] == 5
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "raises", "message"),
+    [
+        (0, "garbage\n", None, "cannot parse recovery process"),
+        (0, "", None, "cannot parse recovery process"),
+        (0, DARWIN_PS_LINE + DARWIN_PS_LINE, None, "cannot parse recovery process"),
+        (0, "Wed Sep 16 11:00:33 2026 notapgid Ss\n", None, "cannot parse recovery process"),
+        (2, "", None, "cannot verify recovery process"),
+        (1, DARWIN_PS_LINE, None, "cannot verify recovery process"),
+        (None, "", subprocess.TimeoutExpired(["ps"], 5), "cannot verify recovery process"),
+        (None, "", OSError("synthetic denied ps"), "cannot verify recovery process"),
+    ],
+)
+def test_strict_identity_darwin_branch_fails_closed(
+    session_state, monkeypatch, returncode, stdout, raises, message,
+) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "darwin")
+
+    def run(argv, *args, **kwargs):
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="ps: boom\n")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    with pytest.raises(SystemExit, match=message):
+        module._strict_process_identity(56525)
+
+
+def test_host_boot_darwin_branch_prefers_boot_session_uuid(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "darwin")
+    fake = _FakeDarwinCommands(processes={}, sysctl={
+        "kern.bootsessionuuid": (0, DARWIN_BOOT_UUID + "\n"),
+        "kern.boottime": (0, DARWIN_BOOTTIME),
+    })
+    monkeypatch.setattr(module.subprocess, "run", fake)
+    assert module._host_boot() == (socket.gethostname().strip(), DARWIN_BOOT_UUID)
+    assert [argv for argv, _ in fake.calls] == [["sysctl", "-n", "kern.bootsessionuuid"]]
+
+
+def test_host_boot_darwin_branch_falls_back_to_boottime(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "darwin")
+    fake = _FakeDarwinCommands(processes={}, sysctl={"kern.boottime": (0, DARWIN_BOOTTIME)})
+    monkeypatch.setattr(module.subprocess, "run", fake)
+    assert module._host_boot()[1] == "1788759298"
+    assert [argv[2] for argv, _ in fake.calls] == ["kern.bootsessionuuid", "kern.boottime"]
+
+    monkeypatch.setattr(module.subprocess, "run", _FakeDarwinCommands(processes={}, sysctl={}))
+    with pytest.raises(SystemExit, match="cannot verify local boot identity"):
+        module._host_boot()
+
+
+def test_process_group_members_darwin_branch_scans_ps(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "darwin")
+
+    class FakeScanner:
+        pid = 4244
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            assert argv == ["ps", "-axo", "pid=,pgid=,stat="]
+
+        def communicate(self, timeout=None):
+            return (
+                "    1     1 Ss\n 4242  4242 S\n 4243  4242 Z\n"
+                " 4244  4242 S+\n 4245  4242 R\n",
+                "",
+            )
+
+    monkeypatch.setattr(module.subprocess, "Popen", FakeScanner)
+    # Zombie 4243 and the scanner itself (4244) are not live members.
+    assert module._process_group_members(4242) == {4242, 4245}
+
+
+def test_process_group_members_linux_branch_without_proc_uses_ps(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "linux")
+    if Path("/proc").is_dir():
+        pytest.skip("host has /proc; the no-/proc fallback is exercised elsewhere")
+    assert os.getpid() in module._process_group_members(os.getpgrp())
+
+
+def test_require_empty_process_group_darwin_branch_refuses_live_leader(
+    session_state, monkeypatch,
+) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "darwin")
+    monkeypatch.setattr(
+        module.subprocess, "run",
+        _FakeDarwinCommands(processes={56525: DARWIN_PS_LINE}, sysctl={}),
+    )
+    scans: list[int] = []
+
+    def members(pgid: int) -> set[int]:
+        scans.append(pgid)
+        return {4242} if pgid == 4242 else set()
+
+    monkeypatch.setattr(module, "_process_group_members", members)
+    with pytest.raises(SystemExit, match="leader pid was reused"):
+        module._require_empty_process_group(56525)
+    assert scans == []
+    with pytest.raises(SystemExit, match="still has live members"):
+        module._require_empty_process_group(4242)
+    module._require_empty_process_group(4243)
+    assert scans == [4242, 4243]
+
+
+def test_require_empty_process_group_linux_branch_walks_proc(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "linux")
+    stat_lines = {
+        200: LINUX_STAT_LINE.format(pid=200, state="S", pgid=200),
+        300: LINUX_STAT_LINE.format(pid=300, state="S", pgid=100),
+        301: LINUX_STAT_LINE.format(pid=301, state="Z", pgid=101),
+    }
+
+    class FakeProcPath(type(module.Path())):
+        def is_dir(self):
+            return str(self) == "/proc" or super().is_dir()
+
+        def iterdir(self):
+            if str(self) != "/proc":
+                yield from super().iterdir()
+                return
+            yield from (FakeProcPath(f"/proc/{pid}") for pid in stat_lines)
+            yield FakeProcPath("/proc/self")
+
+        def read_text(self, *args, **kwargs):
+            text = str(self)
+            if text.startswith("/proc/") and text.endswith("/stat"):
+                pid = int(text.split("/")[2])
+                if pid not in stat_lines:
+                    raise FileNotFoundError(text)
+                return stat_lines[pid]
+            return super().read_text(*args, **kwargs)
+
+    monkeypatch.setattr(module, "Path", FakeProcPath)
+    with pytest.raises(SystemExit, match="leader pid was reused"):
+        module._require_empty_process_group(200)
+    with pytest.raises(SystemExit, match="still has live members"):
+        module._require_empty_process_group(100)
+    module._require_empty_process_group(101)  # only a zombie member remains
+
+
+def test_identity_helpers_reject_unsupported_platform(session_state, monkeypatch) -> None:
+    module = session_state
+    monkeypatch.setattr(module, "_host_os", lambda: "win32")
+    for call in (
+        lambda: module._strict_process_identity(1),
+        module._host_boot,
+        lambda: module._process_group_members(1),
+        lambda: module._require_empty_process_group(1),
+    ):
+        with pytest.raises(SystemExit, match="unsupported platform"):
+            call()
 
 
 FAKE_VENDOR = r'''#!{python}
