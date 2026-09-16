@@ -9,7 +9,7 @@ Use this only when the skill needs to call `autodev` and `autodev --help` fails 
 - Prefer user-scoped install locations derived from XDG or Python user-base.
 - Do not install into a project virtualenv unless the user explicitly asks.
 - Respect an active/user-chosen Python: `PYTHON` wins, then `python3`, then `python`; use the same interpreter for every install step.
-- Do not create or guess a target repo's `vendors.yml`; copying/editing `vendors.yml.example` is a separate user decision.
+- Do not create or guess a target repo's `vendors.yml`; generating the SDK-root `vendors.yml` from `sample-vendors.yml` (`python3 shared/vendors/scripts/init-vendors.py --sample sample-vendors.yml --out vendors.yml`) and editing it is a separate user decision.
 
 ## Choose Python
 
@@ -64,8 +64,11 @@ PY
 ```
 
 `SDK_DIR` must contain `SKILL.md`, `pyproject.toml`, and
-`shared/vendors/scripts/call.sh`. If `shared/vendors` is a symlink, keep it
-valid or copy the shared vendors module into that path as part of packaging.
+`shared/vendors/scripts/call.sh`. With the repo's default symlink install
+(`~/.claude/skills/auto-dev-sdk -> <checkout>/skills/auto-dev-sdk`) `SDK_DIR`
+resolves inside the checkout, so `shared/vendors` and `shared/os` keep
+resolving and the editable install below makes the `autodev` CLI track the
+checkout too. Only a copy install has to materialize the `shared/*` links.
 
 ## Choose install paths
 
