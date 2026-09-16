@@ -39,28 +39,61 @@ exec perl -e '
   die "redact.sh: cannot load $pfile: " . ($@ || $! || "not an array ref") . "\n"
     unless ref $patterns eq "ARRAY";
 
-  my $block_end;     # set while inside a block pattern (e.g. a PEM private key)
-  my $body_seen = 0; # whether the single <redacted> body line was already printed
+  # Block patterns (a PEM private key). Multi-line block mode is entered only
+  # for a real header: the BEGIN marker at the end of its line, allowing
+  # trailing whitespace, quotes, or a literal \n / \r escape
+  # (`key: "-----BEGIN ...-----`, `"-----BEGIN ...-----\n`). Any other text
+  # after the marker is same-line content and never opens a block.
+  my $HEADER_TAIL = qr/^(?:\s|["\x27`]|\\[nr])*$/;
+  # A block collapses at most this many body lines. A stray header in a log
+  # (an ssh error quoting the marker at end of line) must never swallow the
+  # rest of the stream when no END line comes.
+  my $MAX_BLOCK_LINES = 128;
+
+  my $block_end;    # END regex while inside a block; undef in normal mode
+  my $block_rep;    # replacement text for the block body
+  my $block_lines;  # body lines collapsed so far
 
   while (my $line = <STDIN>) {
     if ($block_end) {
       if ($line =~ $block_end) {
-        print "<redacted>\n" unless $body_seen;
-        print $line;
-        undef $block_end;
+        print "$block_rep\n" unless $block_lines;
+        $line =~ s/^.*?(?=$block_end)//;  # key bytes may precede the END marker
+        undef $block_end;                 # the rest of the line is normal text
+      } elsif (++$block_lines > $MAX_BLOCK_LINES) {
+        undef $block_end;                 # cap reached: resume normal mode here
       } else {
-        print "<redacted>\n" unless $body_seen++;
+        print "$block_rep\n" if $block_lines == 1;
+        next;
       }
-      next;
     }
 
     for my $p (@$patterns) {
       my ($name, $re, $rep, $opt) = @$p;
-      if ($opt && $opt->{block_end} && $line =~ $re) {
-        $block_end = $opt->{block_end};
-        $body_seen = 0;
+      my $end = $opt ? $opt->{block_end} : undef;
+      unless ($end) {
+        $line =~ s/$re/ ref $rep eq "CODE" ? $rep->() : $rep /ge;
+        next;
       }
-      $line =~ s/$re/ ref $rep eq "CODE" ? $rep->() : $rep /ge;
+
+      my $r = ref $rep eq "CODE" ? $rep->() : $rep;
+      # BEGIN ... END on one line (GCP JSON, a .env one-liner with \n-escaped
+      # PEM): redact the span between the markers; stay in normal mode.
+      $line =~ s/(?<open>$re)(?<body>.*?)(?<end>$end)/$+{open} . $r . $+{end}/ge;
+      # Only an opener with no END after it on this line is left to handle;
+      # the pairs above keep their BEGIN marker, so look past those.
+      next unless $line =~ /(?<open>$re)(?<tail>(?:(?!$end).)*)$/;
+      if ($+{tail} =~ $HEADER_TAIL) {
+        # A real PEM header: the following body lines collapse to one line.
+        $block_end = $end;
+        $block_rep = $r;
+        $block_lines = 0;
+      } else {
+        # Marker followed by other text and no END on this line (a log line
+        # quoting the header, a key dumped on one line): redact to end of
+        # line only; no block state.
+        $line =~ s/(?<open>$re)(?:(?!$end).)*$/$+{open} . $r/e;
+      }
     }
     print $line;
   }

@@ -51,7 +51,9 @@ def _darwin_process_start_id(pid: int) -> str | None:
     """macOS process start time as epoch seconds, from ``ps -o lstart=``.
 
     ``lstart`` is the kernel's process start time (not the ``ps`` sampling
-    time), so a recycled PID gets a different value from its predecessor.
+    time). Resolution is one second, so a PID recycled within the same second
+    as its predecessor is indistinguishable by this value alone; the caller
+    also checks the owner pid and the process group before signalling.
     """
     ps = shutil.which("ps")
     if not ps:

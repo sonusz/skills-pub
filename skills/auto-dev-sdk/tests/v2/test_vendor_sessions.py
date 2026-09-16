@@ -511,11 +511,27 @@ def test_identity_helpers_reject_unsupported_platform(session_state, monkeypatch
     for call in (
         lambda: module._strict_process_identity(1),
         module._host_boot,
-        lambda: module._process_group_members(1),
         lambda: module._require_empty_process_group(1),
     ):
         with pytest.raises(SystemExit, match="unsupported platform"):
             call()
+    # Group membership keeps the pre-detection behavior on unknown platforms:
+    # the portable ps scan, never a platform refusal.
+    seen: list[list[str]] = []
+
+    class _Scanner:
+        pid = 424242
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            seen.append(list(argv))
+
+        def communicate(self, timeout=None):
+            return ("1 1 Ss\n7 7 Z\n", "")
+
+    monkeypatch.setattr(module.subprocess, "Popen", _Scanner)
+    assert module._process_group_members(1) == {1}
+    assert seen and seen[0][:2] == ["ps", "-axo"]
 
 
 FAKE_VENDOR = r'''#!{python}

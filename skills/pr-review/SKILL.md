@@ -130,16 +130,17 @@ Output (under `$RUN_DIR`):
 | `diff-stat.txt` | `git diff --stat` |
 | `files.txt` | every changed file, verbatim, no filtering (agent classifies) |
 | `secrets.txt` | `shared/secrets/scan.sh --diff` over `diff.patch`: one `path:line:pattern` per added line that matches the secret denylist (never the value). Empty when clean; a `# ...` line when the scan could not run |
-| `summary.json` | machine-readable index (`secret_hits` = line count of `secrets.txt`) |
+| `summary.json` | machine-readable index. `secret_scan` comes from scan.sh's exit code: `clean`, `hits`, `failed` (e.g. perl missing) or `missing` (script not found); `secret_hits` is the number of hit lines in `secrets.txt`, `null` when the scan did not run |
 
 **Read `secrets.txt` first.** Reviewers read manifested files with repo
 access, so a secret in the diff reaches every vendor even though the prompt
 holds only paths. For each listed `path`, either exclude that file from both
 phase manifests (and say so in the summary) or stop and ask the user before
-building any prompt. If `secrets.txt` starts with `#`, the scan did not run
-— eyeball `diff.patch` for credentials yourself. The denylist is
-high-confidence, not complete: a clean file still does not license
-manifesting `.env`, key material, or credential stores.
+building any prompt. If `secret_scan` is `failed` or `missing` (`secrets.txt`
+then holds a single `# ...` line), the scan did not run — eyeball
+`diff.patch` for credentials yourself. The denylist is high-confidence, not
+complete: a clean scan still does not license manifesting `.env`, key
+material, or credential stores.
 
 The script does NOT classify anything. Read `files.txt` and the diff
 yourself; for each file decide what it is and how to handle it (no

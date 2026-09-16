@@ -8,11 +8,19 @@
 #   replacement  a literal string, or a code ref evaluated inside s///e that may
 #                use $1.. captures (e.g. sub { "$1<redacted>" }); redact.sh uses
 #                it, scan.sh ignores it
-#   options      optional hash ref. block_end => qr/.../ marks a block pattern:
-#                the regex matches the block's opening line; redact.sh keeps that
-#                line, replaces everything up to the block_end line with a single
-#                "<redacted>" line (or to EOF if the end never comes), and keeps
-#                the end line. scan.sh reports only the opening line.
+#   options      optional hash ref. block_end => qr/.../ marks a block pattern
+#                (a PEM private key): regex matches the BEGIN marker, block_end
+#                the END marker, and replacement is the text that stands in for
+#                the key material between them (a string, or a code ref called
+#                without captures). redact.sh keeps both markers: a BEGIN...END
+#                pair on one line is redacted between the markers; a BEGIN
+#                marker at the end of its line (trailing quotes / a literal \n
+#                allowed -- a real PEM header) opens a multi-line block whose
+#                body collapses to one replacement line until the END line
+#                (printed from the END marker onward) or for at most 128 body
+#                lines; a BEGIN marker followed by other text and no END is
+#                redacted to the end of that line only. scan.sh reports only
+#                the BEGIN line.
 #
 # This is a DENYLIST OF HIGH-CONFIDENCE SHAPES, NOT A GUARANTEE. A secret in a
 # novel format, a base64 blob, a password that looks like a word, or a token
@@ -59,10 +67,11 @@ my @patterns = (
   # ---- additions ----
 
   # PEM private key blocks (RSA, EC, OPENSSH, DSA, PKCS#8, encrypted PKCS#8, PGP).
-  # Block pattern: the header line is kept, the body collapses to <redacted>.
+  # Block pattern (see the options note above): both markers are kept, the key
+  # material between them becomes <redacted>.
   [ 'private-key-block',
-    qr/(-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----)/,
-    sub { $1 },
+    qr/-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----/,
+    $R,
     { block_end => qr/-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----/ } ],
 
   # OpenAI / Anthropic style keys: sk-..., sk-proj-..., sk-ant-... (prefix kept)

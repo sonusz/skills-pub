@@ -128,7 +128,9 @@ def run_idle_probe(
 
     cfg = probe_config
     timeout = probe_timeout_sec if probe_timeout_sec is not None else cfg.timeout_sec
-    timeout = max(int(timeout), 0)
+    # A watchdog arbiter must itself be bounded: 0/negative would turn the
+    # outer wait below (and the script's own call.sh --timeout) into "forever".
+    timeout = max(int(timeout), 1)
     env = os.environ.copy()
     cmd = [
         "bash", str(IDLE_PROBE_SCRIPT),
@@ -221,7 +223,7 @@ def run_idle_probe(
             try:
                 # The script bounds the model call itself; this outer cap only
                 # guards against the wrapper wedging.
-                out, err = proc.communicate(timeout=timeout + 30 if timeout else None)
+                out, err = proc.communicate(timeout=timeout + 30)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)

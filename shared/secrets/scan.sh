@@ -12,7 +12,9 @@
 #
 # Output: one `path:line:pattern-name` per hit on stdout (path is `-` for
 # stdin; a line hit by several patterns is reported once per pattern). The
-# matched secret is never printed. Diagnostics go to stderr.
+# matched secret is never printed, and a path that is itself secret-shaped
+# (a file named after a token) is printed through the same denylist.
+# Diagnostics go to stderr.
 #
 # Exit codes:
 #   0  clean
@@ -31,7 +33,7 @@ set -uo pipefail
 SECRETS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
 
 MODE=plain
@@ -64,6 +66,17 @@ PROG='
 
   my $hits = 0;
   my $errors = 0;
+
+  # A path can itself be secret-shaped (a file named after a token), so every
+  # printed path goes through the same denylist as the content.
+  sub redact_path {
+    my ($path) = @_;
+    for my $p (@$patterns) {
+      my ($name, $re, $rep) = @$p;
+      $path =~ s/$re/ ref $rep eq "CODE" ? $rep->() : $rep /ge;
+    }
+    return $path;
+  }
 
   sub scan_line {
     my ($path, $n, $line) = @_;
@@ -120,7 +133,7 @@ PROG='
         $p =~ s/\t.*$//;
         $p =~ s/^"(.*)"$/$1/;
         $p =~ s{^b/}{};
-        $path = $p eq "/dev/null" ? $fallback : $p;
+        $path = $p eq "/dev/null" ? $fallback : redact_path($p);
       } elsif ($line =~ /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/) {
         $old_left = defined $1 ? $1 : 1;
         $new_line = $2;
@@ -149,7 +162,8 @@ PROG='
         print STDERR "scan.sh: cannot read $f: $!\n"; $errors++; next;
       }
     }
-    if ($mode eq "diff") { scan_diff($fh, $path) } else { scan_plain($fh, $path) }
+    my $shown = redact_path($path);
+    if ($mode eq "diff") { scan_diff($fh, $shown) } else { scan_plain($fh, $shown) }
     close $fh unless $f eq "-";
   }
 

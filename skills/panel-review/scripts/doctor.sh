@@ -35,7 +35,7 @@ require_value() {
   fi
 }
 
-VENDORS_YAML="$(panel_default_config)"
+VENDORS_YAML=""
 PROBE_TIMEOUT="${PANEL_DOCTOR_TIMEOUT:-60}"
 PROBE_PROMPT="reply with the single word READY"
 TROUBLESHOOTING_FILE="$PANEL_VENDORS_DIR/TROUBLESHOOTING.md"
@@ -72,6 +72,10 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# Resolve the default only when no config was passed, so the "using sample"
+# note never prints for an explicit argument (or for --help).
+[ -n "$VENDORS_YAML" ] || VENDORS_YAML="$(panel_default_config)"
 
 panel_require_config "$VENDORS_YAML"
 

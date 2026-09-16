@@ -62,21 +62,19 @@ Signs of **wedged** (→ kill):
 
 ## Output format
 
-One line, exactly one of:
+End your answer with one verdict line, alone on its line, in one of these
+two shapes (quoted inline here on purpose, so this prompt never contains a
+bare verdict line that could be mistaken for your answer):
 
-```
-VERDICT: extend <seconds>
-```
-or
-```
-VERDICT: kill
-```
+- `VERDICT: extend <seconds>` grants more idle budget, where `<seconds>` is
+  a whole number. Max 1800 (30 min). Start conservative: 300-600 is
+  typical.
+- `VERDICT: kill` stops the process now.
 
-`<seconds>` is how much additional idle budget to grant. Max 1800
-(30 min). Start conservative: 300-600 is typical.
-
-Optionally, one line of rationale after the VERDICT line. The harness
-parses only the VERDICT line; the rationale is for the operator log.
+The harness keeps only the LAST line of that shape, so any reasoning you
+want to write goes before the verdict line, never after it in verdict
+form. Optionally add one line of rationale after the verdict line; the
+harness logs it for the operator and does not parse it.
 
 Do NOT call any tools. Do NOT try to write files or send signals.
 You are a read-only arbiter; your only output is the verdict.

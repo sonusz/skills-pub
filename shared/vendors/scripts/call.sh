@@ -106,7 +106,7 @@ Runtime and native options:
                                  Requires --timeout. Off by default.
   --idle-probe-model MODEL       Probe model (default: vendors.conf model)
   --idle-probe-effort EFFORT     Probe effort hint (default: none)
-  --idle-probe-timeout SECONDS   Probe call timeout (default: 60)
+  --idle-probe-timeout SECONDS   Probe call timeout (default: 60; must be > 0)
   --idle-probe-max-total SECONDS Total extra seconds all probe verdicts may
                                  grant to one call (default: 3600)
   --native-arg ARG               Raw selected-vendor CLI arg; repeatable
@@ -494,27 +494,41 @@ case "$EFFORT" in
     ;;
 esac
 
+# Every digit string below is forced to base 10 once validated: $(( )) reads a
+# leading zero as octal, so "0600" would count as 384 and "08" would be an
+# error that, under set -e, silently kills the watchdog subshell that does the
+# arithmetic (leaving the vendor with no timeout at all).
 case "$TIMEOUT_SECONDS" in
   ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
 esac
+TIMEOUT_SECONDS=$((10#$TIMEOUT_SECONDS))
 
 case "$TIMEOUT_EXTEND_SECONDS" in
   ''|*[!0-9]*) die "--timeout-extend must be a non-negative integer" ;;
 esac
+TIMEOUT_EXTEND_SECONDS=$((10#$TIMEOUT_EXTEND_SECONDS))
 
+# 0 would disable the probe's own deadline; a wedged probe call could then
+# block the watchdog, and with it the kill, forever.
 case "$IDLE_PROBE_TIMEOUT" in
-  ''|*[!0-9]*) die "--idle-probe-timeout must be a non-negative integer" ;;
+  ''|*[!0-9]*) die "--idle-probe-timeout must be a positive integer" ;;
 esac
+IDLE_PROBE_TIMEOUT=$((10#$IDLE_PROBE_TIMEOUT))
+[ "$IDLE_PROBE_TIMEOUT" -gt 0 ] || die "--idle-probe-timeout must be a positive integer"
 
 case "$IDLE_PROBE_MAX_TOTAL" in
   ''|*[!0-9]*) die "--idle-probe-max-total must be a non-negative integer" ;;
 esac
+IDLE_PROBE_MAX_TOTAL=$((10#$IDLE_PROBE_MAX_TOTAL))
 
 if [ -n "$IDLE_PROBE_VENDOR" ]; then
   # Validate in a subshell: vendors_normalize_vendor sets the VENDORS_VENDOR_*
   # globals that the per-vendor loop below owns.
   (vendors_normalize_vendor "$IDLE_PROBE_VENDOR" >/dev/null 2>&1) \
     || die "--idle-probe-vendor: unknown vendor: $IDLE_PROBE_VENDOR"
+  # The probe only ever runs from the --timeout watchdog; without one it
+  # would be accepted and silently do nothing.
+  [ "$TIMEOUT_SECONDS" -gt 0 ] || die "--idle-probe-vendor requires --timeout > 0"
   if [ -n "$IDLE_PROBE_EFFORT" ]; then
     IDLE_PROBE_EFFORT=$(vendors_normalize_effort "$IDLE_PROBE_EFFORT") \
       || die "--idle-probe-effort must be min, low, medium, high, xhigh, or max"
@@ -802,6 +816,76 @@ pid_has_live_work() {
   esac
 }
 
+snapshot_has_live_work() {
+  # True when any pid listed in $1 (one per line), other than $2, is alive
+  # and not a zombie.
+  local targets_file="$1"
+  local skip_pid="${2:-}"
+  local target=""
+
+  while read -r target; do
+    [ -n "$target" ] && [ "$target" != "$skip_pid" ] || continue
+    if pid_has_live_work "$target"; then
+      return 0
+    fi
+  done < "$targets_file"
+  return 1
+}
+
+reap_timed_out_tree() {
+  # SIGKILL escalation for a timed-out call, run by run_one_vendor after
+  # `wait "$RUN_PID"` returns with the timeout marker present.
+  #
+  # Why it lives here and not in the watchdog: the watchdog sends TERM
+  # leaves-first through kill_tree and ends with RUN_PID, a bash subshell
+  # with the default TERM disposition. RUN_PID therefore dies on that first
+  # TERM, the parent's wait returns, and the parent tears the watchdog down
+  # while it is still in its `sleep 2` -- its KILL pass never ran. A vendor
+  # CLI that ignores TERM survived as an orphan: reparented to init, no
+  # longer reachable from RUN_PID with `pgrep -P`, and still writing into
+  # the call dir after the status block has reported a timeout.
+  #
+  # So the watchdog records the tree it is about to signal in $1
+  # (collect_process_tree, before any TERM), and this walks that snapshot:
+  # every listed pid already received TERM, so give it two seconds, KILL
+  # whatever still has live work, and wait for the kernel to tear it down.
+  # $2 is RUN_PID, already reaped by wait (its pid is free for reuse), so it
+  # is skipped. Process groups would be tidier, but bash 3.2 has no setpgid,
+  # macOS has no setsid(1), and `set -m` would change job semantics for the
+  # whole coordinator; a pid snapshot taken microseconds before TERM is the
+  # least invasive reliable handle, and it is the same handle handle_signal
+  # already relies on.
+  local targets_file="$1"
+  local reaped_pid="${2:-}"
+  local target=""
+  local tries=0
+
+  [ -r "$targets_file" ] || return 0
+  tries=0
+  while snapshot_has_live_work "$targets_file" "$reaped_pid"; do
+    [ "$tries" -lt 2 ] || break
+    sleep 1
+    tries=$((tries + 1))
+  done
+  snapshot_has_live_work "$targets_file" "$reaped_pid" || return 0
+  while read -r target; do
+    [ -n "$target" ] && [ "$target" != "$reaped_pid" ] || continue
+    if pid_has_live_work "$target"; then
+      kill -KILL "$target" 2>/dev/null || true
+    fi
+  done < "$targets_file"
+  tries=0
+  while snapshot_has_live_work "$targets_file" "$reaped_pid"; do
+    [ "$tries" -lt 3 ] || break
+    sleep 1
+    tries=$((tries + 1))
+  done
+  if snapshot_has_live_work "$targets_file" "$reaped_pid"; then
+    printf "timeout: part of the vendor process tree survived SIGKILL escalation; see %s\n" \
+      "$targets_file" >&2
+  fi
+}
+
 handle_signal() {
   local code="$1"
   local pid=""
@@ -1033,6 +1117,7 @@ run_one_vendor() {
   local idle_probe_verdicts=0
   local idle_probe_last_verdict=""
   local run_started_epoch=""
+  local kill_targets_file=""
 
   call_dir=$(dirname "$output_file")
   timeout_marker="$call_dir/timed-out"
@@ -1160,9 +1245,12 @@ run_one_vendor() {
   if [ "$TIMEOUT_SECONDS" -gt 0 ] && [ "$VENDORS_DRY_RUN" != "1" ]; then
     # The watchdog subshell cannot set this function's variables, so it
     # appends every idle-probe verdict to a work file that the status block
-    # reads back after the run.
+    # reads back after the run, and writes the pids it is about to TERM to
+    # a file the parent escalates from (reap_timed_out_tree).
     idle_probe_verdict_file="$WORK_DIR/$output_id.idle-probe-verdicts"
+    kill_targets_file="$WORK_DIR/$output_id.kill-targets"
     : > "$idle_probe_verdict_file"
+    rm -f "$kill_targets_file"
     run_started_epoch=$(date +%s)
     vendors_run "$vendor_id" "$prompt_file" "$output_file" &
     RUN_PID=$!
@@ -1189,7 +1277,9 @@ run_one_vendor() {
         # the remaining --idle-probe-max-total budget) and returns to the
         # extend-window check; `kill`, an exhausted budget, or any probe
         # failure falls through to the kill below. The probe's own call.sh
-        # gets no idle-probe flags (no recursion) and no --session-key.
+        # gets no idle-probe flags (no recursion) and no --session-key, but
+        # does get this call's --config so it resolves models from the same
+        # mapping.
         [ -n "$IDLE_PROBE_VENDOR" ] || break
         probe_remaining=$((IDLE_PROBE_MAX_TOTAL - probe_granted))
         if [ "$probe_remaining" -le 0 ]; then
@@ -1200,6 +1290,10 @@ run_one_vendor() {
         probe_count=$((probe_count + 1))
         probe_idle_sec=$(stream_idle_seconds "$run_started_epoch")
         probe_out_dir="$call_dir/idle-probe/$probe_count"
+        probe_verdict_file="$probe_out_dir/verdict"
+        probe_deadline_marker="$probe_out_dir/hard-deadline"
+        probe_hard_deadline=$((IDLE_PROBE_TIMEOUT + 30))
+        mkdir -p "$probe_out_dir"
         probe_args=(
           "$SCRIPT_DIR/idle-probe.sh"
           --pid "$RUN_PID"
@@ -1212,6 +1306,7 @@ run_one_vendor() {
           --probe-vendor "$IDLE_PROBE_VENDOR"
           --probe-timeout "$IDLE_PROBE_TIMEOUT"
           --output-dir "$probe_out_dir"
+          --config "$CONFIG_FILE"
         )
         if [ -n "$IDLE_PROBE_MODEL" ]; then
           probe_args+=(--probe-model "$IDLE_PROBE_MODEL")
@@ -1221,9 +1316,40 @@ run_one_vendor() {
         fi
         printf "idle-probe: probe %s after %ss idle (cap %ss) via %s\n" \
           "$probe_count" "$probe_idle_sec" "$TIMEOUT_SECONDS" "$IDLE_PROBE_VENDOR"
-        probe_output=$(bash "${probe_args[@]}") || probe_output="kill"
-        probe_verdict=$(printf "%s\n" "$probe_output" | head -n 1)
-        probe_rationale=$(printf "%s\n" "$probe_output" | sed -n '2p')
+        # Evidence snapshot: a `kill` verdict is trusted only if the stream
+        # stayed still while the probe ran (stale-verdict check below).
+        probe_pre_size=$(stream_size)
+        probe_pre_mtime=$(file_mtime_epoch "$VENDORS_STREAM_FILE")
+        # idle-probe.sh enforces its own --probe-timeout, but a probe wedged
+        # outside that window (its call.sh stuck before the vendor call, a
+        # hung PTY) would otherwise block this watchdog, and with it the
+        # kill, forever. Run it under a hard deadline of its own.
+        probe_status=0
+        bash "${probe_args[@]}" > "$probe_verdict_file" &
+        probe_pid=$!
+        (
+          sleep "$probe_hard_deadline"
+          : > "$probe_deadline_marker"
+          kill_tree "$probe_pid" TERM
+          sleep 2
+          kill_tree "$probe_pid" KILL
+        ) &
+        probe_guard_pid=$!
+        wait "$probe_pid" 2>/dev/null || probe_status=$?
+        kill_tree "$probe_guard_pid" TERM
+        wait "$probe_guard_pid" 2>/dev/null || true
+        if [ -e "$probe_deadline_marker" ]; then
+          printf "idle-probe: probe %s exceeded its hard deadline (%ss); treating as kill\n" \
+            "$probe_count" "$probe_hard_deadline"
+          probe_verdict="kill"
+          probe_rationale=""
+        elif [ "$probe_status" -ne 0 ]; then
+          probe_verdict="kill"
+          probe_rationale="probe exited $probe_status"
+        else
+          probe_verdict=$(head -n 1 "$probe_verdict_file" 2>/dev/null || true)
+          probe_rationale=$(sed -n '2p' "$probe_verdict_file" 2>/dev/null || true)
+        fi
         [ -n "$probe_verdict" ] || probe_verdict="kill"
         printf "%s\n" "$probe_verdict" >> "$idle_probe_verdict_file"
         printf "idle-probe: verdict %s: %s%s\n" "$probe_count" "$probe_verdict" \
@@ -1234,6 +1360,13 @@ run_one_vendor() {
             case "$probe_grant" in
               ''|*[!0-9]*) probe_grant=0 ;;
             esac
+            # Base 10 (see the --timeout validation); more than nine digits
+            # is "huge", not an overflow.
+            if [ "${#probe_grant}" -gt 9 ]; then
+              probe_grant="$probe_remaining"
+            else
+              probe_grant=$((10#$probe_grant))
+            fi
             if [ "$probe_grant" -gt "$probe_remaining" ]; then
               probe_grant="$probe_remaining"
             fi
@@ -1246,14 +1379,65 @@ run_one_vendor() {
             sleep "$probe_grant"
             ;;
           *)
+            # A kill verdict judged evidence gathered before the probe ran.
+            # If the vendor exited or its stream grew in the meantime, that
+            # evidence is stale: discard the verdict rather than kill a call
+            # that just resumed.
+            if ! pid_has_live_work "$RUN_PID"; then
+              printf "idle-probe: vendor exited while probe %s ran; discarding stale kill verdict\n" \
+                "$probe_count"
+              exit 0
+            fi
+            probe_post_size=$(stream_size)
+            probe_post_mtime=$(file_mtime_epoch "$VENDORS_STREAM_FILE")
+            if [ "$probe_post_size" -gt "$probe_pre_size" ] \
+                || [ "$probe_post_mtime" != "$probe_pre_mtime" ]; then
+              printf "idle-probe: stream grew while probe %s ran (%s -> %s bytes); discarding stale kill verdict\n" \
+                "$probe_count" "$probe_pre_size" "$probe_post_size"
+              # Back to the extend-window check, which sees the growth.
+              prev_size="$probe_pre_size"
+              if [ "$TIMEOUT_EXTEND_SECONDS" -le 0 ]; then
+                # No extend windows configured: wait one base window for
+                # the resumed stream, charged to the probe budget so a
+                # trickle of output cannot re-probe forever.
+                probe_grant="$TIMEOUT_SECONDS"
+                if [ "$probe_grant" -gt "$probe_remaining" ]; then
+                  probe_grant="$probe_remaining"
+                fi
+                probe_granted=$((probe_granted + probe_grant))
+                printf "idle-probe: waiting %ss for the resumed stream (%ss of %ss budget used)\n" \
+                  "$probe_grant" "$probe_granted" "$IDLE_PROBE_MAX_TOTAL"
+                sleep "$probe_grant"
+              fi
+              continue
+            fi
             break
             ;;
         esac
       done
+      # Nothing to kill if the vendor finished while the watchdog deliberated
+      # (and no timeout to report: the run's own exit status stands).
+      if ! pid_has_live_work "$RUN_PID"; then
+        exit 0
+      fi
+      # Snapshot the tree BEFORE signalling: RUN_PID dies on the TERM below,
+      # after which its surviving descendants are orphans that pgrep -P can
+      # no longer find. The parent escalates from this file
+      # (reap_timed_out_tree); the sleep/KILL tail here only matters if
+      # RUN_PID itself ignores TERM (call.sh started with SIGTERM ignored),
+      # so it works from the same snapshot.
+      SIGNAL_TARGET_PIDS=()
+      collect_process_tree "$RUN_PID"
+      printf '%s\n' "${SIGNAL_TARGET_PIDS[@]}" > "$kill_targets_file"
       : > "$timeout_marker"
       kill_tree "$RUN_PID" TERM
       sleep 2
-      kill_tree "$RUN_PID" KILL
+      while read -r target; do
+        [ -n "$target" ] || continue
+        if pid_has_live_work "$target"; then
+          kill -KILL "$target" 2>/dev/null || true
+        fi
+      done < "$kill_targets_file"
     ) &
     TIMER_PID=$!
     wait "$RUN_PID" || run_status=$?
@@ -1265,7 +1449,13 @@ run_one_vendor() {
     wait "$TIMER_PID" 2>/dev/null || true
     if [ -e "$timeout_marker" ]; then
       run_status=124
+      # The watchdog's TERM already took RUN_PID down (that is why wait
+      # returned); finish the escalation for TERM-resistant descendants
+      # before the status block reports, so nothing keeps writing into the
+      # call dir afterwards.
+      reap_timed_out_tree "$kill_targets_file" "$RUN_PID"
     fi
+
     if [ -s "$idle_probe_verdict_file" ]; then
       idle_probe_verdicts=$(wc -l < "$idle_probe_verdict_file" | tr -d '[:space:]')
       idle_probe_last_verdict=$(tail -n 1 "$idle_probe_verdict_file")

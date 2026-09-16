@@ -37,7 +37,11 @@
 #                    `# ...` comment line when the scan could not run. Never
 #                    fails the bundle — the agent reads it and excludes or
 #                    redacts before building any prompt.
-#   summary.json     machine-readable summary (includes secret_hits)
+#   summary.json     machine-readable summary. secret_scan is taken from
+#                    scan.sh's exit code: "clean" (0), "hits" (1), "failed"
+#                    (>= 2, e.g. perl missing) or "missing" (scan.sh not
+#                    found); secret_hits is the number of hit lines in
+#                    secrets.txt, or null when the scan did not run.
 #
 # Usage:
 #   bash scripts/gather-context.sh --branches main feature/foo --out /tmp/run
@@ -175,21 +179,38 @@ git diff --name-only --diff-filter=AM "$MERGE_BASE..$HEAD_SHA" | sort -u > "$OUT
 # Secret scan of the added lines. Records hits; never fails the bundle.
 # Reviewers read manifested files with repo access, so the agent must drop or
 # redact anything listed here before building a prompt.
+#
+# The outcome comes from scan.sh's exit code, never from the content of
+# secrets.txt (a changed path may itself start with `#`):
+#   0     clean    secret_hits 0
+#   1     hits     secret_hits = non-empty lines of secrets.txt
+#   >= 2  failed   secret_hits null (perl missing, unreadable input)
+#   -     missing  secret_hits null (scan.sh not found)
 # ---------------------------------------------------------------------------
 SECRETS_SCAN="$SKILL_DIR/shared/secrets/scan.sh"
+SECRET_SCAN="missing"
+SECRET_HITS=null
 SCAN_RC=0
 if [[ -f "$SECRETS_SCAN" ]]; then
   bash "$SECRETS_SCAN" --diff < "$OUT/diff.patch" > "$OUT/secrets.txt" 2>/dev/null || SCAN_RC=$?
-  if [[ "$SCAN_RC" -ge 2 ]]; then
-    echo "# secret scan did not run (scan.sh exit $SCAN_RC; is perl installed?) — treat the diff as unscanned" > "$OUT/secrets.txt"
-    echo "Warning: shared/secrets/scan.sh exited $SCAN_RC; diff not scanned for secrets." >&2
-  fi
+  case "$SCAN_RC" in
+    0)
+      SECRET_SCAN="clean"
+      SECRET_HITS=0
+      ;;
+    1)
+      SECRET_SCAN="hits"
+      SECRET_HITS=$(grep -c . "$OUT/secrets.txt" || true)
+      SECRET_HITS=${SECRET_HITS:-0}
+      ;;
+    *)
+      SECRET_SCAN="failed"
+      echo "# secret scan did not run (scan.sh exit $SCAN_RC; is perl installed?) — treat the diff as unscanned" > "$OUT/secrets.txt"
+      ;;
+  esac
 else
   echo "# secret scan unavailable (shared/secrets/scan.sh not found) — treat the diff as unscanned" > "$OUT/secrets.txt"
-  echo "Warning: shared/secrets/scan.sh not found; diff not scanned for secrets." >&2
 fi
-SECRET_HITS=$(grep -c -v '^#' "$OUT/secrets.txt" 2>/dev/null || true)
-SECRET_HITS=${SECRET_HITS:-0}
 
 # ---------------------------------------------------------------------------
 # Write metadata
@@ -215,6 +236,7 @@ jq -n \
   --arg head_ref "$HEAD_REF" \
   --argjson file_count "$FILE_COUNT" \
   --argjson diff_bytes "$DIFF_BYTES" \
+  --arg secret_scan "$SECRET_SCAN" \
   --argjson secret_hits "$SECRET_HITS" \
   --rawfile files "$OUT/files.txt" \
   '{
@@ -227,14 +249,25 @@ jq -n \
     head_ref: $head_ref,
     file_count: $file_count,
     diff_bytes: $diff_bytes,
+    secret_scan: $secret_scan,
     secret_hits: $secret_hits,
     files: ($files | split("\n") | map(select(length > 0)))
   }' > "$OUT/summary.json"
 
 echo "Context bundle written to: $OUT"
 echo ""
-jq '{mode, pr_number, head_sha, merge_base_sha, repo_root, base_ref, head_ref, file_count, diff_bytes, secret_hits}' "$OUT/summary.json"
-if [[ "$SECRET_HITS" -gt 0 ]]; then
-  echo ""
-  echo "WARNING: $SECRET_HITS added line(s) match the secret denylist — see $OUT/secrets.txt and exclude or redact before building any prompt." >&2
-fi
+jq '{mode, pr_number, head_sha, merge_base_sha, repo_root, base_ref, head_ref, file_count, diff_bytes, secret_scan, secret_hits}' "$OUT/summary.json"
+case "$SECRET_SCAN" in
+  hits)
+    echo ""
+    echo "WARNING: $SECRET_HITS added line(s) match the secret denylist — see $OUT/secrets.txt and exclude or redact before building any prompt." >&2
+    ;;
+  failed)
+    echo ""
+    echo "WARNING: secret scan failed (scan.sh exit $SCAN_RC; is perl installed?) — the diff is unscanned; check $OUT/diff.patch for credentials yourself before building any prompt." >&2
+    ;;
+  missing)
+    echo ""
+    echo "WARNING: shared/secrets/scan.sh not found — the diff is unscanned; check $OUT/diff.patch for credentials yourself before building any prompt." >&2
+    ;;
+esac

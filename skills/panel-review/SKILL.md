@@ -160,6 +160,10 @@ scripts/launch.sh --cwd "$REVIEW_CWD" <prompt_file> vendors.yaml "$RUN_DIR"
 # outputs before the synthesizer reads them.
 ```
 
+Pass `sample-vendors.yaml` (every vendor) in place of `vendors.yaml` if you
+have not generated the local file yet — the doctor/launch default falls back
+to the sample automatically only when the config argument is omitted.
+
 `--cwd` is mandatory (`PANEL_REVIEW_CWD` in the environment is accepted as the
 same explicit setting; the flag wins when both are set). `--repo` is accepted
 as a no-op for callers written against the old two-mode launcher. `launch.sh`
@@ -174,6 +178,10 @@ outputs and writes `$RUN_DIR/synthesis/out` by default:
 scripts/synthesize.sh <prompt_file> vendors.yaml "$RUN_DIR"
 cat "$RUN_DIR/synthesis/out"
 ```
+
+As in §4, pass `sample-vendors.yaml` here if you have not generated
+`vendors.yaml` yet — the default falls back to the sample only when the
+argument is omitted.
 
 The synthesis prompt requires this format:
 

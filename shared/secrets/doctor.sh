@@ -76,6 +76,78 @@ case "$OUT" in
   *) doctor_fail "redact.sh produced unexpected output for an AWS key" ;;
 esac
 
+# Private-key blocks. The PEM markers are assembled at runtime so no header
+# lives in this file; the body is a placeholder, never key material. Every
+# case ends with an AWS key on the line after the block, which must still be
+# redacted: block handling must never swallow what follows.
+PEM_B="$(printf -- '-----%s RSA PRIVATE KEY-----' BEGIN)"
+PEM_E="$(printf -- '-----%s RSA PRIVATE KEY-----' END)"
+PEM_BODY="MIIBODYLINEPLACEHOLDER"
+nth_line() { printf '%s\n' "$1" | sed -n "${2}p"; }
+line_count() { printf '%s\n' "$1" | wc -l | tr -d ' '; }
+
+# BEGIN and END on one line (GCP JSON / .env with \n-escaped PEM): the span
+# between the markers is redacted inline; the following lines stay intact.
+OUT="$(printf '{"private_key":"%s\\n%s\\n%s\\n"}\nnext line\nkey=%s\n' "$PEM_B" "$PEM_BODY" "$PEM_E" "$AKIA" | bash "$REDACT" 2>/dev/null)"
+if [ "$(line_count "$OUT")" -eq 3 ] \
+   && [ "$(nth_line "$OUT" 1)" = "{\"private_key\":\"$PEM_B<redacted>$PEM_E\\n\"}" ] \
+   && [ "$(nth_line "$OUT" 2)" = "next line" ] \
+   && [ "$(nth_line "$OUT" 3)" = "key=AKIA<redacted>" ]; then
+  doctor_pass "redact.sh redacts a same-line BEGIN...END key inline; next lines intact"
+else
+  doctor_fail "redact.sh mishandled a same-line BEGIN...END key (got $(line_count "$OUT") line(s))"
+fi
+
+# A log line that merely mentions the header (an ssh error): redacted to the
+# end of that line only; nothing after it is swallowed.
+OUT="$(printf 'ssh: error: %s is not a valid key file\nnext line\nkey=%s\n' "$PEM_B" "$AKIA" | bash "$REDACT" 2>/dev/null)"
+if [ "$(line_count "$OUT")" -eq 3 ] \
+   && [ "$(nth_line "$OUT" 1)" = "ssh: error: $PEM_B<redacted>" ] \
+   && [ "$(nth_line "$OUT" 2)" = "next line" ] \
+   && [ "$(nth_line "$OUT" 3)" = "key=AKIA<redacted>" ]; then
+  doctor_pass "redact.sh does not enter block mode on a line that only mentions the header"
+else
+  doctor_fail "redact.sh swallowed lines after a header-only mention (got $(line_count "$OUT") line(s))"
+fi
+
+# A real PEM (header, 3 body lines, footer): header and footer kept, the body
+# collapses to one <redacted> line, the line after the footer is scanned.
+OUT="$(printf '%s\n%s\n%s\n%s\n%s\nkey=%s\n' "$PEM_B" "$PEM_BODY" "$PEM_BODY" "$PEM_BODY" "$PEM_E" "$AKIA" | bash "$REDACT" 2>/dev/null)"
+if [ "$(line_count "$OUT")" -eq 4 ] \
+   && [ "$(nth_line "$OUT" 1)" = "$PEM_B" ] \
+   && [ "$(nth_line "$OUT" 2)" = "<redacted>" ] \
+   && [ "$(nth_line "$OUT" 3)" = "$PEM_E" ] \
+   && [ "$(nth_line "$OUT" 4)" = "key=AKIA<redacted>" ]; then
+  doctor_pass "redact.sh keeps a PEM header and footer and collapses the body to one <redacted> line"
+else
+  doctor_fail "redact.sh mishandled a multi-line PEM block (got $(line_count "$OUT") line(s))"
+fi
+
+# A quoted multi-line value (YAML / shell): the header may end in a quote and
+# key bytes may precede the footer; output resumes from the END marker.
+OUT="$(printf 'key: "%s\n%s\n%s%s"\nkey=%s\n' "$PEM_B" "$PEM_BODY" "$PEM_BODY" "$PEM_E" "$AKIA" | bash "$REDACT" 2>/dev/null)"
+if [ "$(line_count "$OUT")" -eq 4 ] \
+   && [ "$(nth_line "$OUT" 1)" = "key: \"$PEM_B" ] \
+   && [ "$(nth_line "$OUT" 2)" = "<redacted>" ] \
+   && [ "$(nth_line "$OUT" 3)" = "$PEM_E\"" ] \
+   && [ "$(nth_line "$OUT" 4)" = "key=AKIA<redacted>" ]; then
+  doctor_pass "redact.sh handles a quoted PEM value and key bytes before the END marker"
+else
+  doctor_fail "redact.sh mishandled a quoted PEM value (got $(line_count "$OUT") line(s))"
+fi
+
+# A header with no END line ever: the block is capped at 128 body lines and
+# normal mode resumes, so a stray header cannot eat a whole log.
+OUT="$( { printf '%s\n' "$PEM_B"; yes "$PEM_BODY" | head -130; printf 'key=%s\n' "$AKIA"; } | bash "$REDACT" 2>/dev/null)"
+if [ "$(line_count "$OUT")" -eq 5 ] \
+   && [ "$(nth_line "$OUT" 2)" = "<redacted>" ] \
+   && [ "$(nth_line "$OUT" 3)" = "$PEM_BODY" ] \
+   && [ "$(nth_line "$OUT" 5)" = "key=AKIA<redacted>" ]; then
+  doctor_pass "redact.sh caps an unterminated block at 128 body lines"
+else
+  doctor_fail "redact.sh did not cap an unterminated block (got $(line_count "$OUT") line(s))"
+fi
+
 # scan: must report the hit by name with exit 1, never the value
 OUT="$(printf 'token %s\n' "$GHP" | bash "$SCAN" 2>/dev/null)"; RC=$?
 if [ "$RC" -eq 1 ] && [ "$OUT" = "-:1:github-pat" ]; then
@@ -92,6 +164,23 @@ fi
 case "$OUT" in
   *"$AKIA"*) doctor_fail "scan.sh printed the matched secret" ;;
   *) doctor_pass "scan.sh output never contains the matched value" ;;
+esac
+
+# A file whose NAME is secret-shaped: the printed path goes through the
+# denylist too, so the report never leaks the token.
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/secrets-doctor.XXXXXX")"
+printf 'key=%s\n' "$AKIA" > "$TMPD/$GHP.txt"
+OUT="$(bash "$SCAN" "$TMPD/$GHP.txt" 2>/dev/null)"; RC=$?
+rm -rf "$TMPD"
+case "$OUT" in
+  *"$GHP"*) doctor_fail "scan.sh printed a secret-shaped file name verbatim" ;;
+  *)
+    if [ "$RC" -eq 1 ] && [ "$OUT" = "$TMPD/gh<redacted>.txt:1:aws-access-key" ]; then
+      doctor_pass "scan.sh redacts a secret-shaped file name in its report"
+    else
+      doctor_fail "scan.sh on a secret-shaped file name: exit $RC, expected 1 with '<dir>/gh<redacted>.txt:1:aws-access-key'"
+    fi
+    ;;
 esac
 
 # scan --diff: added line addressed by new-file path and line number

@@ -35,16 +35,32 @@ vendors_lower() {
 # this file's physical directory (<scripts>/../../os). Walk the symlink chain
 # first (bash 3.2, no readlink -f on macOS); a materialized copy of the vendors
 # module shipped without shared/os keeps the inline case below.
-VENDORS_HOST_OS_LIB=$(
-  src="${BASH_SOURCE[0]}"
+#
+# vendors_physical_path: print the physical path of $1 with every symlink hop
+# resolved, or fail. The walk is capped at 32 hops (the kernel's own symlink
+# limit): a cycle, or a chain nobody could open anyway, fails instead of
+# spinning, and the caller falls back to the inline host-OS case.
+vendors_physical_path() {
+  local src="$1"
+  local dir=""
+  local hops=0
+
   while [ -L "$src" ]; do
-    dir=$(cd "$(dirname "$src")" && pwd -P) || exit 0
-    src=$(readlink "$src") || exit 0
+    hops=$((hops + 1))
+    [ "$hops" -le 32 ] || return 1
+    dir=$(cd "$(dirname "$src")" && pwd -P) || return 1
+    src=$(readlink "$src") || return 1
     [ "${src#/}" != "$src" ] || src="$dir/$src"   # relative link target
   done
-  cd "$(dirname "$src")" 2>/dev/null || exit 0
-  printf '%s/../../os/host-os.sh' "$(pwd -P)"
-)
+  dir=$(cd "$(dirname "$src")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$src")"
+}
+
+VENDORS_HOST_OS_LIB=""
+if vendors_launch_physical=$(vendors_physical_path "${BASH_SOURCE[0]}"); then
+  VENDORS_HOST_OS_LIB="$(dirname "$vendors_launch_physical")/../../os/host-os.sh"
+fi
+unset vendors_launch_physical
 if [ -r "$VENDORS_HOST_OS_LIB" ]; then
   # shellcheck source=../../os/host-os.sh
   . "$VENDORS_HOST_OS_LIB"
@@ -735,13 +751,28 @@ vendors_pty_script_bsd() {
   script -q /dev/null "$runner_file" > "$output_file" 2>&1
 }
 
+# Wrap $1 in single quotes for use inside a shell command string, escaping
+# embedded single quotes the POSIX way ('\''). Every other byte, including
+# spaces, $, backticks, ; and newlines, is literal under sh, dash, bash, and
+# zsh alike. (`printf %q`, verified on bash 3.2, would also work for those
+# but emits $'...' for control characters, which dash does not parse.)
+vendors_shell_quote() {
+  printf "%s" "$1" | sed "s/'/'\\\\''/g" | sed "s/^/'/; s/\$/'/"
+}
+
 # util-linux `script` (Linux): the command goes through `-c`; `-e` returns the
-# child's exit status, `-f` flushes, `-E never` disables echo.
+# child's exit status, `-f` flushes, `-E never` disables echo. `-c` takes a
+# shell command string (run through $SHELL -c, /bin/sh when unset), not an
+# argv: passed bare, a runner path with spaces splits into words and shell
+# metacharacters in it are interpreted, so it is quoted and exec'd.
 vendors_pty_script_util_linux() {
   local runner_file="$1"
   local output_file="$2"
-  script -qefE never -c "$runner_file" /dev/null > "$output_file" 2>&1
+  local quoted_runner=""
+  quoted_runner=$(vendors_shell_quote "$runner_file")
+  script -qefE never -c "exec $quoted_runner" /dev/null > "$output_file" 2>&1
 }
+
 
 vendors_run_stdin_with_pty() {
   local prompt_file="$1"

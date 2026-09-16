@@ -79,7 +79,17 @@ def available_vendors(explicit: list[str] | None) -> tuple[set[str], dict[str, s
     """Return (kept vendor names, reason per vendor)."""
     reasons: dict[str, str] = {}
     if explicit:
-        keep = {v.strip().lower() for v in explicit if v.strip()}
+        requested = {v.strip().lower() for v in explicit if v.strip()}
+        unknown = sorted(requested - set(VENDOR_BINARIES))
+        if unknown:
+            raise SystemExit(
+                f"init-vendors: unknown --vendor {', '.join(unknown)}; "
+                f"known: {', '.join(sorted(VENDOR_BINARIES))}"
+            )
+        # openai and codex are the same CLI: asking for either keeps both
+        # spellings so a sample's `vendor: openai` survives `--vendor codex`.
+        binaries = {VENDOR_BINARIES[v] for v in requested}
+        keep = {v for v, b in VENDOR_BINARIES.items() if b in binaries}
         for vendor in VENDOR_BINARIES:
             reasons[vendor] = "kept (--vendor)" if vendor in keep else "removed (not in --vendor list)"
         return keep, reasons
@@ -136,13 +146,14 @@ def _list_blocks(lines: list[str], start: int, end: int, item_indent: int) -> li
                     j += 1
                     continue
                 m2 = _LIST_ITEM.match(nxt)
-                if (m2 and len(m2.group(1)) == item_indent) or _indent(nxt) < item_indent:
+                if (m2 and len(m2.group(1)) == item_indent) or _indent(nxt) <= item_indent:
                     break
                 j += 1
-            # give trailing comments above the next item back to that item
+            # Trailing blank/comment lines document whatever comes next (the
+            # next item, or the key after the list): never delete them with
+            # this item.
             block_end = j
-            while block_end > i + 1 and lines[block_end - 1].strip().startswith("#") \
-                    and _indent(lines[block_end - 1]) == item_indent:
+            while block_end > i + 1 and _is_blank_or_comment(lines[block_end - 1]):
                 block_end -= 1
             blocks.append((block_start, block_end))
             i = j
@@ -249,13 +260,23 @@ def prune(lines: list[str], keep: set[str]) -> tuple[list[str], list[str], int]:
                 m = _KEY_LINE.match(line.replace("- ", "  ", 1))
                 if m and not line.strip().startswith("#"):
                     donor_vals[m.group(2)] = m.group(3).strip()
+            stale: list[int] = []
             for i in range(s_start + 1, s_end):
                 m = _KEY_LINE.match(out[i])
                 if not m or out[i].strip().startswith("#"):
                     continue
                 key = m.group(2)
-                if key in ("vendor", "model", "effort") and key in donor_vals:
+                if key not in ("vendor", "model", "effort"):
+                    continue
+                if key in donor_vals:
                     out[i] = f"{m.group(1)}{key}: {donor_vals[key]}\n"
+                else:
+                    # e.g. the donor has no `model:` (uses the CLI default);
+                    # keeping the old vendor's model here would hand vendor A
+                    # a model id that belongs to vendor B.
+                    stale.append(i)
+            for i in reversed(stale):
+                drop.append((i, i + 1))
             notes.append(
                 f"synthesis vendor {s_vendor} unavailable; now uses "
                 f"{donor_vals.get('vendor', '?')} / {donor_vals.get('model', '?')}"
@@ -263,12 +284,25 @@ def prune(lines: list[str], keep: set[str]) -> tuple[list[str], list[str], int]:
         elif s_vendor is not None and s_vendor not in keep:
             notes.append(f"WARNING: synthesis vendor {s_vendor} unavailable and no panel entry to borrow from")
 
-    # Other roles: warn only.
+    # Other roles: warn only. `synthesizer` lives under `panel:` in the
+    # auto-dev-sdk shape, so look for it there as well as at top level.
+    role_ranges: list[tuple[str, int, int]] = []
     for key in ("stages", "synthesizer", "probe"):
         sec = _section_bounds(out, key)
-        if sec is None:
-            continue
-        for i in range(sec[0] + 1, sec[1]):
+        if sec is not None:
+            role_ranges.append((key, sec[0] + 1, sec[1]))
+    if item_indent is None:
+        for i in range(p_start + 1, p_end):
+            m = _KEY_LINE.match(out[i])
+            if m and m.group(2) == "synthesizer" and not out[i].strip().startswith("#"):
+                s_indent = len(m.group(1))
+                j = i + 1
+                while j < p_end and (_is_blank_or_comment(out[j]) or _indent(out[j]) > s_indent):
+                    j += 1
+                role_ranges.append(("panel.synthesizer", i + 1, j))
+                break
+    for key, a, b in role_ranges:
+        for i in range(a, b):
             m = _VENDOR_KEY.match(out[i])
             if m and not out[i].strip().startswith("#") and _clean(m.group(1)) not in keep:
                 notes.append(f"WARNING: {key} uses vendor {_clean(m.group(1))} which is not available; edit by hand")
@@ -314,17 +348,20 @@ def main(argv: list[str] | None = None) -> int:
         "\n",
     ]
     text = "".join(header + new_lines)
+    # Status goes to stderr when the document itself goes to stdout, so
+    # `--out - > vendors.yaml` yields a clean file.
+    status = sys.stderr if to_stdout else sys.stdout
     if to_stdout:
         sys.stdout.write(text)
     else:
         out_path.write_text(text, encoding="utf-8")
-        print(f"wrote {out_path}")
+        print(f"wrote {out_path}", file=status)
     for vendor in VENDOR_BINARIES:
         if vendor == "codex":
             continue
-        print(f"  {vendor:7s} {reasons[vendor]}")
+        print(f"  {vendor:7s} {reasons[vendor]}", file=status)
     for note in notes:
-        print(f"  {note}")
+        print(f"  {note}", file=status)
     if survivors < 2:
         print("init-vendors: fewer than two panel entries survive; the panel skills need at least two",
               file=sys.stderr)

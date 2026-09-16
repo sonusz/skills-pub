@@ -693,7 +693,10 @@ def cmd_abort(args) -> int:
                 stopped = terminate_process_group(pid, grace_sec=5.0)
                 reaped = stopped
             else:
+                # Already gone: nothing left to reap, so report it as reaped
+                # rather than leaving the initial False in the artifact.
                 stopped = True
+                reaped = True
             if stopped:
                 pid_file.unlink(missing_ok=True)
             else:

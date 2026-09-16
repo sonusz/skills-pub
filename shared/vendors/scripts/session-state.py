@@ -529,7 +529,14 @@ def _ps_process_group_members(pgid: int) -> set[int]:
             stderr=subprocess.PIPE,
             text=True,
         )
-        stdout, _ = scanner.communicate(timeout=2)
+        try:
+            stdout, _ = scanner.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            # Reap the scanner instead of orphaning it (it would otherwise
+            # inherit the dedicated process group during interrupt cleanup).
+            scanner.kill()
+            scanner.communicate()
+            raise
     except (OSError, subprocess.SubprocessError) as exc:
         raise SystemExit(f"cannot verify process-group membership: {exc}")
     if scanner.returncode != 0:
@@ -578,9 +585,10 @@ def _process_group_members(pgid: int) -> set[int]:
                 return members
         # /proc is not mounted (rare containers): use the portable ps scan.
         return _ps_process_group_members(pgid)
-    if host_os == "darwin":
-        return _ps_process_group_members(pgid)
-    raise SystemExit(f"unsupported platform for process-group membership: {host_os}")
+    # darwin and any other platform: the portable ps scan (this was the
+    # pre-detection fallback for every non-/proc host, so unknown platforms
+    # keep exactly that behavior).
+    return _ps_process_group_members(pgid)
 
 
 def _darwin_start_id(lstart: str) -> str:

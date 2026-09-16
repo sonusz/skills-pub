@@ -7,9 +7,9 @@ commands that apply it:
 | Command | Contract |
 |---|---|
 | `redact.sh` | stdin -> stdout, every recognised secret replaced by `<redacted>` (prefix kept where it helps: `gh<redacted>`, `AKIA<redacted>`, `sk-ant-<redacted>`). Line by line. Exit 1 with a message if `perl` is missing. |
-| `scan.sh [FILE...]` | Prints one `path:line:pattern-name` per hit, never the matched text. No args or `-` reads stdin (path `-`). Binary files are skipped. Exit 0 clean, 1 on any hit, 2 on usage error / missing perl / unreadable input. |
+| `scan.sh [FILE...]` | Prints one `path:line:pattern-name` per hit, never the matched text; a path that is itself secret-shaped (a file named after a token) is printed redacted. No args or `-` reads stdin (path `-`). Binary files are skipped. Exit 0 clean, 1 on any hit, 2 on usage error / missing perl / unreadable input. |
 | `scan.sh --diff [FILE...]` | Same, for unified diffs: only added lines are checked, `path` comes from the `+++ b/` header and `line` is the new-file line number. |
-| `doctor.sh` | perl present, `patterns.pl` loads, and a self-test with synthetic tokens (redacted, reported with exit 1, clean line exits 0). |
+| `doctor.sh` | perl present, `patterns.pl` loads, and a self-test with synthetic tokens (redacted, reported with exit 1, clean line exits 0), the PEM block cases (same-line, header-only mention, real block, unterminated block) and a secret-shaped file name. |
 
 ```bash
 echo "$build_log" | shared/secrets/redact.sh
@@ -35,7 +35,7 @@ matters for redaction: specific shapes first, the generic assignment rule last.
 | `authorization-header` | `Authorization: <scheme> <value>` (case-insensitive) |
 | `bearer-basic-token` | inline `Bearer <token>` / `Basic <token>` (16 or more token chars) |
 | `uri-credentials` | `scheme://user:password@host` (only the password is replaced) |
-| `private-key-block` | `-----BEGIN (RSA \| EC \| OPENSSH \| DSA \| ENCRYPTED \| PGP )?PRIVATE KEY( BLOCK)?-----`; redaction keeps the BEGIN and END lines and collapses everything between them to one `<redacted>` line (to EOF if the END line never comes); scan reports the BEGIN line |
+| `private-key-block` | `-----BEGIN (RSA \| EC \| OPENSSH \| DSA \| ENCRYPTED \| PGP )?PRIVATE KEY( BLOCK)?-----`; redaction keeps both markers. A BEGIN...END pair on one line (GCP JSON, a `.env` one-liner with `\n`-escaped PEM) is redacted between the markers. A BEGIN marker alone at the end of its line (trailing quotes or a literal `\n` allowed, i.e. a real PEM header) opens a block: the body collapses to one `<redacted>` line until the END line, which is printed from the END marker onward, or for at most 128 body lines, after which normal mode resumes. A BEGIN marker followed by other text and no END (a log line quoting the header) is redacted to the end of that line only. scan reports the BEGIN line |
 | `openai-anthropic-key` | `sk-`, `sk-proj-`, `sk-ant-` + 20 or more key chars |
 | `google-api-key` | `AIza` + 35 key chars |
 | `xai-key` | `xai-` + 20 or more alphanumerics |
