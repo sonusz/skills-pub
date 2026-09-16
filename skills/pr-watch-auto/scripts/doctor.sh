@@ -12,22 +12,30 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=../shared/doctor/doctor-lib.sh
+. "$SKILL_DIR/shared/doctor/doctor-lib.sh"
+
+# The shared doctor runs as a subprocess and prints its own summary; only its
+# exit code carries over. The extras below are counted separately.
 bash "$SKILL_DIR/shared/github-ops/doctor.sh"
 SHARED_RC=$?
 
 echo ""
 echo "=== pr-watch-auto extras ==="
 echo ""
-echo "Sibling skills:"
-EXTRA_FAIL=0
+
+doctor_section "Sibling skills"
 if [[ -f "$SKILL_DIR/skills/auto-fix/SKILL.md" ]]; then
-  echo "  [OK]   auto-fix skill found"
+  doctor_pass "auto-fix skill found"
 else
-  echo "  [WARN] auto-fix skill not found at skills/auto-fix"
-  echo "         Fix/comment automation requires the auto-fix skill."
+  doctor_warn "auto-fix skill not found at skills/auto-fix"
+  doctor_note "Fix/comment automation requires the auto-fix skill."
 fi
 
-if [[ "$SHARED_RC" -ne 0 ]] || [[ "$EXTRA_FAIL" -ne 0 ]]; then
+doctor_summary
+EXTRA_RC=$?
+
+if [[ "$SHARED_RC" -ne 0 ]] || [[ "$EXTRA_RC" -ne 0 ]]; then
   echo ""
   echo "Fix the failures above, then re-run: bash scripts/doctor.sh"
   exit 1

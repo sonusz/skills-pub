@@ -31,7 +31,13 @@
 #                    sorted alphabetically. No filtering. The agent decides
 #                    which are anchor docs, implementation, tests, binaries,
 #                    or generated noise.
-#   summary.json     machine-readable summary
+#   secrets.txt      shared/secrets/scan.sh --diff over diff.patch: one
+#                    `path:line:pattern` per added line that matches the
+#                    secret denylist (never the value). Empty when clean; a
+#                    `# ...` comment line when the scan could not run. Never
+#                    fails the bundle — the agent reads it and excludes or
+#                    redacts before building any prompt.
+#   summary.json     machine-readable summary (includes secret_hits)
 #
 # Usage:
 #   bash scripts/gather-context.sh --branches main feature/foo --out /tmp/run
@@ -166,6 +172,26 @@ git diff --stat "$MERGE_BASE..$HEAD_SHA" > "$OUT/diff-stat.txt"
 git diff --name-only --diff-filter=AM "$MERGE_BASE..$HEAD_SHA" | sort -u > "$OUT/files.txt"
 
 # ---------------------------------------------------------------------------
+# Secret scan of the added lines. Records hits; never fails the bundle.
+# Reviewers read manifested files with repo access, so the agent must drop or
+# redact anything listed here before building a prompt.
+# ---------------------------------------------------------------------------
+SECRETS_SCAN="$SKILL_DIR/shared/secrets/scan.sh"
+SCAN_RC=0
+if [[ -f "$SECRETS_SCAN" ]]; then
+  bash "$SECRETS_SCAN" --diff < "$OUT/diff.patch" > "$OUT/secrets.txt" 2>/dev/null || SCAN_RC=$?
+  if [[ "$SCAN_RC" -ge 2 ]]; then
+    echo "# secret scan did not run (scan.sh exit $SCAN_RC; is perl installed?) — treat the diff as unscanned" > "$OUT/secrets.txt"
+    echo "Warning: shared/secrets/scan.sh exited $SCAN_RC; diff not scanned for secrets." >&2
+  fi
+else
+  echo "# secret scan unavailable (shared/secrets/scan.sh not found) — treat the diff as unscanned" > "$OUT/secrets.txt"
+  echo "Warning: shared/secrets/scan.sh not found; diff not scanned for secrets." >&2
+fi
+SECRET_HITS=$(grep -c -v '^#' "$OUT/secrets.txt" 2>/dev/null || true)
+SECRET_HITS=${SECRET_HITS:-0}
+
+# ---------------------------------------------------------------------------
 # Write metadata
 # ---------------------------------------------------------------------------
 echo "$MODE" > "$OUT/mode"
@@ -189,6 +215,7 @@ jq -n \
   --arg head_ref "$HEAD_REF" \
   --argjson file_count "$FILE_COUNT" \
   --argjson diff_bytes "$DIFF_BYTES" \
+  --argjson secret_hits "$SECRET_HITS" \
   --rawfile files "$OUT/files.txt" \
   '{
     mode: $mode,
@@ -200,9 +227,14 @@ jq -n \
     head_ref: $head_ref,
     file_count: $file_count,
     diff_bytes: $diff_bytes,
+    secret_hits: $secret_hits,
     files: ($files | split("\n") | map(select(length > 0)))
   }' > "$OUT/summary.json"
 
 echo "Context bundle written to: $OUT"
 echo ""
-jq '{mode, pr_number, head_sha, merge_base_sha, repo_root, base_ref, head_ref, file_count, diff_bytes}' "$OUT/summary.json"
+jq '{mode, pr_number, head_sha, merge_base_sha, repo_root, base_ref, head_ref, file_count, diff_bytes, secret_hits}' "$OUT/summary.json"
+if [[ "$SECRET_HITS" -gt 0 ]]; then
+  echo ""
+  echo "WARNING: $SECRET_HITS added line(s) match the secret denylist — see $OUT/secrets.txt and exclude or redact before building any prompt." >&2
+fi

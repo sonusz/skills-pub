@@ -197,8 +197,14 @@ it in the "Notes that may help" section. Models can miss subtle setups.
    sycophancy. "Find bugs" produces useful output.
 2. **Demand a specific output format.** Free-form output is harder to
    cross-reference and harder to verify.
-3. **Strip credentials and tokens** before sending. Check env-loaded values,
-   default-config strings, anything `*_KEY` or `*_TOKEN`.
+3. **Strip credentials and tokens** before sending. Read `$RUN_DIR/secrets.txt`
+   (written by `gather-context.sh` via `shared/secrets/scan.sh --diff`): every
+   `path:line:pattern` there names a file whose added lines match the secret
+   denylist. Exclude that file from the manifest or redact a copy under a
+   temporary audit root before building the prompt — reviewers read manifested
+   files themselves, so a path is enough to leak the value. Then still check
+   env-loaded values, default-config strings, anything `*_KEY` or `*_TOKEN`:
+   the denylist is high-confidence, not complete.
 4. **Never include reviewed bodies in the prompt.** No source, doc text,
    excerpt, or diff hunk. Include only instructions and the path/revision
    manifest.

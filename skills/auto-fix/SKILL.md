@@ -200,7 +200,7 @@ Return `ESCALATED` with:
   - `doc-drift` — §1 cross-check found drift AND fix doesn't align with docs
   - `above-minor` — §5 size gate failed OR §3 flagged a bot comment on error/control-flow with no evidence
 - `conflict` — one sentence describing the disagreement (request vs. docs, request vs. code, or docs vs. code)
-- `evidence` — relevant quotes from §1 (commit message, doc excerpt, docstring), or `"none found"` if §1 was empty. For `doc-drift`, include both the doc quote and the observed code behavior. Pipe any quote sourced from `error_log` or fetched files through `scripts/redact-secrets.sh` first (covers AWS keys, GitHub PATs, JWTs, Slack tokens, Authorization headers, Bearer tokens, URI-creds — see the script for the exhaustive denylist).
+- `evidence` — relevant quotes from §1 (commit message, doc excerpt, docstring), or `"none found"` if §1 was empty. For `doc-drift`, include both the doc quote and the observed code behavior. Pipe any quote sourced from `error_log` or fetched files through `scripts/redact-secrets.sh` first (covers AWS keys, GitHub PATs, JWTs, Slack tokens, Authorization headers, Bearer tokens, URI-creds, private-key blocks, OpenAI/Anthropic/Google/xAI/GitLab keys and `<name>=<value>` secret assignments — the exhaustive denylist is `shared/secrets/patterns.pl`; it is high-confidence, not complete).
 - `recommendation` — what the developer should do; see `references/examples.md` for sample wording
 
 ## Guardrails
@@ -241,7 +241,8 @@ Callers receive a single structured result and decide downstream actions (reply 
 | `scripts/check-clean-tree.sh` | §0 preflight: refuses if the working tree is dirty |
 | `scripts/check-paths.sh` | §5a path denylist: refuses if any affected file matches a sensitive-path pattern |
 | `scripts/compute-evaluate-hash.sh` | Deterministic 16-char hash over the canonical decision packet, used by the Confirmation gate's passthrough path |
-| `scripts/redact-secrets.sh` | Scrubs AWS keys, GitHub PATs, JWTs, Slack tokens, Authorization/Bearer headers, and URI-with-creds before content from `error_log` or fetched files lands in output |
+| `scripts/redact-secrets.sh` | Thin wrapper that delegates to `shared/secrets/redact.sh` (denylist in `shared/secrets/patterns.pl`): scrubs AWS keys, GitHub PATs, JWTs, Slack tokens, Authorization/Bearer headers, URI-with-creds, private-key blocks, vendor API keys and secret assignments before content from `error_log` or fetched files lands in output |
+| `shared/secrets/` | Shared secrets module (`redact.sh`, `scan.sh`, `patterns.pl`, `doctor.sh`); linked as `shared/secrets -> ../../../shared/secrets` |
 
 ## Why this skill exists
 

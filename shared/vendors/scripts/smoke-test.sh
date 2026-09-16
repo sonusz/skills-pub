@@ -7,7 +7,9 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-WORK=$(mktemp -d /tmp/vendors-smoke.XXXXXX)
+# Canonicalize (pwd -P): call.sh resolves --cwd the same way, and on macOS the
+# mktemp path is the /tmp symlink while the resolved path is /private/tmp/...
+WORK=$(cd "$(mktemp -d /tmp/vendors-smoke.XXXXXX)" && pwd -P)
 cleanup() {
   rm -rf "$WORK"
 }
@@ -16,6 +18,65 @@ trap cleanup EXIT
 BIN_DIR="$WORK/bin"
 RUN_ROOT="$WORK/runs"
 mkdir -p "$BIN_DIR" "$RUN_ROOT"
+
+# Host OS detection self-check: vendors_host_os must match `uname -s`, and the
+# PTY launcher must run this host's `script` form exactly once (no sniff-and-
+# retry). A fake `script` outside BIN_DIR records argv and runs the runner, so
+# the Claude calls below still exercise the real `script`.
+pty_shim_dir="$WORK/pty-shim"
+pty_capture="$WORK/pty-capture"
+mkdir -p "$pty_shim_dir" "$pty_capture"
+cat > "$pty_shim_dir/script" <<'FAKE_SCRIPT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_SCRIPT_CAPTURE/argv"
+# BSD form: script -q /dev/null <runner>
+if [ "$#" -eq 3 ] && [ "$1" = "-q" ] && [ "$2" = "/dev/null" ]; then
+  exec "$3"
+fi
+# util-linux form: script -qefE never -c <runner> /dev/null
+if [ "$#" -eq 5 ] && [ "$1" = "-qefE" ] && [ "$2" = "never" ] && [ "$3" = "-c" ]; then
+  exec "$4"
+fi
+printf 'fake script: unexpected argv: %s\n' "$*" >&2
+exit 1
+FAKE_SCRIPT
+chmod +x "$pty_shim_dir/script"
+
+case "$(uname -s)" in
+  Darwin) expected_host_os="darwin" ;;
+  Linux) expected_host_os="linux" ;;
+  *) expected_host_os="other" ;;
+esac
+pty_runner="$pty_capture/out.runner.sh"
+case "$expected_host_os" in
+  darwin) expected_pty_argv="-q /dev/null $pty_runner" ;;
+  linux) expected_pty_argv="-qefE never -c $pty_runner /dev/null" ;;
+  *) expected_pty_argv="" ;;
+esac
+printf 'PTY_PROMPT\n' > "$pty_capture/prompt"
+(
+  # shellcheck source=vendor-launch.sh
+  . "$SCRIPT_DIR/vendor-launch.sh"
+  host_os=$(vendors_host_os)
+  if [ "$host_os" != "$expected_host_os" ]; then
+    printf "FAIL: vendors_host_os returned %s, expected %s from uname -s\n" "$host_os" "$expected_host_os" >&2
+    exit 1
+  fi
+  export FAKE_SCRIPT_CAPTURE="$pty_capture"
+  export PATH="$pty_shim_dir:$PATH"
+  vendors_run_stdin_with_pty "$pty_capture/prompt" "$pty_capture/out" cat \
+    || { printf "FAIL: PTY launcher exited %s on %s\n" "$?" "$host_os" >&2; exit 1; }
+)
+if [ "$(cat "$pty_capture/out")" != "PTY_PROMPT" ]; then
+  printf "FAIL: expected PTY launcher to deliver stdin prompt through script\n" >&2
+  cat "$pty_capture/out" >&2
+  exit 1
+fi
+if [ -n "$expected_pty_argv" ] && [ "$(cat "$pty_capture/argv")" != "$expected_pty_argv" ]; then
+  printf "FAIL: expected exactly one %s-form script launch:\n  %s\ngot:\n" "$expected_host_os" "$expected_pty_argv" >&2
+  sed -e 's/^/  /' "$pty_capture/argv" >&2
+  exit 1
+fi
 
 cat > "$BIN_DIR/codex" <<'FAKE_CODEX'
 #!/usr/bin/env bash
@@ -88,6 +149,9 @@ done
 prompt=$(cat)
 if printf "%s" "$prompt" | grep -qi 'single word READY'; then
   response="READY"
+elif printf "%s" "$prompt" | grep -q 'Idle-timeout probe'; then
+  # Answer idle-probe.sh's evidence prompt like a cooperative arbiter.
+  response="VERDICT: extend 120"
 else
   response="claude received: $prompt"
 fi
@@ -1113,9 +1177,40 @@ if ! grep -q '^exit_code=1$' "$grok_empty_dir/grok-empty/status" \
   exit 1
 fi
 
+# Fake idle probe for the watchdog cases below: records each prompt it receives
+# under $FAKE_PROBE_STATE_DIR and answers from $FAKE_PROBE_ANSWERS (space-
+# separated `extend:N` | `kill` verdicts, the last one repeating).
+cat > "$WORK/fake-probe.sh" <<'FAKE_PROBE'
+#!/usr/bin/env bash
+state="${FAKE_PROBE_STATE_DIR:?}"
+mkdir -p "$state"
+n=$(ls "$state" | grep -c '^prompt\.' || true)
+n=$((n + 1))
+cat > "$state/prompt.$n"
+set -- ${FAKE_PROBE_ANSWERS:-kill}
+i=1
+answer="$1"
+while [ "$i" -lt "$n" ] && [ "$#" -gt 1 ]; do
+  shift
+  answer="$1"
+  i=$((i + 1))
+done
+case "$answer" in
+  extend:*) printf 'VERDICT: extend %s\nfake probe grant\n' "${answer#extend:}" ;;
+  *) printf 'VERDICT: kill\nfake probe kill\n' ;;
+esac
+FAKE_PROBE
+chmod +x "$WORK/fake-probe.sh"
+
+# Mechanical watchdog without idle-probe flags: byte-for-byte the old contract.
+# The fake probe is reachable in the environment but must never be consulted.
 grok_timeout_dir="$RUN_ROOT/grok-timeout"
+grok_timeout_probe_state="$WORK/grok-timeout-probe-state"
 mkdir -p "$grok_timeout_dir"
-if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+if PATH="$BIN_DIR:$PATH" \
+    VENDORS_IDLE_PROBE_FAKE="$WORK/fake-probe.sh" \
+    FAKE_PROBE_STATE_DIR="$grok_timeout_probe_state" \
+    "$SCRIPT_DIR/call.sh" \
     --vendor Grok \
     --prompt "controlled Grok timeout" \
     --native-arg --fake-delay \
@@ -1131,6 +1226,215 @@ if ! grep -q '^exit_code=124$' "$grok_timeout_dir/grok-timeout/status" \
     || ! grep -q '^reason=timeout$' "$grok_timeout_dir/grok-timeout/status"; then
   printf "FAIL: expected Grok timeout status and reason\n" >&2
   cat "$grok_timeout_dir/grok-timeout/status" >&2
+  exit 1
+fi
+if grep -q 'idle_probe' "$grok_timeout_dir/grok-timeout/status" \
+    || grep -q 'idle-probe' "$grok_timeout_dir/grok-timeout/log" \
+    || [ -e "$grok_timeout_probe_state" ]; then
+  printf "FAIL: expected no idle-probe activity without --idle-probe-vendor\n" >&2
+  cat "$grok_timeout_dir/grok-timeout/status" >&2
+  exit 1
+fi
+
+# Idle probe through call.sh: the vendor is silent past --timeout 2 with 1s
+# extend windows; the fake probe grants 3s once, then says kill. The call must
+# outlive the mechanical deadline by the grant, record both verdicts, and
+# still end as a timeout kill.
+idle_probe_dir="$RUN_ROOT/grok-idle-probe"
+idle_probe_state="$WORK/idle-probe-state"
+mkdir -p "$idle_probe_dir"
+idle_probe_started=$(date +%s)
+if PATH="$BIN_DIR:$PATH" \
+    VENDORS_IDLE_PROBE_FAKE="$WORK/fake-probe.sh" \
+    FAKE_PROBE_STATE_DIR="$idle_probe_state" \
+    FAKE_PROBE_ANSWERS="extend:3 kill" \
+    "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "controlled Grok idle probe" \
+    --native-arg --fake-delay \
+    --native-arg 60 \
+    --timeout 2 \
+    --timeout-extend 1 \
+    --idle-probe-vendor claude \
+    --idle-probe-model fake-probe \
+    --idle-probe-timeout 10 \
+    --output-dir "$idle_probe_dir" \
+    --id grok-idle-probe \
+    --min-success 1 >/dev/null 2>&1; then
+  printf "FAIL: expected idle-probed Grok call to end by kill\n" >&2
+  exit 1
+fi
+idle_probe_elapsed=$(( $(date +%s) - idle_probe_started ))
+idle_probe_status="$idle_probe_dir/grok-idle-probe/status"
+idle_probe_log="$idle_probe_dir/grok-idle-probe/log"
+if ! grep -q '^exit_code=124$' "$idle_probe_status" \
+    || ! grep -q '^reason=timeout$' "$idle_probe_status" \
+    || ! grep -q '^idle_probe_verdicts=2$' "$idle_probe_status" \
+    || ! grep -q '^idle_probe_last_verdict=kill$' "$idle_probe_status"; then
+  printf "FAIL: expected timeout status with two recorded idle-probe verdicts\n" >&2
+  cat "$idle_probe_status" >&2
+  exit 1
+fi
+if ! grep -q '^idle-probe: verdict 1: extend 3' "$idle_probe_log" \
+    || ! grep -q '^idle-probe: extending 3s' "$idle_probe_log" \
+    || ! grep -q '^idle-probe: verdict 2: kill' "$idle_probe_log"; then
+  printf "FAIL: expected both idle-probe verdicts in the call log\n" >&2
+  cat "$idle_probe_log" >&2
+  exit 1
+fi
+if [ ! -s "$idle_probe_state/prompt.1" ] || [ ! -s "$idle_probe_state/prompt.2" ] \
+    || [ -e "$idle_probe_state/prompt.3" ]; then
+  printf "FAIL: expected exactly two idle-probe prompts\n" >&2
+  ls "$idle_probe_state" >&2 || true
+  exit 1
+fi
+if ! grep -q '^# Idle-timeout probe' "$idle_probe_state/prompt.1" \
+    || ! grep -q '\*\*Stage\*\*: `grok-idle-probe`' "$idle_probe_state/prompt.1" \
+    || ! grep -q '\*\*Configured idle cap\*\*: `2s`' "$idle_probe_state/prompt.1" \
+    || ! grep -q '^### Process tree' "$idle_probe_state/prompt.1" \
+    || ! grep -q 'sleep 60' "$idle_probe_state/prompt.1" \
+    || ! grep -q '^### Stream output tail' "$idle_probe_state/prompt.1"; then
+  printf "FAIL: expected idle-probe prompt to carry label, cap, process tree, and stream evidence\n" >&2
+  cat "$idle_probe_state/prompt.1" >&2
+  exit 1
+fi
+if [ "$idle_probe_elapsed" -lt 5 ]; then
+  printf "FAIL: expected the 3s probe grant to delay the kill (elapsed %ss)\n" "$idle_probe_elapsed" >&2
+  exit 1
+fi
+
+# Idle probe budget: a probe that always extends is bounded by
+# --idle-probe-max-total, so the call still dies after one truncated grant.
+idle_budget_dir="$RUN_ROOT/grok-idle-budget"
+idle_budget_state="$WORK/idle-budget-state"
+mkdir -p "$idle_budget_dir"
+if PATH="$BIN_DIR:$PATH" \
+    VENDORS_IDLE_PROBE_FAKE="$WORK/fake-probe.sh" \
+    FAKE_PROBE_STATE_DIR="$idle_budget_state" \
+    FAKE_PROBE_ANSWERS="extend:3" \
+    "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "controlled Grok idle probe budget" \
+    --native-arg --fake-delay \
+    --native-arg 60 \
+    --timeout 1 \
+    --idle-probe-vendor claude \
+    --idle-probe-max-total 2 \
+    --output-dir "$idle_budget_dir" \
+    --id grok-idle-budget \
+    --min-success 1 >/dev/null 2>&1; then
+  printf "FAIL: expected budget-bounded idle-probed Grok call to end by kill\n" >&2
+  exit 1
+fi
+idle_budget_status="$idle_budget_dir/grok-idle-budget/status"
+idle_budget_log="$idle_budget_dir/grok-idle-budget/log"
+if ! grep -q '^exit_code=124$' "$idle_budget_status" \
+    || ! grep -q '^idle_probe_verdicts=1$' "$idle_budget_status" \
+    || ! grep -q '^idle_probe_last_verdict=extend 3$' "$idle_budget_status" \
+    || ! grep -q '^idle-probe: extending 2s (2s of 2s budget used)' "$idle_budget_log" \
+    || ! grep -q '^idle-probe: extension budget exhausted' "$idle_budget_log" \
+    || [ -e "$idle_budget_state/prompt.2" ]; then
+  printf "FAIL: expected --idle-probe-max-total to bound the extension\n" >&2
+  cat "$idle_budget_status" "$idle_budget_log" >&2
+  exit 1
+fi
+
+# Idle-probe flag validation happens before any call.
+idle_flags_log="$WORK/idle-flags.log"
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "idle probe flag validation" \
+    --idle-probe-model fake-probe \
+    --output-dir "$RUN_ROOT/idle-flags" \
+    --dry-run >"$idle_flags_log" 2>&1 \
+    || ! grep -q 'require --idle-probe-vendor' "$idle_flags_log"; then
+  printf "FAIL: expected --idle-probe-model without --idle-probe-vendor to be rejected\n" >&2
+  cat "$idle_flags_log" >&2
+  exit 1
+fi
+if PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/call.sh" \
+    --vendor Grok \
+    --prompt "idle probe flag validation" \
+    --idle-probe-vendor nosuch \
+    --output-dir "$RUN_ROOT/idle-flags" \
+    --dry-run >"$idle_flags_log" 2>&1 \
+    || ! grep -q 'unknown vendor: nosuch' "$idle_flags_log"; then
+  printf "FAIL: expected unknown --idle-probe-vendor to be rejected\n" >&2
+  cat "$idle_flags_log" >&2
+  exit 1
+fi
+
+# idle-probe.sh on its own: composition, forced verdicts, fail-closed parsing,
+# and the real call.sh path through the fake Claude CLI.
+probe_dir="$RUN_ROOT/idle-probe-standalone"
+mkdir -p "$probe_dir"
+printf 'Running tests...\nstill running\n' > "$probe_dir/stdout.log"
+printf 'warn: slow\n' > "$probe_dir/stderr.log"
+printf 'partial stream output' > "$probe_dir/stream"
+sleep 60 &
+probe_sleep_pid=$!
+probe_prompt=$("$SCRIPT_DIR/idle-probe.sh" --compose-only \
+  --pid "$$" --idle-sec 45 --idle-cap-sec 30 --label smoke-stage \
+  --stream "$probe_dir/stream" --stdout "$probe_dir/stdout.log" --stderr "$probe_dir/stderr.log")
+kill "$probe_sleep_pid" 2>/dev/null || true
+wait "$probe_sleep_pid" 2>/dev/null || true
+for marker in \
+    '^# Idle-timeout probe' \
+    '^## Probe inputs' \
+    '\*\*Stage\*\*: `smoke-stage`' \
+    "\*\*Subagent pid\*\*: \`$$\`" \
+    '\*\*Idle duration\*\*: `45s`' \
+    '\*\*Configured idle cap\*\*: `30s`' \
+    '\*\*Stream output file size_bytes\*\*: `21`' \
+    '^partial stream output$' \
+    '^### Process tree' \
+    'sleep 60' \
+    '^### Stdout tail' \
+    '^Running tests\.\.\.$' \
+    '^### Stderr tail' \
+    '^warn: slow$'; do
+  if ! printf '%s\n' "$probe_prompt" | grep -q -- "$marker"; then
+    printf "FAIL: expected composed idle-probe prompt to contain %s\n" "$marker" >&2
+    printf '%s\n' "$probe_prompt" >&2
+    exit 1
+  fi
+done
+probe_args=(--pid "$$" --idle-sec 45 --idle-cap-sec 30 --label smoke-stage \
+  --stdout "$probe_dir/stdout.log" --stderr "$probe_dir/stderr.log")
+if [ "$(VENDORS_IDLE_PROBE_FAKE_VERDICT=extend:99999 "$SCRIPT_DIR/idle-probe.sh" "${probe_args[@]}" | head -n 1)" != "extend 1800" ] \
+    || [ "$(VENDORS_IDLE_PROBE_FAKE_VERDICT=kill "$SCRIPT_DIR/idle-probe.sh" "${probe_args[@]}" | head -n 1)" != "kill" ]; then
+  printf "FAIL: expected forced idle-probe verdicts to clamp and pass through\n" >&2
+  exit 1
+fi
+cat > "$WORK/garbage-probe.sh" <<'FAKE_GARBAGE'
+#!/usr/bin/env bash
+cat > /dev/null
+printf 'I cannot decide.\n'
+FAKE_GARBAGE
+chmod +x "$WORK/garbage-probe.sh"
+garbage_verdict=$(VENDORS_IDLE_PROBE_FAKE="$WORK/garbage-probe.sh" "$SCRIPT_DIR/idle-probe.sh" "${probe_args[@]}")
+if [ "$(printf '%s\n' "$garbage_verdict" | head -n 1)" != "kill" ] \
+    || ! printf '%s\n' "$garbage_verdict" | grep -q '^rationale: .*parseable'; then
+  printf "FAIL: expected an unparsable probe answer to fail closed to kill\n" >&2
+  printf '%s\n' "$garbage_verdict" >&2
+  exit 1
+fi
+real_probe_verdict=$(PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/idle-probe.sh" "${probe_args[@]}" \
+  --probe-vendor claude --probe-model fake-probe --probe-timeout 20 \
+  --output-dir "$probe_dir/real")
+if [ "$(printf '%s\n' "$real_probe_verdict" | head -n 1)" != "extend 120" ] \
+    || ! grep -q '^exit_code=0$' "$probe_dir/real/probe/status" \
+    || ! grep -q '^model=fake-probe$' "$probe_dir/real/probe/status"; then
+  printf "FAIL: expected idle-probe.sh to reach the fake Claude CLI through call.sh\n" >&2
+  printf '%s\n' "$real_probe_verdict" >&2
+  cat "$probe_dir/real/probe/status" >&2 || true
+  exit 1
+fi
+missing_cli_verdict=$(PATH="/usr/bin:/bin" /bin/bash "$SCRIPT_DIR/idle-probe.sh" "${probe_args[@]}" \
+  --probe-vendor claude --output-dir "$probe_dir/missing")
+if [ "$(printf '%s\n' "$missing_cli_verdict" | head -n 1)" != "kill" ]; then
+  printf "FAIL: expected a missing probe CLI to fail closed to kill\n" >&2
+  printf '%s\n' "$missing_cli_verdict" >&2
   exit 1
 fi
 
@@ -1247,4 +1551,4 @@ assert usage == {
 }
 PY
 
-printf "OK: vendors smoke test passed (native sessions + 5 calls x 5 vendors + Grok aliases/runtime/schema/failure/timeout/doctor)\n"
+printf "OK: vendors smoke test passed (host-os/pty selection + native sessions + 5 calls x 5 vendors + Grok aliases/runtime/schema/failure/timeout/doctor + idle probe)\n"

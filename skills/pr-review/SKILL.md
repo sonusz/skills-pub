@@ -89,7 +89,8 @@ wait for a single go/no-go:
 - Phases that will run: "Phase 1 if anchor docs are found in the diff,
   Phase 2 always"
 - Vendors panel-review is configured to invoke (read from
-  `panel-review`'s `vendors.yaml` — e.g. Claude, Agy, Codex)
+  `panel-review`'s machine-local `vendors.yaml`, or its `sample-vendors.yaml`
+  when no local file exists — e.g. Claude, Agy, Codex)
 - (gh mode) That findings will be cross-referenced against existing PR
   threads, and that posting inline threads is opt-in and requires a
   second confirmation later
@@ -128,7 +129,17 @@ Output (under `$RUN_DIR`):
 | `diff.patch` | unified diff |
 | `diff-stat.txt` | `git diff --stat` |
 | `files.txt` | every changed file, verbatim, no filtering (agent classifies) |
-| `summary.json` | machine-readable index |
+| `secrets.txt` | `shared/secrets/scan.sh --diff` over `diff.patch`: one `path:line:pattern` per added line that matches the secret denylist (never the value). Empty when clean; a `# ...` line when the scan could not run |
+| `summary.json` | machine-readable index (`secret_hits` = line count of `secrets.txt`) |
+
+**Read `secrets.txt` first.** Reviewers read manifested files with repo
+access, so a secret in the diff reaches every vendor even though the prompt
+holds only paths. For each listed `path`, either exclude that file from both
+phase manifests (and say so in the summary) or stop and ask the user before
+building any prompt. If `secrets.txt` starts with `#`, the scan did not run
+— eyeball `diff.patch` for credentials yourself. The denylist is
+high-confidence, not complete: a clean file still does not license
+manifesting `.env`, key material, or credential stores.
 
 The script does NOT classify anything. Read `files.txt` and the diff
 yourself; for each file decide what it is and how to handle it (no
@@ -448,6 +459,7 @@ The skill should not:
 | `scripts/gather-context.sh` | Build a unified review context bundle from local branches or a PR |
 | `scripts/post-review-thread.sh` | Post one inline review thread; supports single-line and multi-line targets; re-fetches head SHA by default |
 | `shared/github-ops/*.sh` | Shared GitHub primitives (auth, ci-check, comment-check, etc.) |
+| `shared/secrets/scan.sh` | Secret denylist scan; `gather-context.sh` runs it with `--diff` and writes `secrets.txt` |
 | `shared/vendors/*` | Shared vendor CLIs (used indirectly via panel-review) |
 
 | Reference | Purpose |

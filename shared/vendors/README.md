@@ -473,6 +473,69 @@ The module does not require every supported vendor to be healthy. A caller
 selects the vendors it needs for that workflow and sets `--min-success` for
 that selected set.
 
+## Idle Probe
+
+`--timeout` plus `--timeout-extend` is a purely mechanical watchdog: it kills a
+call once a full extend window passes with no new `stream` output. A vendor
+CLI that is silently thinking, running a long test suite, or waiting on a slow
+tool looks identical to one whose API stream stalled. The idle probe adds a
+cheap-model judgment at exactly that point:
+
+```bash
+"$VENDORS/scripts/call.sh" \
+  --vendor claude \
+  --timeout 600 --timeout-extend 300 \
+  --idle-probe-vendor openai --idle-probe-model gpt-5-mini \
+  --prompt-file "$prompt_file" \
+  --output-dir "$RUN_DIR"
+```
+
+When the watchdog is about to kill and `--idle-probe-vendor` is set, `call.sh`
+runs `scripts/idle-probe.sh` for the vendor process. The probe composes a
+read-only evidence prompt (`prompts/idle-probe.md` plus the process tree from
+`process-tree.sh`, the last 200 lines of `out`, `log`, and `stream`, the
+stream file's size and seconds since its last write, the idle time so far,
+and the configured cap), sends it through a separate `call.sh` invocation
+(`<call-dir>/idle-probe/<n>/probe/{out,status,log}`; no `--yolo`, no `--cwd`,
+no `--session-key`, and no idle-probe flags, so it cannot recurse), and
+parses the model's `VERDICT: extend <seconds>` or `VERDICT: kill` line.
+
+- `extend N` (clamped to 1..1800) sleeps N seconds, bounded by the remaining
+  `--idle-probe-max-total` budget (default 3600 extra seconds per call), then
+  returns to the extend-window check: new output resumes the normal windows,
+  continued silence probes again.
+- `kill`, an exhausted budget, or any probe failure proceeds to the kill.
+
+Fail-closed rule: a missing vendor CLI, a non-zero probe exit, a probe timeout
+(`--idle-probe-timeout`, default 60s), or an unparsable answer all count as
+`kill`. The probe can only ever grant more time than the mechanical watchdog;
+it can never shorten a call, and it never runs unless the watchdog would have
+killed. Without `--idle-probe-vendor` the watchdog behaves exactly as before.
+
+Flags:
+
+- `--idle-probe-vendor NAME` enables the probe (`openai|claude|agy|cursor|grok`)
+- `--idle-probe-model MODEL` (default: the vendor's `vendors.conf` model)
+- `--idle-probe-effort EFFORT` (default: none)
+- `--idle-probe-timeout SECONDS` (default: 60)
+- `--idle-probe-max-total SECONDS` (default: 3600)
+
+Each verdict is written to the call's `log` (`idle-probe: verdict <n>: ...`),
+and the `status` file gains `idle_probe_verdicts=<count>` and
+`idle_probe_last_verdict=<verdict>`. A killed call still reports
+`exit_code=124` and `reason=timeout`.
+
+`scripts/idle-probe.sh` is also usable on its own (`--pid`, `--idle-sec`,
+`--idle-cap-sec`, `--label`, `--stream/--stdout/--stderr`, `--probe-vendor`,
+`--probe-model`, `--probe-effort`, `--probe-timeout`, `--output-dir`,
+`--prompt-file`); it prints one line, `extend <N>` or `kill`, then an optional
+`rationale: ...` line, and exits 0 for every verdict. `--compose-only` prints
+the composed prompt instead, for tests. Two environment hooks make it
+deterministic without a model: `VENDORS_IDLE_PROBE_FAKE=<path>` runs that
+program instead of `call.sh` (prompt on stdin, `VERDICT:` line on stdout), and
+`VENDORS_IDLE_PROBE_FAKE_VERDICT=extend:N|kill` skips composition and the call
+entirely.
+
 ## Grok Capability Matrix
 
 The wrapper/runtime guarantees below are separate from Grok model quality.

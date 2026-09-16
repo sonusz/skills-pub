@@ -11,7 +11,9 @@ legitimately slow task** (extend).
 - **Subagent pid**: the root pid the harness is watching.
 - **Idle duration**: seconds since last stream-output activity.
 - **Configured idle cap**: current timeout threshold that just fired.
-- **Process tree**: `ps --forest` output rooted at the subagent pid.
+- **Process tree**: process listing (pid, ppid, state, elapsed,
+  command) rooted at the subagent pid, produced by the shared
+  `process-tree.sh` helper; indentation shows depth.
 - **Stdout tail / stderr tail**: last ~200 lines of each log. May be
   empty when the subagent streams structured tokens to a file
   instead of stdout (this is the common case for vendor LLM CLIs in

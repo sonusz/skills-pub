@@ -50,7 +50,14 @@ Value comes from **divergence**, not consensus. If you won't act on disagreement
   fragment into the panel prompt. If the artifact cannot be made locally
   readable, stop instead of falling back to inline review.
 - Never send credentials, tokens, `.env` contents, or production secrets to
-  panel vendors. Redact or exclude them before launch.
+  panel vendors. Reviewers read manifested files themselves, so a secret inside
+  one reaches every vendor even though the prompt holds only paths. Before
+  launch run `bash shared/secrets/scan.sh <manifest paths...>` (or
+  `bash shared/secrets/scan.sh --diff < diff.patch` when the input is a diff);
+  it prints `path:line:pattern` per hit and exits 1. On any hit either exclude
+  that file from the manifest (and list it under redactions/exclusions at the
+  approval checkpoint) or stop and ask. A clean scan is a denylist result, not
+  a guarantee -- still exclude files you know hold key material.
 - In git worktrees, `launch.sh` snapshots status and diffs before and after
   panel calls. If the workspace changes, stop and report it. Do not
   auto-revert or commit unless the user explicitly asks.
@@ -88,7 +95,7 @@ required file cannot be read, the reviewer must report a failed or risky review
 rather than infer from the manifest. Keep panel output directories outside the
 audit root.
 
-Strip credentials and tokens before sending. Panel members cannot prompt the user mid-run, so the orchestrator owns security up front.
+Strip credentials and tokens before sending: run `bash shared/secrets/scan.sh` over the manifest paths (or `--diff < diff.patch`) and exclude or stop on hits, as the Guardrails require. Panel members cannot prompt the user mid-run, so the orchestrator owns security up front.
 
 For env-specific launcher quirks (SSL certs, proxy vars, per-vendor flags), check your runtime's user-level notes or memory file — never bake machine-specific setup into skill source.
 
@@ -116,7 +123,13 @@ timeout by default via `PANEL_CALL_TIMEOUT=300`; override with
 `PANEL_CALL_TIMEOUT=<seconds>` only for a focused prompt. The timeout kills
 only stalled vendors: if a vendor is still producing output when the deadline
 hits, the call is extended in 5-minute windows (`PANEL_CALL_TIMEOUT_EXTEND=300`,
-`0` disables) and killed only after a full window with no new output.
+`0` disables) and killed only after a full window with no new output. To let a
+cheap model judge a silent call before it is killed, set
+`PANEL_IDLE_PROBE_VENDOR=<vendor>` (optionally `PANEL_IDLE_PROBE_MODEL`,
+`PANEL_IDLE_PROBE_EFFORT`); `launch.sh` and `synthesize.sh` forward these as
+`call.sh --idle-probe-*` flags, and the probe reads the process tree and output
+tails and answers extend-or-kill (any probe failure still kills; see
+`shared/vendors/README.md`, "Idle Probe").
 
 Path-based discovery drives `shared/vendors/scripts/call.sh` with
 `--cwd <repo/source>` and `--yolo` for each panel vendor. The shared wrapper

@@ -98,6 +98,17 @@ Runtime and native options:
                                  repeats while output keeps growing. Kill
                                  happens only after a full window with no
                                  new output. 0 disables (default).
+  --idle-probe-vendor NAME       When the watchdog is about to kill a silent
+                                 call (deadline reached, no new output for a
+                                 full extend window), first ask this vendor's
+                                 cheap model whether to extend or kill (see
+                                 idle-probe.sh). Any probe failure kills.
+                                 Requires --timeout. Off by default.
+  --idle-probe-model MODEL       Probe model (default: vendors.conf model)
+  --idle-probe-effort EFFORT     Probe effort hint (default: none)
+  --idle-probe-timeout SECONDS   Probe call timeout (default: 60)
+  --idle-probe-max-total SECONDS Total extra seconds all probe verdicts may
+                                 grant to one call (default: 3600)
   --native-arg ARG               Raw selected-vendor CLI arg; repeatable
   --env NAME=VALUE               Per-call environment override; repeatable
   --dry-run                      Print resolved command(s) without calling models
@@ -143,6 +154,11 @@ SESSION_MAX_TURNS=""
 MIN_SUCCESS=""
 TIMEOUT_SECONDS=0
 TIMEOUT_EXTEND_SECONDS=0
+IDLE_PROBE_VENDOR=""
+IDLE_PROBE_MODEL=""
+IDLE_PROBE_EFFORT=""
+IDLE_PROBE_TIMEOUT=60
+IDLE_PROBE_MAX_TOTAL=3600
 
 VENDORS_CWD=""
 VENDORS_EFFECTIVE_CWD=""
@@ -371,6 +387,52 @@ while [ "$#" -gt 0 ]; do
       TIMEOUT_EXTEND_SECONDS="${1#*=}"
       shift
       ;;
+    --idle-probe-vendor)
+      require_value "$1" "${2-}"
+      IDLE_PROBE_VENDOR="$2"
+      shift 2
+      ;;
+    --idle-probe-vendor=*)
+      IDLE_PROBE_VENDOR="${1#*=}"
+      shift
+      ;;
+    --idle-probe-model)
+      require_value "$1" "${2-}"
+      IDLE_PROBE_MODEL="$2"
+      shift 2
+      ;;
+    --idle-probe-model=*)
+      IDLE_PROBE_MODEL="${1#*=}"
+      shift
+      ;;
+    --idle-probe-effort)
+      require_value "$1" "${2-}"
+      IDLE_PROBE_EFFORT=$(vendors_lower "$2")
+      shift 2
+      ;;
+    --idle-probe-effort=*)
+      IDLE_PROBE_EFFORT="${1#*=}"
+      IDLE_PROBE_EFFORT=$(vendors_lower "$IDLE_PROBE_EFFORT")
+      shift
+      ;;
+    --idle-probe-timeout)
+      require_value "$1" "${2-}"
+      IDLE_PROBE_TIMEOUT="$2"
+      shift 2
+      ;;
+    --idle-probe-timeout=*)
+      IDLE_PROBE_TIMEOUT="${1#*=}"
+      shift
+      ;;
+    --idle-probe-max-total)
+      require_value "$1" "${2-}"
+      IDLE_PROBE_MAX_TOTAL="$2"
+      shift 2
+      ;;
+    --idle-probe-max-total=*)
+      IDLE_PROBE_MAX_TOTAL="${1#*=}"
+      shift
+      ;;
     --speed|--speed=*|--add-dir|--add-dir=*|--tools|--tools=*|--sandbox|--sandbox=*|--output-format|--output-format=*|--json|--schema-json|--schema-json=*)
       die "$1 is not a shared option; pass vendor-specific controls with --native-arg"
       ;;
@@ -439,6 +501,30 @@ esac
 case "$TIMEOUT_EXTEND_SECONDS" in
   ''|*[!0-9]*) die "--timeout-extend must be a non-negative integer" ;;
 esac
+
+case "$IDLE_PROBE_TIMEOUT" in
+  ''|*[!0-9]*) die "--idle-probe-timeout must be a non-negative integer" ;;
+esac
+
+case "$IDLE_PROBE_MAX_TOTAL" in
+  ''|*[!0-9]*) die "--idle-probe-max-total must be a non-negative integer" ;;
+esac
+
+if [ -n "$IDLE_PROBE_VENDOR" ]; then
+  # Validate in a subshell: vendors_normalize_vendor sets the VENDORS_VENDOR_*
+  # globals that the per-vendor loop below owns.
+  (vendors_normalize_vendor "$IDLE_PROBE_VENDOR" >/dev/null 2>&1) \
+    || die "--idle-probe-vendor: unknown vendor: $IDLE_PROBE_VENDOR"
+  if [ -n "$IDLE_PROBE_EFFORT" ]; then
+    IDLE_PROBE_EFFORT=$(vendors_normalize_effort "$IDLE_PROBE_EFFORT") \
+      || die "--idle-probe-effort must be min, low, medium, high, xhigh, or max"
+  fi
+  if [ ! -r "$SCRIPT_DIR/idle-probe.sh" ]; then
+    die "--idle-probe-vendor requires $SCRIPT_DIR/idle-probe.sh"
+  fi
+elif [ -n "$IDLE_PROBE_MODEL" ] || [ -n "$IDLE_PROBE_EFFORT" ]; then
+  die "--idle-probe-model and --idle-probe-effort require --idle-probe-vendor"
+fi
 
 case "$MIN_SUCCESS" in
   "") ;;
@@ -652,6 +738,39 @@ stream_size() {
   # Size in bytes of the vendor's stream file; 0 if it does not exist yet.
   if [ -f "$VENDORS_STREAM_FILE" ]; then
     wc -c < "$VENDORS_STREAM_FILE" | tr -d '[:space:]'
+  else
+    printf 0
+  fi
+}
+
+file_mtime_epoch() {
+  # Portable mtime (follows symlinks: the stream file is usually a symlink to
+  # the vendor transcript). Selected per host OS like vendors_host_os, never
+  # by running one platform's form and sniffing its error output.
+  local file="$1"
+  case "$(vendors_host_os)" in
+    darwin) stat -L -f %m "$file" 2>/dev/null || true ;;
+    linux) stat -L -c %Y "$file" 2>/dev/null || true ;;
+    *) printf '' ;;
+  esac
+}
+
+stream_idle_seconds() {
+  # Seconds since the vendor's stream output last grew: stream-file mtime when
+  # it exists and can be read, otherwise the epoch given as fallback.
+  local fallback_epoch="$1"
+  local now=""
+  local mtime=""
+
+  now=$(date +%s)
+  if [ -f "$VENDORS_STREAM_FILE" ]; then
+    mtime=$(file_mtime_epoch "$VENDORS_STREAM_FILE")
+  fi
+  case "$mtime" in
+    ''|*[!0-9]*) mtime="$fallback_epoch" ;;
+  esac
+  if [ "$now" -gt "$mtime" ]; then
+    printf '%s' "$((now - mtime))"
   else
     printf 0
   fi
@@ -910,6 +1029,10 @@ run_one_vendor() {
   local native_arg=""
   local py=""
   local -a session_plan_args=()
+  local idle_probe_verdict_file=""
+  local idle_probe_verdicts=0
+  local idle_probe_last_verdict=""
+  local run_started_epoch=""
 
   call_dir=$(dirname "$output_file")
   timeout_marker="$call_dir/timed-out"
@@ -1035,6 +1158,12 @@ run_one_vendor() {
 
   run_status=0
   if [ "$TIMEOUT_SECONDS" -gt 0 ] && [ "$VENDORS_DRY_RUN" != "1" ]; then
+    # The watchdog subshell cannot set this function's variables, so it
+    # appends every idle-probe verdict to a work file that the status block
+    # reads back after the run.
+    idle_probe_verdict_file="$WORK_DIR/$output_id.idle-probe-verdicts"
+    : > "$idle_probe_verdict_file"
+    run_started_epoch=$(date +%s)
     vendors_run "$vendor_id" "$prompt_file" "$output_file" &
     RUN_PID=$!
     (
@@ -1044,13 +1173,82 @@ run_one_vendor() {
       # file grew since the previous check, and kill only after a full
       # window passes with no new output.
       prev_size=0
-      while [ "$TIMEOUT_EXTEND_SECONDS" -gt 0 ]; do
-        cur_size=$(stream_size)
-        if [ "$cur_size" -le "$prev_size" ]; then
+      probe_count=0
+      probe_granted=0
+      while :; do
+        while [ "$TIMEOUT_EXTEND_SECONDS" -gt 0 ]; do
+          cur_size=$(stream_size)
+          if [ "$cur_size" -le "$prev_size" ]; then
+            break
+          fi
+          prev_size="$cur_size"
+          sleep "$TIMEOUT_EXTEND_SECONDS"
+        done
+        # The mechanical watchdog would kill here. With --idle-probe-vendor,
+        # ask a cheap model first: `extend N` sleeps N seconds (bounded by
+        # the remaining --idle-probe-max-total budget) and returns to the
+        # extend-window check; `kill`, an exhausted budget, or any probe
+        # failure falls through to the kill below. The probe's own call.sh
+        # gets no idle-probe flags (no recursion) and no --session-key.
+        [ -n "$IDLE_PROBE_VENDOR" ] || break
+        probe_remaining=$((IDLE_PROBE_MAX_TOTAL - probe_granted))
+        if [ "$probe_remaining" -le 0 ]; then
+          printf "idle-probe: extension budget exhausted (%ss granted of %ss); killing\n" \
+            "$probe_granted" "$IDLE_PROBE_MAX_TOTAL"
           break
         fi
-        prev_size="$cur_size"
-        sleep "$TIMEOUT_EXTEND_SECONDS"
+        probe_count=$((probe_count + 1))
+        probe_idle_sec=$(stream_idle_seconds "$run_started_epoch")
+        probe_out_dir="$call_dir/idle-probe/$probe_count"
+        probe_args=(
+          "$SCRIPT_DIR/idle-probe.sh"
+          --pid "$RUN_PID"
+          --idle-sec "$probe_idle_sec"
+          --idle-cap-sec "$TIMEOUT_SECONDS"
+          --label "$output_id"
+          --stream "$VENDORS_STREAM_FILE"
+          --stdout "$output_file"
+          --stderr "$log_file"
+          --probe-vendor "$IDLE_PROBE_VENDOR"
+          --probe-timeout "$IDLE_PROBE_TIMEOUT"
+          --output-dir "$probe_out_dir"
+        )
+        if [ -n "$IDLE_PROBE_MODEL" ]; then
+          probe_args+=(--probe-model "$IDLE_PROBE_MODEL")
+        fi
+        if [ -n "$IDLE_PROBE_EFFORT" ]; then
+          probe_args+=(--probe-effort "$IDLE_PROBE_EFFORT")
+        fi
+        printf "idle-probe: probe %s after %ss idle (cap %ss) via %s\n" \
+          "$probe_count" "$probe_idle_sec" "$TIMEOUT_SECONDS" "$IDLE_PROBE_VENDOR"
+        probe_output=$(bash "${probe_args[@]}") || probe_output="kill"
+        probe_verdict=$(printf "%s\n" "$probe_output" | head -n 1)
+        probe_rationale=$(printf "%s\n" "$probe_output" | sed -n '2p')
+        [ -n "$probe_verdict" ] || probe_verdict="kill"
+        printf "%s\n" "$probe_verdict" >> "$idle_probe_verdict_file"
+        printf "idle-probe: verdict %s: %s%s\n" "$probe_count" "$probe_verdict" \
+          "${probe_rationale:+ ($probe_rationale)}"
+        case "$probe_verdict" in
+          "extend "*)
+            probe_grant="${probe_verdict#extend }"
+            case "$probe_grant" in
+              ''|*[!0-9]*) probe_grant=0 ;;
+            esac
+            if [ "$probe_grant" -gt "$probe_remaining" ]; then
+              probe_grant="$probe_remaining"
+            fi
+            if [ "$probe_grant" -le 0 ]; then
+              break
+            fi
+            probe_granted=$((probe_granted + probe_grant))
+            printf "idle-probe: extending %ss (%ss of %ss budget used)\n" \
+              "$probe_grant" "$probe_granted" "$IDLE_PROBE_MAX_TOTAL"
+            sleep "$probe_grant"
+            ;;
+          *)
+            break
+            ;;
+        esac
       done
       : > "$timeout_marker"
       kill_tree "$RUN_PID" TERM
@@ -1067,6 +1265,10 @@ run_one_vendor() {
     wait "$TIMER_PID" 2>/dev/null || true
     if [ -e "$timeout_marker" ]; then
       run_status=124
+    fi
+    if [ -s "$idle_probe_verdict_file" ]; then
+      idle_probe_verdicts=$(wc -l < "$idle_probe_verdict_file" | tr -d '[:space:]')
+      idle_probe_last_verdict=$(tail -n 1 "$idle_probe_verdict_file")
     fi
   else
     vendors_run "$vendor_id" "$prompt_file" "$output_file" || run_status=$?
@@ -1178,6 +1380,10 @@ run_one_vendor() {
         printf "session_turn=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name turn_number 2>/dev/null || true)"
         printf "session_max_turns=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name max_turns 2>/dev/null || true)"
         printf "session_auto_reset=%s\n" "$("$py" "$session_helper" field --plan "$session_plan_file" --name auto_reset 2>/dev/null || true)"
+      fi
+      if [ -n "$IDLE_PROBE_VENDOR" ]; then
+        printf "idle_probe_verdicts=%s\n" "$idle_probe_verdicts"
+        printf "idle_probe_last_verdict=%s\n" "$idle_probe_last_verdict"
       fi
       if [ "$code" = "124" ]; then
         printf "reason=timeout\n"
