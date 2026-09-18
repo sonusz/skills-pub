@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# OS
+.DS_Store
+
+# Harness transient state
+.running.pid
+.pause
+.*.stdout.log
+.*.stderr.log
+.lock/
+
+# Machine-local vendor selections; the tracked sample-vendors.* is the catalog.
+skills/*/vendors.yaml
+skills/*/vendors.yml

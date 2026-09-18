@@ -229,7 +229,7 @@ wait.
   feature-spec stage, no external vendor CLIs. Two docs, in-harness
   subagents, done.
 - Not a general code-review skill — reviews here check *doc conformance and
-  proportionality*. Use `pr-review` / `multi-lens-review` for bug hunts and
+  proportionality*. Use a dedicated code-review skill for bug hunts and
   style review.
 
 ## Files
