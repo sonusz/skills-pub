@@ -8,7 +8,7 @@
 #
 # PANEL_SMOKE_SKILL_DIR selects the skill under test (default: panel-review).
 # Point it at a skill whose scripts/ wrap panel-review's through a
-# skills/panel-review link (multi-lens-review) to exercise the wrappers and
+# skills/panel-review link (another skill) to exercise the wrappers and
 # that skill's sample-vendors.yaml; the fakes assume the same five panel ids.
 set -euo pipefail
 

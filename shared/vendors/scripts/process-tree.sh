@@ -5,7 +5,7 @@
 #                                   indented by depth.
 #   process-tree.sh --alive <pid>   Exit 0 if <pid> is alive, 1 if not.
 #
-# Why this exists: liveness/idle probes (e.g. auto-dev's idle-timeout probe)
+# Why this exists: liveness/idle probes (e.g. auto-dev-sdk's idle-timeout probe)
 # need to read a vendor subprocess's process tree to judge "wedged vs working".
 # The naive `ps --forest -o ...,cmd` form is GNU-only and FAILS on macOS/BSD ps
 # ("illegal option -- -" / "cmd: keyword not found"), which silently degrades

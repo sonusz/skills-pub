@@ -8,7 +8,7 @@ description: >
   Unresolved requirements and core changes return to the user. Triggers on
   "auto-dev-lite", "doc-driven development", "develop against this design
   doc", "implement per this document", or requests for a lighter alternative
-  to the full auto-dev pipeline. Skip single-line fixes, typos, and changes
+  to the full auto-dev-sdk pipeline. Skip single-line fixes, typos, and changes
   with no design surface.
 allowed-tools: Task, Read, Grep, Glob, Bash
 ---
@@ -225,8 +225,8 @@ wait.
 
 ## What this skill is not
 
-- Not the full `auto-dev` pipeline — no `docs/features/` folder contract, no
-  feature-spec stage, no external vendor CLIs. Two docs, in-harness
+- Not the full `auto-dev-sdk` pipeline — no `docs/features/` folder contract,
+  no separate feature-documentation stage, no external vendor CLIs. Two docs, in-harness
   subagents, done.
 - Not a general code-review skill — reviews here check *doc conformance and
   proportionality*. Use a dedicated code-review skill for bug hunts and

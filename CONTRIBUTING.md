@@ -17,7 +17,7 @@ Your authorship (name, email, date) is preserved in the resulting commit. The
 PR is then closed with a note pointing at the commit that landed. Expect the
 landed commit's hash to differ from your branch.
 
-Keep PRs to the paths that exist here: the six `skills/*/` directories,
+Keep PRs to the paths that exist here: the seven `skills/*/` directories,
 `shared/`, and the root files. Changes elsewhere
 cannot be mirrored.
 

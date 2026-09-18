@@ -64,15 +64,15 @@ Skills link the module as `skills/<skill>/shared/secrets -> ../../../shared/secr
   fetched files is piped through `redact.sh` before it lands in the structured
   output. `skills/auto-fix/scripts/redact-secrets.sh` is now a thin wrapper
   around this module's `redact.sh`.
-- **panel-review**, **pr-review**, **multi-lens-review** scan before launch.
+- **panel-review** and **pr-review** scan before launch.
   Panel prompts are path manifests and reviewers read the files themselves
   with repo access, so a secret inside a manifested file still reaches every
   vendor. Run `scan.sh <manifest paths...>` (or `scan.sh --diff < diff.patch`)
   before launching; on any hit either drop that file from the manifest (and say
   so in the report) or stop and ask. pr-review's `gather-context.sh` records
   the diff scan in `secrets.txt` automatically.
-- **create-skill-secured** names `redact.sh` / `scan.sh` as the standard tool
-  for its Output Sanitization checklist item.
+- Skill-authoring security checklists name `redact.sh` / `scan.sh` as the
+  standard tool for output sanitization.
 
 Adding a pattern: append to `patterns.pl`, run `perl -c patterns.pl`, then
 `bash doctor.sh`. Keep new entries high-confidence; a noisy pattern makes the

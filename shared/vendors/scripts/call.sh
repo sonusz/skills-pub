@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # A keyed invocation owns durable leases, so it must also own a kernel process
 # group whose emptiness can be verified during handled-signal cleanup. The
 # Python re-exec preserves pid, argv, cwd, environment, and stdin; os.setsid()
-# gives direct shell callers the same isolation that auto-dev's
+# gives direct shell callers the same isolation that auto-dev-sdk's
 # start_new_session=True already provides.
 VENDORS_RAW_SESSION_REQUESTED=0
 for vendors_raw_arg in "$@"; do

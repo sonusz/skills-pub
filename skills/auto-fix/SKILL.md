@@ -44,7 +44,7 @@ Exactly one of:
 - **ESCALATED** — `{ status: "escalated", category, conflict, evidence, recommendation }` where `category` is one of:
   - `"pre-existing"` — issue existed before the current change; not introduced by this PR
   - `"behavioral"` — change would reverse documented intent, OR no design evidence found and the change is outside the minimum-guard whitelist
-  - `"doc-drift"` — documented intent and actual code behavior disagree, AND the requested fix either undoes the documented guarantee (aligns with current code, against docs) or wants a third behavior (aligns with neither). Drift where the fix aligns with docs is the happy path, not an escalation. A human or a fresh `feature-spec` pass resolves the escalated cases.
+  - `"doc-drift"` — documented intent and actual code behavior disagree, AND the requested fix either undoes the documented guarantee (aligns with current code, against docs) or wants a third behavior (aligns with neither). Drift where the fix aligns with docs is the happy path, not an escalation. A human, or regenerating the feature docs from current code, resolves the escalated cases.
   - `"above-minor"` — size gate failed (too many files / lines, or in a restricted path), OR bot-authored comment on error/control-flow semantics without supporting evidence
 
 Never returns partial / in-progress. Stuck mid-fix ⇒ scoped revert per §6's recovery rule and return ESCALATED.
@@ -92,7 +92,7 @@ Dirty tree (script exits non-zero) → **refuse to start**. Do not stash or `git
 Gather evidence from these sources in order, stop at the first concrete finding:
 
 - Most recent commit message touching the affected lines: `git log -1 --format=%B -- <file>` and `git blame <file>` for relevant lines
-- Feature docs at `docs/features/<area>/README.md` (navigation index — follow pointers to the sub-file covering the affected code). Auto-fix reads these docs but does **not** invoke feature-spec as a skill — reading is in scope, generation is not.
+- Feature docs at `docs/features/<area>/README.md` (navigation index — follow pointers to the sub-file covering the affected code). Auto-fix reads these docs but does **not** generate or regenerate them — reading is in scope, generation is not.
 - Docstrings, module-level docs, inline comments on the affected functions
 - Referenced tickets (the `Issue:` field in commit messages), if the project tracks them
 
@@ -102,7 +102,7 @@ Record what you found (or didn't) — this becomes the `evidence` field on escal
 
 Agree → continue to §2. Disagree → **do not auto-escalate**; drift is common and fixing drift is often the whole point. Branch on which side the fix aligns with:
 
-- **Aligns with docs** — happy path: code has a bug, docs are intent. Proceed to §2 (with the drift exception). Note the drift in the APPLIED summary; a later `feature-spec` pass can confirm the spec still matches the now-fixed code.
+- **Aligns with docs** — happy path: code has a bug, docs are intent. Proceed to §2 (with the drift exception). Note the drift in the APPLIED summary; a later docs regeneration pass can confirm the spec still matches the now-fixed code.
 - **Aligns with current code** (undoes a documented guarantee) → escalate as `doc-drift`. Human decides which side is intent.
 - **Aligns with neither** (third behavior) → escalate as `doc-drift`. Same reasoning.
 
@@ -229,7 +229,7 @@ The skill must never:
 
 Invoked by other flows, not always end-user-facing:
 
-- **`pr-watch-auto`** — delegates all CI-failure and review-comment fix logic to auto-fix in `mode: "apply"`. pr-watch-auto owns orchestration (polling, comment fetching, replying, resolving threads); auto-fix owns the fix-or-escalate decision.
+- **`pr-watch-auto`** — delegates all CI-failure and review-comment fix logic to auto-fix: `mode: "evaluate"` first, then `mode: "apply"` with the confirmed evaluate hash. pr-watch-auto owns orchestration (polling, comment fetching, replying, resolving threads); auto-fix owns the fix-or-escalate decision.
 - **Direct human invocation** — e.g., pasting a review comment and asking "auto-fix this"; the caller provides context in the Review-comment input shape and chooses `evaluate` or `apply`.
 
 Callers receive a single structured result and decide downstream actions (reply to the comment, mark thread resolved, post the summary table, open a follow-up task for `above-minor` items, or decide whether to proceed from `would_apply` to `apply`).

@@ -81,6 +81,6 @@ and source `"$SCRIPT_DIR/../shared/doctor/doctor-lib.sh"` from `scripts/doctor.s
 Modules under `shared/` source it as `"$SCRIPT_DIR/../doctor/doctor-lib.sh"`.
 
 Adopted by: `shared/github-ops/doctor.sh`, `shared/secrets/doctor.sh`,
-`skills/fetch-logs`, `skills/frugal`, `skills/pr-review`, `skills/pr-watch-auto`.
-`skills/panel-review`, `skills/multi-lens-review` and `shared/vendors` keep their
+`skills/pr-review`, `skills/pr-watch-auto`.
+`skills/panel-review` and `shared/vendors` keep their
 table-style doctors.

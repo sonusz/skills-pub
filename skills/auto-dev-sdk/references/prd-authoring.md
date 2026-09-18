@@ -7,7 +7,7 @@ to drive the PRD draft to a state where `autodev prd-lint` passes
 and the PRD captures only what auto-dev-sdk's stages can act on.
 
 This guide is for cold-start authoring. To **document existing
-code**, use `feature-spec` instead — that skill is the inverse
+code**, use a code-to-docs tool instead; that is the inverse
 direction (code → docs), not (idea → spec).
 
 ---
@@ -412,12 +412,12 @@ which is where a violation becomes a P0 finding.
 
 ## Worked example
 
-`docs/features/alpha-miner-runtime/prd.md` was authored using this
+`docs/features/signal-runtime/prd.md` was authored using this
 workflow:
 
-- Bootstrap: read `alpha-miner-sdk/complete/prd.md`,
-  `complete/implemented-spec.md`, `reference/core-flow-design.md`,
-  uploaded `alpha-miner-prd.pdf`.
+- Bootstrap: read the prior feature's `complete/prd.md` and
+  `complete/implemented-spec.md`, a `reference/core-flow-design.md`,
+  and an uploaded product brief PDF.
 - Skeleton: 7 sections drafted empty, then Out of Scope first
   (carved out tmux dashboard, dead-letter HTTP service, multi-user,
   live execution).
@@ -433,7 +433,7 @@ workflow:
   cooldown tiers, 15-min smoothing window, exact `--json` field
   names) into scope-stage decisions.
 - Lessons: appended 6 Implementation Discipline items from the
-  prior `alpha-miner-sdk` build.
+  prior feature's build.
 - Validate: `autodev prd-lint` passed, 14 requirements parsed.
 
 The conversation that produced this PRD is the canonical example

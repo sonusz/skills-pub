@@ -59,7 +59,7 @@ single-line bug fix — the two-phase ceremony costs more than it returns.
 1. Gather context — scripts/gather-context.sh
 2. Phase 1 (docs-compliance) — only if the agent identifies anchor docs
 3. Phase 2 (bug hunt) — always
-4. (gh only) Compare findings against PR threads — scripts/list-all-threads.sh
+4. (gh only) Compare findings against PR threads — shared/github-ops/comment-check.sh <pr> --include-resolved
 5. (gh only, opt-in) Draft + post inline threads — scripts/post-review-thread.sh
 6. Summary
 ```
@@ -347,7 +347,7 @@ AGENT: [runs gather-context.sh --pr 21]
        Phase 1 gaps: NUM_FLEX_WORKERS clobbered at startup (unanimous).
        [Phase 2 runs, surfaces bugs]
        3 HIGH findings verified.
-       [runs list-all-threads.sh, classifies]
+       [runs comment-check.sh --include-resolved, classifies]
        → Bug #1 (multipart): 2 resolved threads on same function for
          a different concern (resource leak). New finding is net-new.
        → Bug #2 (notify wake-up): no overlapping threads.

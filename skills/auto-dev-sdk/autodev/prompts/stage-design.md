@@ -230,7 +230,7 @@ and why.
 
 In greenfield (no arch-docs exist in the discretionary-read set),
 design.md IS the first architectural record for the repo; the
-feature-spec stage later crystallizes code facts into `implemented-spec.md`'s
+spec stage later crystallizes code facts into `implemented-spec.md`'s
 architecture section, which the next feature will read as an
 arch-doc anchor.
 

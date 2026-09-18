@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from autodev import exit_codes
-from autodev.cli import DEFAULT_VENDORS_YML, VENDORS_YML_ENV, main
+from autodev.cli import VENDORS_YML_ENV, main
 
 
 def test_cli_status_nonexistent_returns_ok(git_repo, capsys, monkeypatch):
@@ -494,9 +494,13 @@ def test_cli_run_without_until_runs_to_completion(git_repo, feature_active, monk
     assert captured["stop_before"] is None
 
 
-def test_cli_run_uses_sdk_root_vendors_by_default(git_repo, feature_active, monkeypatch):
+def test_cli_run_uses_sdk_root_vendors_by_default(git_repo, feature_active, tmp_path, monkeypatch):
     import autodev.cli as cli
 
+    # The real SDK-root vendors.yml is machine-local and git-ignored, so stand
+    # in a temporary file for it; the loader only checks that the path exists.
+    sdk_default = tmp_path / "sdk-vendors.yml"
+    sdk_default.write_text("stages: {}\n", encoding="utf-8")
     calls = []
 
     def fake_load(path):
@@ -504,12 +508,13 @@ def test_cli_run_uses_sdk_root_vendors_by_default(git_repo, feature_active, monk
         return object()
 
     monkeypatch.delenv(VENDORS_YML_ENV, raising=False)
+    monkeypatch.setattr(cli, "DEFAULT_VENDORS_YML", sdk_default)
     monkeypatch.setattr(cli, "load_vendors_config", fake_load)
 
     cfg = cli._load_vendors(None, repo_root=git_repo)
 
     assert cfg is not None
-    assert calls == [DEFAULT_VENDORS_YML]
+    assert calls == [sdk_default]
 
 
 def test_cli_run_honors_vendor_env_before_sdk_default(git_repo, tmp_path, monkeypatch):

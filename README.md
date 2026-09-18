@@ -1,100 +1,155 @@
-# skills-pub
+<h1 align="center">skills-pub</h1>
 
-Agent skills for PRD-driven feature development, multi-vendor review, and
-autonomous PR upkeep, plus the shared modules they depend on. Skills follow the open `SKILL.md` format and work in Claude
-Code, Codex CLI, and other agents that load skills from a directory.
+<p align="center">
+  Agent skills that take a feature from PRD to merged PR,<br>
+  with several LLM vendors checking each other's work.
+</p>
 
-| Skill | What it is | Pick it when |
-|---|---|---|
-| [`skills/auto-dev-sdk`](skills/auto-dev-sdk/) | A Python harness (`autodev` CLI) that owns pipeline state and enforcement: design packet → multi-vendor design review → build loop → implementation index → PRD checklist → close approval. The skill itself is a thin dispatcher from natural language to CLI verbs. | You want the pipeline enforced by code, with review gates that call several LLM vendors and a resumable filesystem state machine. |
-| [`skills/auto-dev-lite`](skills/auto-dev-lite/) | A prompt-only skill. You own a core requirements document; the orchestrator owns a detail spec; fresh subagents do a design dry run, scoped implementation, and reviews. | You want document-driven development without external vendor CLIs or a harness install. |
-| [`skills/panel-review`](skills/panel-review/) | Runs one prompt through several LLM vendors in parallel and synthesizes where they agree and, more importantly, where they diverge. `auto-dev-sdk` uses the same mechanism for its review gates. | You want a cross-vendor second opinion on a spec, config, or architecture decision that tests cannot verify. |
-| [`skills/pr-review`](skills/pr-review/) | Two-phase review of a local branch diff or a GitHub PR: first whether the code delivers what its docs (plan, PRD, spec) require, then a bug hunt. In GitHub mode it can post inline review threads. | You want a structured pre-merge review, not a one-line sanity check. |
-| [`skills/auto-fix`](skills/auto-fix/) | Takes a failure signal (CI log or review comment) plus the affected scope, reads the project's feature docs for design intent, and either applies a minimum fix that matches the documented intent or escalates with a conflict report. | You want autonomous fixes that refuse to reverse design decisions. |
-| [`skills/pr-watch-auto`](skills/pr-watch-auto/) | Watches a pushed PR's CI and review comments in one loop, delegates fixes to `auto-fix`, squash-commits and pushes, and resolves or escalates each thread. | You want a PR babysat after pushing it. |
+<p align="center">
+  <a href="https://github.com/sonusz/skills-pub/actions/workflows/test.yml"><img alt="tests" src="https://github.com/sonusz/skills-pub/actions/workflows/test.yml/badge.svg"></a>
+  <img alt="python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
+  <img alt="linux | macos" src="https://img.shields.io/badge/platform-linux%20%7C%20macos-lightgrey">
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+</p>
 
-`shared/` holds the modules the skills link to: `shared/vendors` (one adapter
-for every supported LLM CLI, with idle probing and doctor checks),
-`shared/github-ops` (GitHub API primitives for the PR skills), `shared/os`
-(host OS detection), `shared/secrets` (redaction and secret scanning), and
-`shared/doctor` (the shared output format for `doctor.sh` scripts).
+---
 
-`auto-fix`, `pr-review`, and `pr-watch-auto` read a project's `docs/features/<X>/`
-folder for design intent when one exists; `auto-dev-sdk` produces that folder.
+Seven skills in the open [`SKILL.md`](https://github.com/anthropics/skills) format. They load into Claude Code, Codex CLI, and any agent that reads skills from a directory. Everything is shell and Python; there is nothing to deploy.
 
-## Requirements
+- **PRD in, reviewed code out.** `auto-dev-lite` for most features, `auto-dev-sdk` when the feature is big enough to want a harness with state on disk.
+- **Disagreement as a signal.** Review gates send the same artifact to several vendors and synthesize where they diverge, because consensus among models that share training data proves little.
+- **Quota-aware.** The harness reads each vendor's remaining quota before a launch and falls back to the next candidate instead of stalling.
+- **PRs that look after themselves.** Watch CI and review threads, fix only what documented design intent allows, escalate the rest.
+- **Nothing hidden from you.** Every fix, push, and thread resolution needs a confirmation bound to a snapshot of what it will touch.
 
-- Linux or macOS. Windows needs WSL: the scripts assume a POSIX shell and
-  `/proc` or BSD `ps`.
-- Python 3.11+ for `auto-dev-sdk`; bash 3.2+ for the shell scripts (macOS's
-  system bash is fine).
-- For `auto-dev-sdk`, `panel-review`, and `pr-review`: at least one supported
-  LLM CLI on `PATH` and logged in. Supported: `claude`, `codex`, `agy`, `grok`,
-  `cursor-agent`. See [`shared/vendors/sample-vendors.yaml`](shared/vendors/sample-vendors.yaml)
-  for binaries, login commands, and model ids. `auto-dev-lite` needs none.
-- For `pr-review`, `auto-fix`, and `pr-watch-auto` in GitHub mode: the `gh` CLI,
-  logged in.
-
-## Install a skill
-
-Symlink the skill directory into your agent's skills directory. Symlinks keep
-the `shared/` links resolving and let `git pull` update everything:
+## Quick start
 
 ```bash
 git clone https://github.com/sonusz/skills-pub.git
 REPO="$PWD/skills-pub"
 
-ln -sfn "$REPO/skills/auto-dev-lite" ~/.claude/skills/auto-dev-lite   # Claude Code
-ln -sfn "$REPO/skills/auto-dev-sdk"  ~/.claude/skills/auto-dev-sdk
-ln -sfn "$REPO/skills/panel-review"  ~/.claude/skills/panel-review
-# pr-watch-auto depends on auto-fix: link both
-ln -sfn "$REPO/skills/auto-fix"      ~/.claude/skills/auto-fix
-ln -sfn "$REPO/skills/pr-watch-auto" ~/.claude/skills/pr-watch-auto
-# Codex: use ~/.codex/skills/ instead
+# Claude Code (use ~/.codex/skills for Codex CLI)
+for s in auto-dev-lite panel-review pr-review auto-fix pr-watch-auto compact-skill auto-dev-sdk; do
+  ln -sfn "$REPO/skills/$s" ~/.claude/skills/$s
+done
 ```
 
-If you must copy instead of link, replace each `shared/*` symlink inside the
-copied skill with a real copy of that module.
+`auto-dev-lite` and `auto-fix` work right away; the others need vendors configured (below). Then, in your agent:
 
-## panel-review: pick your vendors
+> implement per this document docs/my-feature.md
+
+and `auto-dev-lite` takes it from there. For the skills that call other vendors, see [Configure vendors](#configure-vendors).
+
+## Skills
+
+| Skill | What it does | Needs |
+|---|---|---|
+| [**auto-dev-lite**](skills/auto-dev-lite/) | Document-driven development for small and medium features. You own a core requirements doc, the agent owns a detail spec, fresh subagents build and review against both. | nothing extra |
+| [**auto-dev-sdk**](skills/auto-dev-sdk/) | The same idea for large features and codebases. A Python harness (`autodev`) owns pipeline state and gates; the skill just turns your request into CLI verbs. | Python 3.11+, vendor CLIs |
+| [**panel-review**](skills/panel-review/) | One prompt to several vendors in parallel, then a synthesis of where they agree and where they diverge. | vendor CLIs |
+| [**pr-review**](skills/pr-review/) | Two-phase review of a branch diff or a GitHub PR: does the code deliver what its docs require, then a bug hunt. Can post inline threads. | panel-review, GitHub token for PR mode |
+| [**auto-fix**](skills/auto-fix/) | Given a CI log or review comment, apply the smallest fix that matches documented design intent, or escalate with a conflict report. | nothing extra |
+| [**pr-watch-auto**](skills/pr-watch-auto/) | Babysit a pushed PR: watch CI and review threads in one loop, hand each to auto-fix, push, resolve or escalate. | auto-fix, GitHub token |
+| [**compact-skill**](skills/compact-skill/) | Shrink a `SKILL.md` without losing behavior, then have a vendor panel confirm nothing was lost. | panel-review |
+
+Every skill has its own README with requirements, usage, and how it works.
+
+### Which auto-dev?
+
+Start with **auto-dev-lite**. It is prompt-only, needs no install beyond the symlink, and fits most features. Move to **auto-dev-sdk** when a feature is large enough that you want the pipeline state on disk, resumable across sessions, with multi-vendor review gates enforced by code rather than by prompt. Its README has [the two loops drawn out](skills/auto-dev-sdk/README.md#the-two-loops).
+
+## How they fit together
+
+```text
+                    PRD
+                     │
+                     ▼
+  panel-review ◄── auto-dev-sdk ──► code + docs/features/<feature>/
+       ▲                                        ▲            │
+       │ both phases                            │ reads      │ push
+       │                                        │            ▼
+   pr-review ◄── before merge ── PR ──► pr-watch-auto ──► auto-fix
+```
+
+`auto-dev-sdk` leaves a `docs/features/<feature>/` folder next to the code it writes. `auto-fix` reads that folder to decide whether a fix matches the documented intent. `pr-review` checks a diff against whatever plan, PRD, or spec documents the diff itself touches. `panel-review` is both a standalone skill and the mechanism behind `auto-dev-sdk`'s three panel gates. Every skill also works alone; the arrows are conventions, not requirements.
+
+## Why multiple vendors
+
+Four of the seven skills send the same artifact to several vendors: `panel-review` directly, `pr-review` and `compact-skill` through it, and `auto-dev-sdk` at its panel gates. The reasoning, from `panel-review`:
+
+- **Divergence is the signal.** When three models read one spec differently, the spec is under-defined. That shows up before the implementation bug does.
+- **Consensus is not validation.** Vendors share training data, cutoffs, and upstream sources, so they can agree on the same mistake. A unanimous concern is actionable; unanimous approval is not proof.
+- **Different biases, different failure modes.** For a config or architecture decision no test can verify, reviewer diversity is the best available proxy for ground truth.
+- **A failed call is never silently replaced.** Substituting another vendor mid-run would weaken the signal without telling you. A panel needs at least two successful reviewers or it aborts.
+
+`auto-dev-sdk` adds quota awareness on top: before each launch it reads the vendor's remaining quota and, below the configured threshold, moves to the next candidate in that role's fallback list. A reviewer that fails is retried once with a fresh quota reading. Details in [Why this harness](skills/auto-dev-sdk/README.md#why-this-harness).
+
+## Requirements
+
+| | |
+|---|---|
+| OS | Linux or macOS. Windows via WSL. Scripts detect the OS and use `/proc` or BSD `ps` accordingly. |
+| Shell | bash 3.2 or newer. macOS's system bash is enough. |
+| Python | 3.11 or newer, for `auto-dev-sdk` only. |
+| Vendor CLIs | At least one of `claude`, `codex`, `agy`, `grok`, `cursor-agent` on `PATH` and logged in, for the skills marked above. Binaries, login commands, and model ids: [`shared/vendors/sample-vendors.yaml`](shared/vendors/sample-vendors.yaml). |
+| GitHub token | A fine-grained PAT reachable through `git credential fill` for `github.com`. The PR skills call the API directly and do not use `gh`. Read on Pull requests, Actions, Contents, Issues; add Pull requests: Write to post or resolve threads. |
+
+## Configure vendors
+
+Skills that call vendors ship a tracked `sample-vendors.yaml` (or `.yml`) listing every vendor they can use. Each machine keeps a git-ignored `vendors.yaml` beside it, pruned to what actually works there. Generate it once per skill, run the doctor, delete what fails:
 
 ```bash
-cd skills-pub/skills/panel-review
+cd "$REPO/skills/panel-review"
 python3 ../../shared/vendors/scripts/init-vendors.py \
   --sample sample-vendors.yaml --out vendors.yaml   # keeps vendors whose CLI is on PATH
-bash scripts/doctor.sh                                # then delete entries that fail
+bash scripts/doctor.sh
 ```
 
-## auto-dev-sdk: install the CLI
+`init-vendors.py --vendor claude --vendor codex` keeps an explicit list instead of probing `PATH`. `auto-dev-sdk` uses the same flow with `sample-vendors.yml` / `vendors.yml`, and needs its CLI installed first:
 
 ```bash
-cd skills-pub/skills/auto-dev-sdk
-python3 -m pip install --user .          # provides the `autodev` command
-autodev --help
-
-# Tell the harness which vendors exist on this machine
-python3 ../../shared/vendors/scripts/init-vendors.py \
-  --sample sample-vendors.yml --out vendors.yml
+cd "$REPO/skills/auto-dev-sdk" && python3 -m pip install --user . && autodev --help
 ```
 
-`vendors.yml` is machine-local and git-ignored; `sample-vendors.yml` is the
-tracked catalog. Full details, including venv installs and a first feature
-walkthrough, are in [`skills/auto-dev-sdk/README.md`](skills/auto-dev-sdk/README.md)
-and [`skills/auto-dev-sdk/references/install.md`](skills/auto-dev-sdk/references/install.md).
+Model names in the samples are the ones this repository has used; change them freely.
 
-## Run the tests
+## Install notes
+
+Symlinks are not a shortcut, they are the install. Skills reach shared modules through relative links (`skills/<skill>/shared/vendors -> ../../../shared/vendors`), `pr-watch-auto` reaches `auto-fix` the same way, and `pr-review` and `compact-skill` reach `panel-review`. A symlinked install keeps every link valid and updates with `git pull`. If you must copy, replace each `shared/*` and `skills/*` link inside the copy with a real copy of its target.
+
+<details>
+<summary><b>Repository layout</b></summary>
+
+```text
+skills/<skill>/        one skill: SKILL.md, README.md, scripts/, prompts/
+skills/<skill>/shared/ relative links into ../../../shared/
+skills/<skill>/skills/ relative links to sibling skills this one depends on
+shared/vendors/        one adapter for every vendor CLI (call.sh, doctor.sh)
+shared/github-ops/     GitHub API primitives used by the PR skills
+shared/secrets/        redact.sh and scan.sh for anything sent out or posted
+shared/os/             host OS detection for shell and Python
+shared/doctor/         shared output format for the doctor.sh scripts
+```
+
+</details>
+
+<details>
+<summary><b>Running the tests</b></summary>
 
 ```bash
-cd skills/auto-dev-sdk
+cd "$REPO/skills/auto-dev-sdk"
 python3 -m pip install --user -e ".[test]"
-python3 -m pytest -q            # ~4 minutes; live-vendor tests are opt-in via -m live
+python3 -m pytest -q          # about 4 minutes; live-vendor tests are opt-in via -m live
+bash ../panel-review/tests/smoke.sh    # panel-review against fake vendor CLIs
 ```
+
+The pytest suite runs on every push here, on Linux and macOS.
+
+</details>
 
 ## Contributing
 
-This repository is a read-only mirror of a larger private repository. Pull
-requests are welcome and are applied upstream as patches, so the commit that
-lands will not be the PR's own commit. See [CONTRIBUTING.md](CONTRIBUTING.md).
+This repository is a read-only mirror of a larger private repository. `main` is regenerated from upstream on every change and a ruleset blocks direct pushes. Pull requests are welcome and land upstream as patches with your authorship preserved, so the commit that ships will not be the PR's own. Details in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

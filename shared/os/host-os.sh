@@ -12,8 +12,6 @@
 # (skills/<skill>/shared/os -> ../../../shared/os) and keep an identical inline
 # copy as the fallback for a materialized install shipped without shared/os:
 #   shared/vendors/scripts/vendor-launch.sh   (vendors_host_os)
-#   skills/frugal/scripts/frugal-lib.sh       (host_os)
-#   skills/aws-poc-deploy/scripts/ssmrun.sh   (host_os)
 # The Python twin is hostos.py in this directory.
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

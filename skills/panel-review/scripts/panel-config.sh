@@ -11,7 +11,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 fi
 
 # A caller skill that reuses these scripts through a skills/panel-review link
-# (multi-lens-review) presets PANEL_SKILL_DIR so its own vendors.yaml /
+# (another skill) presets PANEL_SKILL_DIR so its own vendors.yaml /
 # sample-vendors.yaml and shared/vendors are used.
 PANEL_SKILL_DIR="${PANEL_SKILL_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PANEL_VENDORS_DIR="$PANEL_SKILL_DIR/shared/vendors"

@@ -101,7 +101,7 @@ Scripts auto-detect owner/repo from the git remote; default target is the curren
 
 ## Fix decisions delegate to `auto-fix`
 
-CI failures invoke `auto-fix` in `mode: "apply"`. Comment threads use `mode: "evaluate"` for triage, then `mode: "apply"` only for threads the user approved with `apply fix`.
+CI failures and comment threads both invoke `auto-fix` in `mode: "evaluate"` first; `mode: "apply"` runs only after the user confirms, carrying that evaluation's hash (for threads, only those approved with `apply fix`).
 
 `auto-fix` owns all fix-or-escalate gates: design intent, minimum guard, semantic reversal, and bot-author asymmetry. If it is missing, stop and ask the user to install it.
 

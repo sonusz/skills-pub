@@ -20,6 +20,200 @@ reuses its correction findings to keep only affected scopes incomplete; the
 panel routes code-only cleanup to build and design-mandated redundancy to
 `arch-design`.
 
+## Why this harness
+
+- **Several vendors review the same artifact.** The `design-review`,
+  `trace-review` and `close-approval` gates dispatch every reviewer listed
+  under `panel.reviewers` in parallel; the allowed labels are `claude`,
+  `codex`/`openai`, `agy`, `cursor` and `grok`, and the loader rejects two
+  reviewers that resolve to the same underlying provider. Each reviewer
+  states its own verdict and findings; the synthesizer keeps every raw
+  finding, groups the ones that describe one underlying issue into
+  clusters, and the harness counts clusters, not repeated wording, so
+  agreement and divergence between vendors are both visible in the verdict.
+- **Vendor switching by remaining quota.** Every LLM role in `vendors.yml`
+  (each coding stage, each panel reviewer, the synthesizer, the idle probe)
+  may set `min_quota_pct` and an ordered `fallbacks` list. Before a call
+  launches, the harness reads that vendor's remaining quota (Claude,
+  Codex/OpenAI, Cursor, Agy and Grok have fetchers) and runs the first
+  candidate whose reading is at or above its floor; a reading it cannot
+  fetch counts as insufficient. A reviewer fallback must be a different
+  provider from its primary. When no candidate qualifies the run pauses,
+  records the earliest reset time and a repo fingerprint in
+  `.quota-pause.json`, and `autodev quota-resume` continues only when the
+  time has passed, quota has recovered, and nothing else changed.
+- **A lost reviewer does not sink the panel.** A reviewer that times out or
+  returns nothing is retried once; the retry re-resolves its candidate with
+  a fresh quota reading, so it can land on a fallback vendor. After the
+  retry the harness force-refreshes that vendor's quota and omits the
+  reviewer only if exhaustion is positively confirmed; unknown quota and
+  ordinary failures still block. `min_responding_reviewers` (default 2)
+  must still be met, otherwise the same quota-pause path applies. Setting
+  `fail_fast_confirmed_quota: true` cancels the whole panel on the first
+  confirmed exhaustion instead of waiting for retries.
+- **A filesystem state machine that resumes where it stopped.** All state
+  lives under `docs/features/<feature>/active/`. The cascade decides the
+  next stage by comparing each artifact's recorded `source_hash` with its
+  upstream's current hash, so `autodev run` after a crash or `pause`
+  re-selects the first stale artifact. The `.pause` sentinel is honored at
+  the top of the run loop, when a panel finishes (before its revision is
+  dispatched), and at the top of every build round.
+- **Persistent provider-native agent sessions with turn rotation.** The
+  design, build, Ralph-review and arch-review agents each keep one native
+  session per repo and feature, and every panel reviewer slot keeps its own;
+  later turns receive a compact continuation prompt with current paths and
+  hashes. Sessions rotate automatically at successful-turn boundaries
+  (design 15 turns, build 3, arch-review 3, Ralph review and panel reviewers
+  5) and can be reset by hand with `autodev reset-session`.
+- **Design packages archived as local Git refs.** Each accepted or
+  superseded design package is committed as a package-only tree at
+  `refs/autodev/design/<feature>/package-NNN`, containing only the design
+  artifacts and changelog; it never touches the index, the checked-out
+  branch or a remote. Revision reviewers get the previous and current refs
+  with bounded `git diff` commands, and `autodev restore-design` brings the
+  latest hash-verified package back.
+- **Out-of-scope writes are a containment failure, not a warning.** Each
+  stage has a writable set and a protected set. The harness snapshots the
+  worktree before and after the subprocess, including committed tree changes
+  and content fingerprints of protected files; any write outside the
+  writable set or inside the protected set is recorded in
+  `<stage>-failure.json` as `detected_out_of_scope_write` and halts the run.
+  `vendors.yml` flags can only narrow tool access; write-scope flags are
+  harness-owned.
+- **Revision budgets with auditable single-use rerun grants.** Each panel
+  gate has a counter `L` in `revision-state.json` capped at `L_MAX = 10`; a
+  blocking verdict that reruns a producer bumps it, a build-reported design
+  defect that routes back to design consumes the same counter, and the
+  blocking verdict after the cap halts for a human. `autodev grant-rerun`
+  adds one credit recorded with reason, author and consumption time; it
+  does not raise `L`, does not mark the gate passed, and the next blocking
+  verdict halts again.
+- **Output-validation retry amends instead of restarting.** When a stage
+  exits 0 but its deliverable fails validation (missing artifact, missing
+  provenance header, a `ralph-review.json` that skips an active scope), the
+  same agent is re-dispatched up to `STAGE_OUTPUT_RETRY_MAX = 3` times with
+  a `<stage>-output-rejection.json` naming the defect and an instruction to
+  amend the prior artifact in place. Hard subprocess failures and
+  containment violations still halt immediately.
+- **Reviewers see only what they should judge.** The Ralph reviewer gets the
+  accepted design, scope, trace and the iteration diff, but not `prd.md`,
+  `build.json` or `implemented-spec.md`; the trace-review panel gets
+  `trace.md`, `test-plan.md` and `prd.md` but not `design.md`; the spec
+  stage describes code without PRD, design or build context, and the
+  close-approval panel then compares that code-first description and the
+  code against the PRD.
+
+## The two loops
+
+### Design loop
+
+```text
+prd.md
+  |
+  v
+arch-design --> arch-review (single agent; pass | needs_revision)
+  ^               | needs_revision: rerun arch-design (5 rounds, then halt)
+  |               | pass
+  |               v
+  |             design --> design.md  scope.json  trace.md  test-plan.md
+  |               |
+  |               v
+  |             design-packet.json (harness seals the four hashes)
+  |               |
+  |               v
+  |             design-review || trace-review   (parallel panels, every
+  |               |             configured vendor, one synthesizer each,
+  |               |             verdicts merged into one decision)
+  |               |
+  |               |-- pass: coverage round and budget round both passed
+  |               |      -> accepted-design.json -> build loop
+  |               |
+  |               |-- retry_design: L[design-review] += 1  (L_MAX = 10)
+  +---------------+      finding targets prd.md twice in a row
+  |               |      -> halt_for_human (PRD amendment)
+  |               |-- L already at L_MAX -> halt_for_human
+  |                      operator: autodev grant-rerun <feature> \
+  +---------------------   design-review --reason "..."
+                         one single-use credit -> one more arch-design
+                         rerun; the next blocking verdict halts again
+```
+
+The PRD is the only human-owned input. `arch-design` derives an initial
+architecture, and the single-agent `arch-review` returns `pass` or
+`needs_revision`; five consecutive `needs_revision` rounds halt. The
+`design` stage expands the passed architecture into `design.md`,
+`scope.json`, `trace.md` and `test-plan.md`, and the harness seals their
+hashes into `design-packet.json`. Two panels then run against `prd.md`:
+`design-review` judges coverage, architecture fit and scope sizing of
+`design.md` and `scope.json`; `trace-review` judges behavioral completeness
+and test fidelity of `trace.md` and `test-plan.md`. Their findings merge
+into one decision. Rounds follow a six-round cadence, three in a coverage
+role (is anything required missing) then three in a budget role (is
+anything present unrequired), skipping a role that has already passed on
+the current packet, and the gate completes only when both have passed on
+the same packet.
+A blocking decision (`retry_design`) reruns `arch-design`, which cascades
+through `design` again, and bumps `L[design-review]`; a finding that
+targets `prd.md` gets one such rerun and halts on the second consecutive
+one. At `L_MAX` the run halts for a human, who can either amend the PRD
+(`autodev update --amendment`, which resets the counters) or issue one
+`grant-rerun`. A `.pause` set while the panel runs takes effect when the
+panel finishes, before the revision is dispatched.
+
+### Build loop (the Ralph loop)
+
+```text
+accepted-design.json
+  v
++-> build ---- build.json blocking=true, diagnosis.defective_layer:
+|     |          design -> route_to_layer (L[design-review] += 1)
+|     |                    -> rerun design -> design-review again
+|     |          prd | ambiguous -> halt for human (autodev update)
+|     v
+|   ralph-review  (single agent; sees accepted design, scope, trace and
+|     |            the iteration diff; never prd.md or build.json)
+|     |   trace rows: Fully | Partial | Missing | Deviated | Deferred
+|     |   design_conformance: Aligned | Deviated + correction findings
+|     |-- every active scope Fully and no open finding -> exit loop
++-----+-- otherwise the affected scopes stay incomplete -> next round
+          (.pause checked at the top of every round; ralph-state.json
+           persists, so autodev resume + run re-enters the loop)
+  |
+  v
+implementation-index.json (harness) -> spec -> implemented-spec.md
+  |                                            (code-first; no prd.md)
+  v
+prd-checklist.json (harness; PRD requirement IDs only)
+  v
+close-approval panel: code + implemented-spec.md vs prd.md
+  |-- pass -> pipeline-done
+  |-- blocking, routed by finding target (L[close-approval] += 1):
+        build.json                                 -> rerun build
+        design.md scope.json trace.md test-plan.md -> rerun arch-design
+        prd.md or an architecture doc              -> halt for human
+```
+
+`build` implements against the accepted design, one scope item per
+iteration, and commits as it goes. If it hits a defect it cannot fix in
+code it writes a blocking deviation to `build.json` with a
+`defective_layer`: `design` routes back to the design stage and consumes
+the design-review budget; `prd` or `ambiguous` halts for a human. Otherwise
+`ralph-review` classifies every trace row against the code on disk and
+independently audits the diff for drift from the accepted design and for
+evidenced redundancy; each correction finding caps its scopes below
+complete, so only the affected scopes return to `build`. A mechanism the
+accepted design mandates is not removable here; that goes through the
+design route above. The loop exits when every active scope is `Fully` with
+no open finding. The harness then writes `implementation-index.json`, the
+`spec` stage writes the code-first `implemented-spec.md`, the harness writes
+`prd-checklist.json`, and the `close-approval` panel compares the code and
+spec against the PRD. Its blocking findings route by target: `build.json`
+for code-only fixes and cleanup, the design artifacts for design-mandated
+problems (rerun `arch-design`), and `prd.md` halts on the first occurrence.
+`autodev pause` is honored between build rounds and after each panel;
+`autodev resume` clears the sentinel and the next `autodev run` continues
+from the persisted state.
+
 ## Vendor Configuration
 
 The default config lives with the SDK at `vendors.yml`. Harness-owned
@@ -195,7 +389,7 @@ python3 -m pytest -q                 # source checkout verification
 ## First feature
 
 **Through the skill**: in Claude Code, say
-`implement <description>`. The `auto-dev` skill triggers, intakes
+`implement <description>`. The `auto-dev-sdk` skill triggers, intakes
 the PRD via interview, dispatches the pipeline. You get asked to
 clarify when a reviewer needs intent.
 

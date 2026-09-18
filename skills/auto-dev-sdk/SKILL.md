@@ -1,5 +1,5 @@
 ---
-name: auto-dev
+name: auto-dev-sdk
 description: >
   Auxiliary skill for auto-dev-sdk. Thin dispatcher: parses user intent
   into `autodev` CLI calls; DOES NOT code; DOES NOT write artifacts; DOES
@@ -178,11 +178,6 @@ If the user says no, exit this skill entirely.
 ## Feature-folder enforcement
 
 If the request touches a path covered by `docs/features/<X>/` in any status, route through `autodev update <X>`. Do not allow ad-hoc edits.
-
-## Disambiguation from other skills
-
-- **`auto-dev` original skill**: this skill takes precedence when SDK-root or explicit vendor config uses v2 schema (`stages:` map). If the available config is v0.1-style (top-level stage keys), use the original skill instead.
-- **`auto-dev-sdk` (v0.1)**: deferred; do not use.
 
 ## Never
 

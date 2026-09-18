@@ -6,13 +6,11 @@ uniform `scripts/call.sh` and `scripts/vendor-launch.sh` interface.
 
 ## Repository layout
 
-Five committed skill consumers use relative symlinks to the canonical module:
+Committed skill consumers use relative symlinks to the canonical module:
 
 | Consumer | Committed path | Required link target |
 |---|---|---|
 | auto-dev-sdk | `skills/auto-dev-sdk/shared/vendors` | `../../../shared/vendors` |
-| feature-spec | `skills/feature-spec/shared/vendors` | `../../../shared/vendors` |
-| multi-lens-review | `skills/multi-lens-review/shared/vendors` | `../../../shared/vendors` |
 | panel-review | `skills/panel-review/shared/vendors` | `../../../shared/vendors` |
 | pr-review | `skills/pr-review/shared/vendors` | `../../../shared/vendors` |
 
@@ -28,8 +26,6 @@ Run this audit after changing the module:
 canonical=$(cd shared/vendors && pwd -P)
 for link in \
   skills/auto-dev-sdk/shared/vendors \
-  skills/feature-spec/shared/vendors \
-  skills/multi-lens-review/shared/vendors \
   skills/panel-review/shared/vendors \
   skills/pr-review/shared/vendors
 do

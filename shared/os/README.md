@@ -38,7 +38,7 @@ Skills reach this module through a link, like `shared/vendors`:
 imports the shared definition when that link resolves and otherwise falls
 back to an inline copy of the same lines, so a materialized install shipped
 without `shared/os` still works. Consumers that can be reached through a
-symlink (frugal installs its hooks as symlinks into the checkout) walk the
+symlink (some skills install their hooks as symlinks into the checkout) walk the
 symlink chain to their physical directory before looking for `../shared/os`
 (bash 3.2, no `readlink -f` on macOS).
 
@@ -47,8 +47,6 @@ symlink chain to their physical directory before looking for `../shared/os`
 | `shared/vendors/scripts/vendor-launch.sh` | `vendors_host_os` (delegates to `host_os`) |
 | `shared/vendors/scripts/session-state.py` | `_host_os` |
 | `skills/auto-dev-sdk/autodev/state/hostos.py` | `_host_os` (via `skills/auto-dev-sdk/shared/os`) |
-| `skills/frugal/scripts/frugal-lib.sh` | `host_os` (via `skills/frugal/shared/os`) |
-| `skills/aws-poc-deploy/scripts/ssmrun.sh` | `host_os` (via `skills/aws-poc-deploy/shared/os`) |
 
 When installing a skill by copy, materialize `shared/os` the same way as
 `shared/vendors` (see the repo README, "Installing a skill"); a symlink install
