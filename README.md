@@ -1,24 +1,34 @@
 <h1 align="center">skills-pub</h1>
 
 <p align="center">
-  Agent skills that take a feature from PRD to merged PR,<br>
-  with several LLM vendors checking each other's work.
+  <b>Cross-vendor agent skills.</b> Claude, Codex, Gemini, Grok, and Cursor<br>
+  build, review, and fix the same feature, and the harness reads their disagreement.
+</p>
+
+<p align="center">
+  <img alt="Claude" src="https://img.shields.io/badge/Claude-claude-D97757">
+  <img alt="Codex" src="https://img.shields.io/badge/Codex-codex-000000">
+  <img alt="Gemini via Agy" src="https://img.shields.io/badge/Gemini-agy-4285F4">
+  <img alt="Grok" src="https://img.shields.io/badge/Grok-grok-1DA1F2">
+  <img alt="Cursor" src="https://img.shields.io/badge/Cursor-cursor--agent-6E56CF">
 </p>
 
 <p align="center">
   <a href="https://github.com/sonusz/skills-pub/actions/workflows/test.yml"><img alt="tests" src="https://github.com/sonusz/skills-pub/actions/workflows/test.yml/badge.svg"></a>
   <img alt="python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="linux | macos" src="https://img.shields.io/badge/platform-linux%20%7C%20macos-lightgrey">
-  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
 
-Seven skills in the open [`SKILL.md`](https://github.com/anthropics/skills) format. They load into Claude Code, Codex CLI, and any agent that reads skills from a directory. Everything is shell and Python; there is nothing to deploy.
+Seven skills in the open [`SKILL.md`](https://github.com/anthropics/skills) format that take a feature from PRD to merged PR. They load into Claude Code, Codex CLI, and any agent that reads skills from a directory. Everything is shell and Python; there is nothing to deploy.
 
-- **PRD in, reviewed code out.** `auto-dev-lite` for most features, `auto-dev-sdk` when the feature is big enough to want a harness with state on disk.
-- **Disagreement as a signal.** Review gates send the same artifact to several vendors and synthesize where they diverge, because consensus among models that share training data proves little.
-- **One adapter, five vendors.** Claude, Codex, Gemini (Agy), Grok, and Cursor behind one call interface. The harness reads each vendor's remaining quota before a launch and falls back to the next candidate instead of stalling.
+**The point is the vendors working together, not any one of them.** One adapter drives all five CLIs behind the same interface, so a skill can hand one artifact to several models at once and keep going when one of them runs out of quota.
+
+- **Disagreement is the signal.** Review gates send the same spec, design, or diff to several vendors in parallel and synthesize where they diverge. Consensus among models that share training data proves little; a split vote points at the under-defined clause.
+- **Quota-aware switching.** Before every launch the harness reads the vendor's remaining quota and falls back to the next candidate in that role's list, never to the same provider it is meant to check. A run pauses rather than guesses when nothing qualifies.
+- **PRD in, reviewed code out.** `auto-dev-lite` for most features, `auto-dev-sdk` when the feature is big enough to want a harness with state on disk and multi-vendor panels at its design, trace, and close gates.
 - **PRs that look after themselves.** Watch CI and review threads, fix only what documented design intent allows, escalate the rest.
 - **Nothing hidden from you.** Every fix, push, and thread resolution needs a confirmation bound to a snapshot of what it will touch.
 
