@@ -6,14 +6,6 @@
 </p>
 
 <p align="center">
-  <img alt="Claude" src="https://img.shields.io/badge/Claude-claude-D97757">
-  <img alt="Codex" src="https://img.shields.io/badge/Codex-codex-000000">
-  <img alt="Gemini via Agy" src="https://img.shields.io/badge/Gemini-agy-4285F4">
-  <img alt="Grok" src="https://img.shields.io/badge/Grok-grok-1DA1F2">
-  <img alt="Cursor" src="https://img.shields.io/badge/Cursor-cursor--agent-6E56CF">
-</p>
-
-<p align="center">
   <a href="https://github.com/sonusz/skills-pub/actions/workflows/test.yml"><img alt="tests" src="https://github.com/sonusz/skills-pub/actions/workflows/test.yml/badge.svg"></a>
   <img alt="python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="linux | macos" src="https://img.shields.io/badge/platform-linux%20%7C%20macos-lightgrey">
