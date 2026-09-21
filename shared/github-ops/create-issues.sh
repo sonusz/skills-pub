@@ -147,6 +147,24 @@ fi
 
 created=0; skipped=0; failed=0
 
+# --- make sure every label exists before any issue references one -----------
+# GitHub does create a missing label when an issue names it, but only for a
+# token with push access, and it is silently dropped otherwise — a difference
+# that shows up as issues quietly missing their labels. Creating them up front
+# turns that into an explicit 201/422 we can see. 422 means it already exists.
+_ensure_label() {
+  local name="$1" code
+  [[ -n "$name" ]] || return 0
+  code="$(jq -nc --arg n "$name" '{name:$n, color:"ededed"}' \
+    | _auth_curl -o /dev/null -w '%{http_code}' -X POST \
+        -H "Content-Type: application/json" --data-binary @- "$API/labels")"
+  case "$code" in
+    201) echo "create-issues.sh: created label '$name'" >&2 ;;
+    422) : ;;  # already exists
+    *)   echo "create-issues.sh: could not ensure label '$name' (HTTP $code); it may be dropped" >&2 ;;
+  esac
+}
+
 for ((i = 1; i <= COUNT; i++)); do
   title="$(cat "$WORK/entry-$i.title")"
   [[ -f "$WORK/entry-$i.body" ]] || : > "$WORK/entry-$i.body"
@@ -184,6 +202,9 @@ for ((i = 1; i <= COUNT; i++)); do
     created=$((created + 1))
     continue
   fi
+
+  while IFS= read -r _needed; do _ensure_label "$_needed"; done \
+    < <(jq -r '.labels[]' "$WORK/payload.json")
 
   code="$(_auth_curl -o "$WORK/resp.json" -w '%{http_code}' \
     -X POST -H "Content-Type: application/json" \
