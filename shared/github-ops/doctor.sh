@@ -94,6 +94,19 @@ elif _init_github_auth 2>/dev/null; then
     doctor_note "PAT needs 'Pull requests: Read' permission."
   fi
 
+  # Issues are a separate fine-grained permission from Pull requests, and the
+  # two are easy to confuse because `/issues` also returns PRs. A token that
+  # reads PRs perfectly well can still be 403 here — which is invisible until
+  # create-issues.sh refuses.
+  ISSUES_HTTP=$(_auth_curl -o /dev/null -w "%{http_code}" \
+    "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/issues?per_page=1&state=all" 2>/dev/null || echo "000")
+  if [[ "$ISSUES_HTTP" == "200" ]]; then
+    doctor_pass "Issues API accessible"
+  else
+    doctor_fail "Issues API returned HTTP $ISSUES_HTTP"
+    doctor_note "PAT needs 'Issues: Read and write' permission (create-issues.sh needs write)."
+  fi
+
   ACTIONS_HTTP=$(_auth_curl -o /dev/null -w "%{http_code}" \
     "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/runs?per_page=1" 2>/dev/null || echo "000")
   if [[ "$ACTIONS_HTTP" == "200" ]]; then
