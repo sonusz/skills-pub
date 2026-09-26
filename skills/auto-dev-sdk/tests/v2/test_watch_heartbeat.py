@@ -13,10 +13,17 @@ from autodev.watch import WatchSession, heartbeat_interval
 def test_watch_session_emits_started_heartbeat_and_terminal(capsys):
     watch = WatchSession(feature="demo", verb="run", interval_sec=0.01)
     watch.start()
-    time.sleep(0.035)
+    # Wait for the first heartbeat instead of sleeping a fixed time: a busy CI
+    # runner can delay the heartbeat thread well past a few intervals.
+    out = ""
+    deadline = time.monotonic() + 2.0
+    while "[autodev:watch] heartbeat" not in out and time.monotonic() < deadline:
+        time.sleep(0.005)
+        out += capsys.readouterr().out
     watch.finish(2)
+    out += capsys.readouterr().out
 
-    lines = capsys.readouterr().out.splitlines()
+    lines = out.splitlines()
     assert any("[autodev:watch] started" in line for line in lines)
     assert any("[autodev:watch] heartbeat" in line for line in lines)
     terminal = [line for line in lines if "[autodev:watch] terminal" in line]
