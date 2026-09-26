@@ -77,6 +77,10 @@ Start with **auto-dev-lite**. It is prompt-only, needs no install beyond the sym
 
 ## One adapter, five vendors
 
+<p align="center">
+  <img src="assets/all-vendors.jpg" alt="Claude, OpenAI, Gemini, Grok, and Cursor orbs held in one hand, captioned: I want them all" width="600">
+</p>
+
 Every skill that talks to a model goes through `shared/vendors/scripts/call.sh`. It is the only place that knows how to drive each vendor's CLI; skills pass a prompt and a vendor label and get back the same files regardless of vendor: `out`, `status`, `log`, `stream`, and `usage.json` per call.
 
 | Vendor label | CLI it drives | Login | Models this repo has used | Schema output |
