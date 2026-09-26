@@ -130,7 +130,7 @@ arch-design --> arch-review (single agent; pass | needs_revision)
   |               |
   |               |-- retry_design: L[design-review] += 1  (L_MAX = 10)
   +---------------+      finding targets prd.md twice in a row
-  |               |      -> halt_for_human (PRD amendment)
+  |               |      -> halt_for_human (PRD update)
   |               |-- L already at L_MAX -> halt_for_human
   |                      operator: autodev grant-rerun <feature> \
   +---------------------   design-review --reason "..."
@@ -155,9 +155,9 @@ the same packet.
 A blocking decision (`retry_design`) reruns `arch-design`, which cascades
 through `design` again, and bumps `L[design-review]`; a finding that
 targets `prd.md` gets one such rerun and halts on the second consecutive
-one. At `L_MAX` the run halts for a human, who can either amend the PRD
-(`autodev update --amendment`, which resets the counters) or issue one
-`grant-rerun`. A `.pause` set while the panel runs takes effect when the
+one. At `L_MAX` the run halts for a human, who can either replace the PRD
+(`autodev update <feature> --from-file PATH`, which starts a new cycle and
+resets the counters) or issue one `grant-rerun`. A `.pause` set while the panel runs takes effect when the
 panel finishes, before the revision is dispatched.
 
 ### Build loop (the Ralph loop)
@@ -415,6 +415,13 @@ autodev status myfeature
 tail docs/features/myfeature/active/log.jsonl
 ```
 
+```bash
+# Change requirements: write the full new PRD to a scratch file, then
+# replace prd.md in place (old version + diff land in
+# docs/features/myfeature/active/prd-history/)
+autodev update myfeature --from-file /path/to/new-prd.md
+```
+
 When a blocking gate has exhausted its local revision budget, an operator can
 authorize one more producer correction without amending the PRD or bypassing
 review:
@@ -472,6 +479,8 @@ Current runtime stages and harness-authored nodes:
 | `spec` | `implemented-spec.md` | Code-first implementation facts; no PRD/design/build semantics in prompt context |
 | `prd-checklist` | `prd-checklist.json` | Harness-authored PRD requirement IDs only; no coverage/evidence |
 | `close-approval` | `panel-close-approval.json` | Panel reviews `implemented-spec.md` against `prd.md` + checklist and emits coverage judgment |
+| `requirement` (optional, user-supplied) | `requirement.md` | Read-only reference for `arch-design`, `arch-review`, `design`, `build` (`spec` and `ralph-review` excluded — the latter judges code only against the accepted design); imported via `autodev prd --requirement`; excluded from the staleness cascade |
+| `human feedback` (any review point) | `human-feedback-<point>.json` | Written by `autodev feedback`; merged once into the named review point's own package, then marked consumed — see "Human feedback at review points" below |
 
 `stage-review.md` is retained as a deprecated legacy prompt, but the
 main cascade no longer schedules a post-spec `review.json` stage.
@@ -508,6 +517,65 @@ For `design-review`, a blocking finding that targets `prd.md` first
 reruns `arch-design` so the arch-design agent can try to remove the
 apparent PRD conflict. A second consecutive PRD-targeted design-review
 finding halts for human.
+
+### Human feedback at review points
+
+Mid-pipeline human feedback is injected as an independent reviewer's finding
+at one of five review points: `arch-review`, `design-review`, `trace-review`,
+`close-approval`, `ralph-review`. The wrapper skill shapes a natural-language
+comment into that point's own finding structure and writes it with
+`autodev feedback <f> <point> --from-file PATH | --text JSON`. The finding is
+**merged into the package that point's own review agent (or panel) already
+produced** — it is never fed to that review point's own agent or panel
+(their inputs and prompts are unchanged), and no agent is rerun to
+accommodate it; the merged package then flows downstream like any other
+finding (e.g. an arch-design revision reads the merged `arch-review.json`;
+the next build reads the merged `ralph-review.json`).
+
+Merging happens at whichever of three points in time comes first for a given
+pending feedback:
+
+- **at verb time**, if a fresh response/synthesis package for that point
+  already exists on disk;
+- **just before routing** (panel points only), at the top of the harness's
+  blocking-verdict check, which catches a package that turned fresh while
+  the feedback was pending;
+- **at the harness hook**, immediately after the review agent's (or panel's)
+  output is validated and about to be consumed, for a package that has not
+  been produced yet.
+
+A given piece of feedback is consumed by exactly one of these three — once
+merged, its status moves from `pending` to `consumed` and it is not
+re-merged into a later run of the same point. `design-review` and
+`trace-review` alternate coverage and budget rounds and rewrite their
+judgment files each round. At verb time and at the pre-routing check,
+feedback pending for either point stays `pending` until both rounds are
+complete and their two judgments are paired; the harness hook, however,
+merges into whichever round's judgment is produced next, without waiting
+for both rounds. A non-blocking human finding merged into the coverage
+round is overwritten when the budget round rewrites the file (a blocking
+finding is routed immediately, before it can be overwritten).
+
+The point's overall verdict is **recomputed from the merged finding set
+alone** — the human finding's own reported `verdict` is recorded for audit
+but carries no weight and no veto. At the three panel points
+(`design-review`, `trace-review`, `close-approval`) it moves the outcome
+only through its `severity`/`priority`, following the same routing and
+blocking rules as every other reviewer's finding; at `arch-review` and
+`ralph-review`, any human finding forces the verdict to `needs_revision` /
+`Deviated` respectively, the same as when the review agent itself writes a
+finding. If merging would fail validation against the point's own package
+(for example, a `ralph-review` finding naming a scope that stopped being
+active while the feedback was pending), the harness does not inject it or
+halt the run — it marks the feedback `rejected` with a reason, visible in
+`autodev status`, and the pipeline continues; re-injecting is the
+operator's job.
+
+`requirement.md` is the conflict baseline the wrapper skill checks feedback
+and the PRD against before choosing where to inject it — the PRD remains
+the requirement anchor and hash root. It is read-only to the stage agents
+listed in the table above; import path and staleness-cascade exclusion are
+covered there too.
 
 ## Release Contents
 

@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from autodev.errors import PreflightError
+from autodev.orchestrator import _STAGE_PROTECTED_NAMES, _stage_write_contract
 from autodev.workspace import (
     committed_baseline_dirt, detect_out_of_scope_writes, diff_snapshots,
     ensure_git_repo, is_git_repo, snapshot, user_visible_changes,
@@ -455,3 +456,99 @@ def test_protected_touch_without_content_change_is_not_an_escape(git_repo):
             protected_scope=[protected], repo_root=git_repo,
         )
     )
+
+
+def test_prd_history_path_is_harness_internal():
+    from autodev.workspace import _line_is_harness_internal
+
+    line = "?? docs/features/demo/active/prd-history/prd.20260101T000000Z.md"
+    assert _line_is_harness_internal(line) is True
+
+
+def test_directory_protected_scope_catches_new_file_despite_mtime_only_change(
+    git_repo,
+):
+    """A directory-shaped protected path (prd-history/) must be flagged as
+    an escape when a stage adds a new file inside it, even though adding a
+    file to an already-existing directory typically changes only the
+    directory's mtime — and `_watched_changed` ignores mtime. Without the
+    §5 directory rule, this would be missed."""
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    history_dir = active / "prd-history"
+    history_dir.mkdir(parents=True)
+    (history_dir / "prd.20260101T000000Z.md").write_text("old prd")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+    before = snapshot(git_repo, watched_paths=[history_dir])
+
+    (history_dir / "prd.20260102T000000Z.md").write_text("new snapshot")
+    after = snapshot(git_repo, watched_paths=[history_dir])
+
+    escapes = detect_out_of_scope_writes(
+        before, after,
+        allowed_scope=[git_repo],
+        protected_scope=[history_dir],
+        repo_root=git_repo,
+    )
+    assert any("prd.20260102T000000Z.md" in entry for entry in escapes)
+
+
+def test_all_stage_protected_tuples_include_prd_history():
+    """detail §5: `prd-history/*` matches the harness-internal ignore
+    pattern, so a non-protected write there is skipped by
+    `_line_is_harness_internal` before `detect_out_of_scope_writes` ever
+    checks it against a stage's (possibly narrow) allowed scope. Every
+    stage must therefore list "prd-history" as protected explicitly."""
+    for stage, names in _STAGE_PROTECTED_NAMES.items():
+        assert "prd-history" in names, stage
+
+
+def test_design_stage_write_contract_flags_prd_history_escape(git_repo):
+    """detail §7.2(c): using the design stage's own (narrow) write
+    contract — writable is just its concrete output targets + scratch,
+    not the whole active/ directory — a write into prd-history/ must
+    still be caught as an out-of-scope escape because prd-history is in
+    design's protected list (§5), even though it sits outside design's
+    writable scope and would otherwise be silently skipped as
+    harness-internal."""
+    active = git_repo / "docs" / "features" / "demo" / "active"
+    active.mkdir(parents=True)
+    (active / "prd.md").write_text("# PRD\n")
+    (active / "design.md").write_text("# Design\n")
+    history_dir = active / "prd-history"
+    history_dir.mkdir()
+    (history_dir / "prd.20260101T000000Z.md").write_text("old prd")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "baseline"], cwd=git_repo, check=True,
+    )
+
+    primary_target = active / "design.md"
+    extra_targets = [
+        active / name
+        for name in ("scope.json", "trace.md", "test-plan.md", "design-changelog.json")
+    ]
+    writable, protected = _stage_write_contract(
+        repo_root=git_repo,
+        active=active,
+        stage="design",
+        primary_target=primary_target,
+        extra_targets=extra_targets,
+    )
+    assert any(p.name == "prd-history" for p in protected)
+    assert not any(p.name == "prd-history" for p in writable)
+
+    before = snapshot(git_repo, watched_paths=protected)
+
+    (history_dir / "prd.20260102T000000Z.md").write_text("new snapshot")
+    after = snapshot(git_repo, watched_paths=protected)
+
+    escapes = detect_out_of_scope_writes(
+        before, after,
+        allowed_scope=writable,
+        protected_scope=protected,
+        repo_root=git_repo,
+    )
+    assert any("prd.20260102T000000Z.md" in entry for entry in escapes)

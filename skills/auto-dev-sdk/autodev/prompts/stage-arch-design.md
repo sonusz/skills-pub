@@ -17,6 +17,7 @@ pipeline_position:
     - "<REPO_ROOT>/CLAUDE.md"
     - "<REPO_ROOT>/docs/features/<other-feature>/complete/implemented-spec.md"
     - "<REPO_ROOT>/docs/features/<other-feature>/complete/spec.md" # legacy
+    - "<FEATURE_ACTIVE>/requirement.md"
   gate_that_grades_me: arch-review         # single agent, not a panel
   downstream_stages: [design]
   escalate_to_on_unresolvable: [prd]       # halt-for-human
@@ -78,6 +79,16 @@ Git history.
 1. **Read arch-docs relevant to this feature** before authoring
    `arch-design.md`. Browse the `discretionary_read` paths above for
    docs touching the primitives the PRD implies.
+
+   **Requirement (read-only, optional).** `<FEATURE_ACTIVE>/requirement.md`,
+   when present, is the user's own statement of intent from which the PRD was
+   derived. Read it only to check that your output does not drift from the
+   user's direction. It does NOT replace the PRD as the requirement anchor:
+   coverage, `prd_ref`, evidence and every `R<N>` reference still point at
+   `prd.md`. If you find the PRD and the requirement disagree, do not
+   silently follow the requirement — report the disagreement in your output
+   (review stages: as a finding; producer stages: in your artifact's notes
+   section) and otherwise follow the PRD. Never modify this file.
 
 2. **Author `arch-design.md`.** Sections (markdown):
 

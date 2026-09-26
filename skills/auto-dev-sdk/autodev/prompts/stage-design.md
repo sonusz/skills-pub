@@ -19,6 +19,7 @@ pipeline_position:
     - "<REPO_ROOT>/CLAUDE.md"
     - "<REPO_ROOT>/docs/features/<other-feature>/complete/implemented-spec.md"
     - "<REPO_ROOT>/docs/features/<other-feature>/complete/spec.md" # legacy
+    - "<FEATURE_ACTIVE>/requirement.md"
   gate_that_grades_me: design-review       # panel at G1
   downstream_stages: [build, close-approval]
   escalate_to_on_unresolvable: [prd]       # halt-for-human
@@ -354,6 +355,16 @@ G1 checks six things. Optimize for all six:
    records of every primitive you invent. The design-review
    panel treats empty-doc-set as greenfield and downgrades
    "primitive not in any doc" findings to `opinion`.
+
+   **Requirement (read-only, optional).** `<FEATURE_ACTIVE>/requirement.md`,
+   when present, is the user's own statement of intent from which the PRD was
+   derived. Read it only to check that your output does not drift from the
+   user's direction. It does NOT replace the PRD as the requirement anchor:
+   coverage, `prd_ref`, evidence and every `R<N>` reference still point at
+   `prd.md`. If you find the PRD and the requirement disagree, do not
+   silently follow the requirement — report the disagreement in your output
+   (review stages: as a finding; producer stages: in your artifact's notes
+   section) and otherwise follow the PRD. Never modify this file.
 
 2. **Author design.md.** Sections (markdown):
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from autodev import __version__ as HARNESS_VERSION
+from autodev import human_feedback
 from autodev import ralph
 from autodev.artifacts.design_packet import (
     write_accepted_design,
@@ -141,6 +142,8 @@ _STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
         "panel-trace-review.json",
         "panel-close-approval.json",
         "build.json",
+        "requirement.md",
+        "prd-history",
     ),
     "build": (
         "prd.md",
@@ -154,6 +157,8 @@ _STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
         "accepted-design.json",
         "panel-design-review.json",
         "panel-trace-review.json",
+        "requirement.md",
+        "prd-history",
     ),
     "ralph-review": (
         "design-packet.json",
@@ -164,6 +169,8 @@ _STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
         "arch-design.md",
         "ralph-iteration-context.json",
         "ralph-review.previous.json",
+        "requirement.md",
+        "prd-history",
     ),
     "spec": (
         "implementation-index.json",
@@ -174,6 +181,8 @@ _STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
         "trace.md",
         "test-plan.md",
         "build.json",
+        "requirement.md",
+        "prd-history",
     ),
     # core R9: arch-design can write only arch-design.md + scratch; PRD,
     # the three panel verdicts, build.json, and its own gate's arch-review
@@ -185,11 +194,15 @@ _STAGE_PROTECTED_NAMES: dict[str, tuple[str, ...]] = {
         "panel-close-approval.json",
         "build.json",
         "arch-review.json",
+        "requirement.md",
+        "prd-history",
     ),
     # core R9: arch-review can write only arch-review.json + scratch.
     "arch-review": (
         "prd.md",
         "arch-design.md",
+        "requirement.md",
+        "prd-history",
     ),
 }
 
@@ -224,6 +237,11 @@ def _stage_write_contract(
         active / name
         for name in _STAGE_PROTECTED_NAMES.get(stage, ())
         if (active / name).resolve() not in owned_resolved
+        # requirement.md (R10) is optional and user-owned: only list it when
+        # present, so a feature without one renders the same PROTECTED_PATHS
+        # as before this file existed. Every other name here is listed
+        # unconditionally, same as today.
+        and (name != "requirement.md" or (active / "requirement.md").exists())
     ]
     return writable, protected
 
@@ -490,7 +508,20 @@ class Orchestrator:
         a single panel run. This method merges them into one
         PanelVerdict before calling handle_panel_verdict, so the
         revision loop sees both groups' findings in one decision.
+
+        Entry A' (detail §2, §2.1): before anything else, merge any
+        pending human feedback for the three panel points into their
+        target verdict files, if each is judged "current" for this
+        point. Both ``run()`` and ``_advance_one`` reach this function
+        right after their pause checks, so this one site covers both
+        ``autodev run`` and ``autodev next``. Idempotent and a no-op
+        when there is no pending feedback or the target isn't current
+        yet (the feedback stays pending for the hook at timing B to
+        pick up once the point's output is next produced).
         """
+        for p in ("design-review", "trace-review", "close-approval"):
+            human_feedback.apply_pending(active, p, log=logger, check_current=True)
+
         from autodev.artifacts.verdict import load_verdict
         cascade = StalenessCascade(active)
         fresh_by_name = cascade.fresh()
@@ -730,6 +761,24 @@ class Orchestrator:
         if self._check_pause_sentinel(active):
             logger.emit(stage="orchestrator", event="paused", feature=feature)
             raise GatePending("pause", "run `autodev resume` to continue")
+
+        # Timing B hook (detail §2.2): the verdict(s) just written above
+        # are current by construction, so merge any pending human
+        # feedback for this gate unconditionally — no current-check
+        # needed. Placed after the pause checkpoint (not before): a
+        # pause hit before this point leaves the feedback pending, so a
+        # resume that reruns this same round doesn't clobber an
+        # already-merged finding. Uses a list comprehension (not a
+        # short-circuiting `any(...)` over a generator) so BOTH points
+        # are always processed for the design-review gate.
+        points = ("design-review", "trace-review") if gate == "design-review" else (gate,)
+        merged = [
+            human_feedback.apply_pending(active, p, log=logger, check_current=False)
+            for p in points
+        ]
+        if any(merged):
+            from autodev.artifacts.verdict import load_verdict
+            v = load_verdict(active / f"panel-{gate}.json")
 
         # For design-review, merge in the parallel trace-review verdict
         # so blocking findings from either group route through one
@@ -1044,6 +1093,16 @@ class Orchestrator:
 
             # Success — drop any rejection note from an earlier attempt.
             feedback_path.unlink(missing_ok=True)
+
+            # Timing B hook (detail §2.2): merge any pending human
+            # feedback into this just-validated, current-by-construction
+            # arch-review.json before it's consumed by the arch-design
+            # loop.
+            if human_feedback.apply_pending(
+                active, "arch-review", log=logger, check_current=False,
+            ):
+                review = load_arch_review(review_target, arch_design_path)
+
             logger.emit(
                 stage="arch-review", event="verdict", feature=feature,
                 detail={
@@ -2417,6 +2476,16 @@ class Orchestrator:
         # Validation passed — drop the rejection note so a later iteration
         # does not mistake it for live feedback.
         feedback_path.unlink(missing_ok=True)
+
+        # Timing B hook (detail §2.2): merge any pending human feedback
+        # into this just-validated, current-by-construction
+        # ralph-review.json. Re-parse on a merge so `statuses` reflects
+        # the merged findings; the recorded state is recomputed by the
+        # ordinary `record_iter` call below (no separate recompute here).
+        if human_feedback.apply_pending(
+            active, "ralph-review", log=logger, check_current=False,
+        ):
+            statuses = ralph.parse_review_statuses(review_target)
 
         state = ralph.load_ralph_state(active)
         state.source = str(active / "scope.json")

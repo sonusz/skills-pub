@@ -71,7 +71,20 @@ Answer five questions, with evidence (file:line and the document section):
    finding. A detail-only mechanism choice may be proposed for revision when
    the evidence shows the simpler design preserves those requirements and
    constraints, but code must not silently depart from the current detail
-   document. If there is no evidenced excess or redundancy, say so.
+   document. Also flag a rule, check, or hard stop — in code or design —
+   that traces to no requirement and no real failure mode, and makes the
+   system less robust: rejecting valid input or state, hard-failing where
+   degrading is safe, demanding exact matches or ordering the requirements
+   don't guarantee, fail-closed on a transient or optional dependency, or a
+   retry/limit/timeout that aborts healthy work. Judge against the
+   robustness principle (Postel's law): liberal in what is accepted
+   (tolerate unknown fields, harmless reordering or format differences,
+   optional-field absence, benign version skew), conservative in what is
+   emitted (well-formed, spec-exact output). Strictly rejecting input that
+   is ambiguous, security-relevant, or would be misread downstream is
+   correct, not a finding. For each, name the concrete input or state that
+   trips it and the correct, more tolerant handling. If there is no
+   evidenced excess or redundancy, say so.
 
 End with a verdict line: `PASS` (nothing found), `FIX` (conformance,
 completeness, or evidenced excess/redundancy defects — list actionable

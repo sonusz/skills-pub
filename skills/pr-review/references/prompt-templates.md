@@ -9,8 +9,10 @@ to the specific diff. Don't copy verbatim; treat as a structural guide.
 ## Phase 1 — Docs-compliance
 
 **Goal:** Does the delivered code fulfill the explicit requirements in the
-new/modified doc(s)? For each requirement, classify yes / partial / no /
-unclear, with a code citation.
+new/modified doc(s), and does it stay within them? For each requirement,
+classify yes / partial / no / unclear, with a code citation. Separately,
+flag anything the diff adds beyond those requirements (overreach) or any
+new mechanism disproportionate to what the requirements need.
 
 **Path inputs:** the audit repo root, merge-base/head SHAs, `diff.patch`, the
 anchor-doc paths, and the implementation paths most likely to deliver the
@@ -30,9 +32,9 @@ the plan, state:
 2. the specific code location(s) that satisfy or contradict it,
 3. any deviation, ambiguity, or missing behavior worth flagging.
 
-End with a short "gaps" list: requirements that are NOT satisfied or are only
-partially satisfied. Be concrete. Quote line numbers / function names. Do not
-generalize.
+End with a short "gaps" list (requirements NOT satisfied or only partially
+satisfied) and an "excess" list (see items 4-5 below). Be concrete. Quote
+line numbers / function names. Do not generalize.
 
 AUDIT_ROOT: <absolute repo root>
 MERGE_BASE_SHA: <merge-base SHA>
@@ -66,8 +68,32 @@ What you need to produce
 2. For each requirement, cite the function name(s) responsible. Quote the
    relevant constant or branch.
 3. Highlight any deviation, ambiguity, or missing item.
-4. End with a concrete "gaps" list and a yes/partial/no verdict per plan
-   section.
+4. Overreach: does the diff add behavior, a dependency, or structure the
+   anchor doc(s) never required? Flag it even if the code looks good —
+   undocumented work is a finding, not a bonus. Cite the location and the
+   requirement (or absence of one) that makes it overreach. Tests, logging,
+   and helpers that serve a documented requirement are not overreach.
+5. Proportionality: for each new mechanism, apply the two-step test —
+   (a) would removing it break a specific anchor-doc requirement or
+   constraint? If not, it is removable — report it. (b) If it would, is
+   there a cheaper mechanism — already in the repo, or simply simpler —
+   that satisfies the same requirement? Report only if so. Every finding
+   needs the location, the proposed removal or alternative, and why every
+   affected requirement and constraint still holds without the mechanism
+   as built. A bare "could be
+   simpler," a style preference, flexibility reserved for unstated future
+   work, or line-count reduction alone is not evidence. Safety or guardrail
+   code that protects against a real failure mode is not excess — but a
+   rule, check, or hard stop that traces to no requirement and no real
+   failure mode, and makes the system less robust (rejects valid inputs or
+   states, hard-fails where degrading is safe, demands exact matches where
+   the requirement tolerates variation — a robustness-principle
+   violation), is excess: name what it breaks. Strictly rejecting
+   ambiguous or security-relevant input is not excess.
+6. End with a concrete "gaps" list (requirements NOT satisfied or only
+   partially satisfied) and a concrete "excess" list (overreach and
+   proportionality findings from steps 4-5; write "none" if there are
+   none), plus a yes/partial/no verdict per plan section.
 
 Be concise but specific. Reviewers will use your output to decide whether to
 merge.
@@ -130,6 +156,23 @@ covered those).
   default on user typo
 - Logic: off-by-one in queue capacity, weight==0 enqueue success that
   bypasses backpressure, panic on negative weight
+- Brittle rigidity: a check, rule, or hard stop with no evident purpose
+  that turns a normal or recoverable situation into a failure — valid
+  input rejected by an over-strict validator, exact-match or ordering
+  assumptions the data doesn't guarantee, fail-closed on a transient or
+  optional dependency, a retry/limit/timeout that aborts healthy work.
+  Judge against the robustness principle (Postel's law): be liberal in
+  what you accept from peers — tolerate unknown fields, extra whitespace,
+  harmless reordering, optional-field absence, benign version skew — and
+  conservative in what you send — emit well-formed, spec-exact output.
+  The limit: liberal acceptance must never silently accept input that is
+  ambiguous, security-relevant, or would be misinterpreted downstream;
+  there strict rejection with a clear error is correct. Report a violation
+  in either direction (rejecting harmless variation; emitting sloppy or
+  non-conformant output; silently guessing on ambiguous input) as a bug
+  only with the concrete input or state that trips it and the
+  operator-visible failure; "I'd have written it more leniently" is not a
+  bug
 
 # Output format — REQUIRED
 

@@ -59,6 +59,18 @@ def test_orders_oldest_first(active):
 
 def test_amendment_label(active):
     _emit(active, "2026-04-29T11:30:00Z", "orchestrator", "prd-amended",
+          {"summary": "removed R4; changed R2, R7; +12/-8 lines"})
+    history = build_iteration_history(active)
+    assert len(history) == 1
+    assert "UPDATED" in history[0].label
+    assert "removed R4" in history[0].label
+    assert history[0].artifact == "prd.md"
+
+
+def test_amendment_label_legacy_format(active):
+    # Log rows written before this change carry only
+    # amendment_first_line, with no summary field.
+    _emit(active, "2026-04-29T11:30:00Z", "orchestrator", "prd-amended",
           {"amendment_first_line": "R8 must auto-trigger handoff"})
     history = build_iteration_history(active)
     assert len(history) == 1
@@ -108,7 +120,7 @@ def test_render_includes_table_headers_and_rows():
                      artifact="design.md",
                      current_hash="sha256:" + "a" * 64),
         HistoryEntry(ts="2026-04-29T11:30:00Z",
-                     label="prd.md AMENDED",
+                     label="prd.md UPDATED",
                      artifact="prd.md",
                      current_hash="sha256:" + "b" * 64),
     ]
@@ -117,7 +129,7 @@ def test_render_includes_table_headers_and_rows():
     assert "Event" in rendered
     assert "Current hash" in rendered
     assert "design stage-complete" in rendered
-    assert "AMENDED" in rendered
+    assert "UPDATED" in rendered
     # Both entries appear
     assert rendered.count("|") >= 12  # 2 header rows + 2 data rows × 6 cells
 

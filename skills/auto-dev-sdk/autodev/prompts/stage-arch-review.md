@@ -19,7 +19,26 @@ Make exactly four kinds of finding:
   requirement. Use the two-step test: would removing it break a PRD
   requirement? If not, is there a cheaper mechanism that satisfies
   the same requirement? Only report when both answers support a
-  change.
+  change. Separately — not gated by that two-step test — this also
+  covers a rule, check, or hard stop that traces
+  to no PRD requirement and no real failure mode, and makes the
+  system less robust: it rejects valid inputs or states, hard-fails
+  where degrading is safe, demands an exact match or ordering the
+  PRD does not require, fails closed on a transient or optional
+  dependency, or aborts healthy work via a retry/limit/timeout the
+  PRD never asked for. Judge these by the robustness principle
+  (Postel's law): accept liberally — tolerate unknown fields,
+  harmless reordering or format differences, optional-field
+  absence, benign version skew — and send strictly — well-formed,
+  spec-exact output. The binding limit: liberal acceptance must
+  never silently accept input that is ambiguous, security-relevant,
+  or would be misread downstream; strict rejection with a clear
+  error there is correct, not a finding. Name the concrete input or
+  state that trips the rule and the correct, more tolerant or more
+  strict handling; "this would have been written more leniently"
+  alone is not a finding. Report this kind on its own evidence — the
+  input or state and the correct handling — not on the two-step
+  test above.
 - `reuse` — `arch-design.md` invents a mechanism that already exists
   and applies, per the architecture/history docs, elsewhere in the
   repo.
@@ -50,6 +69,16 @@ You may additionally browse, for the `reuse` check only:
 - `<REPO_ROOT>/docs/features/<other-feature>/complete/implemented-spec.md`
 - `<REPO_ROOT>/docs/features/<other-feature>/complete/spec.md` # legacy
 
+**Requirement (read-only, optional).** `<FEATURE_ACTIVE>/requirement.md`,
+when present, is the user's own statement of intent from which the PRD was
+derived. Read it only to check that your output does not drift from the
+user's direction. It does NOT replace the PRD as the requirement anchor:
+coverage, `prd_ref`, evidence and every `R<N>` reference still point at
+`prd.md`. If you find the PRD and the requirement disagree, do not
+silently follow the requirement — report the disagreement in your output
+(review stages: as a finding; producer stages: in your artifact's notes
+section) and otherwise follow the PRD. Never modify this file.
+
 Deliberately not provided, and not to be read: `design.md`,
 `scope.json`, `trace.md`, `test-plan.md` (the design package does not
 exist yet at this point in the pipeline, and this review must not be
@@ -67,7 +96,9 @@ influence this review.
    (not just a table row) — otherwise `missing`.
 4. Scan the components and flows for commitments the PRD never asked
    for — `invented`.
-5. For each component, apply the `redundant` two-step test.
+5. For each component, apply the `redundant` two-step test, including
+   the robustness-principle check in the `redundant` definition
+   above.
 6. For each component tagged `new`, check the discretionary docs for
    an existing equivalent — `reuse`.
 

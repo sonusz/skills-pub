@@ -1,19 +1,19 @@
 ---
 name: pr-review
 description: >
-  Structured two-phase review of code changes — either a pre-PR diff between
-  two local branches or an existing GitHub PR. Phase 1 checks whether code
-  delivers what new/modified docs (plan/PRD/spec/design) require; Phase 2
-  hunts bugs in the implementation. Findings are surfaced as a synthesized
-  report; in GitHub mode they can be posted as Copilot-style inline review
-  threads. Use this skill whenever the user asks for a code review, a
-  sanity-check on a diff, a spec-conformance check, or wants to verify a
-  PR before merge — even when they don't say "review" explicitly. Triggers
-  on phrases like "review this PR", "review my branch", "look at PR #N",
-  "does this match the spec", "check this diff", "audit my changes",
-  "pre-PR check", or explicit `/pr-review`. Do not use for typo fixes,
-  formatting-only diffs, or one-line bug fixes — there is nothing two-phase
-  about those.
+  Structured two-phase review of code changes — either a pre-PR diff between two
+  local branches or an existing GitHub PR. Phase 1 checks whether code delivers
+  what new/modified docs (plan/PRD/spec/design) require and stays within them
+  (no undocumented overreach or disproportionate mechanisms); Phase 2 hunts bugs
+  in the implementation. Findings are surfaced as a synthesized report; in
+  GitHub mode they can be posted as Copilot-style inline review threads. Use
+  this skill whenever the user asks for a code review, a sanity-check on a diff,
+  a spec-conformance check, or wants to verify a PR before merge — even when
+  they don't say "review" explicitly. Triggers on phrases like "review this PR",
+  "review my branch", "look at PR #N", "does this match the spec", "check this
+  diff", "audit my changes", "pre-PR check", or explicit `/pr-review`. Do not
+  use for typo fixes, formatting-only diffs, or one-line bug fixes — there is
+  nothing two-phase about those.
 allowed-tools: Bash, Read, Write, Edit, Skill
 ---
 
@@ -202,7 +202,9 @@ Otherwise:
    this launch.
 4. Surface results: quote the synthesis report's `## Consensus` and
    `## Divergence` sections verbatim — paraphrasing loses model-level
-   confidence cues. Add a per-requirement gap verdict in your own words.
+   confidence cues. Add a per-requirement gap verdict in your own words,
+   and — alongside it — the excess list (overreach/proportionality
+   findings), stating "none" if the panel found nothing to flag.
 5. Proceed straight to Phase 2 — do not ask. (User already opted into the
    whole review at Step 0.)
 
@@ -315,7 +317,8 @@ user instruction ("draft threads for the HIGH ones", "post these", etc.).
 
 Print a summary table:
 
-- Phase 1 gaps (if any), with verdict and PR-thread URL if posted.
+- Phase 1 gaps and excess (if any), with verdict and PR-thread URL if
+  posted.
 - Phase 2 bugs by severity, with verification status, cross-reference
   classification (new / overlaps-open / overlaps-thin-resolved), and
   PR-thread URL if posted.

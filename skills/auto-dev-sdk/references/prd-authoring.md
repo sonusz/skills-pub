@@ -47,14 +47,19 @@ PRD MUST have:
 ## Out of Scope       ← what this feature explicitly does NOT do
 ```
 
-Plus optional `## Amendment <date>` blocks appended via
-`autodev update <feature> --amendment "..."` after a feature is
-underway. An amendment may introduce a new, uniquely numbered
-`### R<n>: <Title>` requirement without rewriting the original section.
+`prd.md` always expresses only the current requirements. Any change
+after import goes through `autodev update <feature> --from-file
+<new-prd.md>`, which replaces the whole file in place; history lands
+in `prd-history/`. `## Amendment <date>` blocks are a legacy form
+left over from older features — still parsed, but `prd-lint` emits a
+warning recommending they be folded into the body on the next
+update.
 
 Every requirement is a `### R<n>: <Title>` block followed by 1-3
-short paragraphs and optional bullets. Number sequentially without
-gaps; renumber when inserting / deleting.
+short paragraphs and optional bullets. Number sequentially in a new
+PRD; after import, numbers are never rearranged — a deleted `R<n>`
+retires that number, and a new requirement takes a number higher
+than any `R<n>` that has ever appeared.
 
 ---
 
@@ -129,14 +134,17 @@ Release threshold: P1
 
 Rows are needed only for Rs deviating from the default. Rationale is
 required — it calibrates reviewers and is re-asked verbatim at
-graduation or stall re-audits. Amendments override levels with
-`Assurance: R3 core -> strict` lines (latest wins).
+graduation or stall re-audits. To change a level after import, edit
+the `## Assurance` table row or the `Default:` line directly, then
+run `autodev update --from-file`; old `Assurance: R3 core -> strict`
+override lines from legacy features are still parsed.
 
 `Release threshold` is separate from rigor and severity. It accepts `P0`,
 `P1`, or `P2`; `P1` is the default and preserves historical behavior. Use
 `P0` for a time-critical release where P1/P2 findings must be retained as
-deferred work but must not trigger another producer/design round. A later
-amendment may set `Release threshold: P0` (last declaration wins).
+deferred work but must not trigger another producer/design round. To
+change it after import, edit the `Release threshold:` line directly and
+run `autodev update --from-file`.
 
 **Elicitation protocol — never ask for a level by name.** Users have
 no stable intuition for the labels but do for "can you accept this
@@ -316,6 +324,24 @@ mv docs/features/<feature>/{planned,active}
 (promotion is currently manual; see auto-dev-sdk README.) Then
 `autodev run <feature>`.
 
+### 10. Updating an imported PRD
+
+`prd.md` always expresses only the current requirements; the only
+way to change it after import is `autodev update <feature>
+--from-file <new-prd.md>`. The flow: run `autodev status` on the
+feature; read the current `prd.md`; write the full new PRD to a
+scratch directory outside the repo (e.g. `mktemp -d`); show the user
+the old-vs-new unified diff (`diff -u`); get the user's
+confirmation; run `autodev update <feature> --from-file
+<scratch>/prd.md`; relay the harness's `R` change summary and any
+`prd-lint` warning; and run the semantic-intent check (step 7 above)
+against the new PRD before resuming, after every `autodev update
+--from-file`.
+
+Numbering never gets rearranged after import: a deleted `R<n>`
+retires that number, and a new requirement takes a number higher
+than any `R<n>` that has ever appeared in this PRD's history.
+
 ---
 
 ## Design-stage POC clause
@@ -387,7 +413,7 @@ A timestamped POC attempt that recorded its environment/identity, an
 artifact hash or pinned version, its inputs, its result, and its failure
 mode (if any) **is evidence**. Do not require a second run just to
 reproduce a record already in this shape — that is ceremony, not
-verification. A design-stage rerun (panel finding, PRD amendment) reads the
+verification. A design-stage rerun (panel finding, PRD update) reads the
 existing record and re-runs the POC only if the underlying question
 actually changed: a different hypothesis, a changed subject version, or a
 finding that the recorded result doesn't actually establish what it claims.

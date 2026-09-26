@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("restore-design", "Restore a hash-verified archived design package"),
         ("retry", "Retry failed current stage"),
         ("invalidate", "Invalidate a stage artifact (rollback)"),
-        ("update", "Append PRD amendment; advance cycle"),
+        ("update", "Replace prd.md with a full new PRD from a file; advance cycle"),
         ("grant-rerun", "Authorize one extra producer rerun after L_MAX"),
         ("close", "Close feature"),
         ("explain", "Human-readable state summary"),
@@ -93,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     # verb-specific extras
     prd = sub._name_parser_map["prd"]
     prd.add_argument("--from-file", default=None)
+    prd.add_argument("--requirement", default=None)
 
     st = sub._name_parser_map["status"]
     st.add_argument("--json", action="store_true")
@@ -108,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore_design.add_argument("--package", default="latest")
 
     upd = sub._name_parser_map["update"]
-    upd.add_argument("--amendment", required=True)
+    upd.add_argument("--from-file", required=True)
 
     grant_rerun = sub._name_parser_map["grant-rerun"]
     grant_rerun.add_argument(
@@ -172,6 +173,23 @@ def build_parser() -> argparse.ArgumentParser:
     ad.add_argument("--who", default=None)
     _common(ad)
 
+    # feedback (core R4, detail §3.1): inject human review feedback into
+    # one of the five review points. `review_point` is a plain string
+    # argument, NOT argparse `choices` -- choices would exit 2 on an
+    # unknown point, but core §6.4 requires all four verb refusals
+    # (including an unknown point) to exit 1; the handler checks it
+    # against REVIEW_POINTS itself.
+    fb = sub.add_parser(
+        "feedback",
+        help="Inject human review feedback into a review point (pause first)",
+    )
+    fb.add_argument("feature")
+    fb.add_argument("review_point")
+    fb_input = fb.add_mutually_exclusive_group(required=True)
+    fb_input.add_argument("--from-file", default=None)
+    fb_input.add_argument("--text", default=None)
+    _common(fb)
+
     return p
 
 
@@ -188,13 +206,38 @@ def cmd_prd(args) -> int:
     fp = FeaturePaths(repo_root=repo_root, feature=args.feature)
     status = fp.current_status() or "planned"
     target = fp.status_dir(status)
-    target.mkdir(parents=True, exist_ok=True)
     prd = target / "prd.md"
+
+    requirement_arg = getattr(args, "requirement", None)
+    if not args.from_file and not requirement_arg:
+        print("interactive PRD intake not bundled; use --from-file")
+        return exit_codes.ERROR
+
+    # Validate both sources before writing anything: a missing --requirement
+    # source must not leave a half-imported prd.md behind (C-stage review pin,
+    # detail §3.2 / §10 "C 期复审 PASS 后 pin").
+    src = Path(args.from_file) if args.from_file else None
+    if src is not None and not src.exists():
+        print(f"source not found: {src}", file=sys.stderr)
+        return exit_codes.ERROR
+    req_src = Path(requirement_arg) if requirement_arg else None
+    if req_src is not None and not req_src.exists():
+        print(f"requirement source not found: {req_src}", file=sys.stderr)
+        return exit_codes.ERROR
+
+    # PRD update-in-place R1: importing over an existing prd.md would bypass
+    # the R-stability check and history; only `autodev update` may change it.
+    # A bare `--requirement` (no --from-file) is still allowed on an existing
+    # feature: it copies the requirement next to prd.md without touching it.
+    if args.from_file and prd.exists():
+        print(
+            f'prd.md already exists for {args.feature} ({status}); use '
+            f'"autodev update {args.feature} --from-file PATH" to change it',
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+    target.mkdir(parents=True, exist_ok=True)
     if args.from_file:
-        src = Path(args.from_file)
-        if not src.exists():
-            print(f"source not found: {src}", file=sys.stderr)
-            return exit_codes.ERROR
         # Stage 0 validation — refuse to import malformed PRDs.
         from autodev.prd_intake import validate_prd_file
         v = validate_prd_file(src)
@@ -214,10 +257,27 @@ def cmd_prd(args) -> int:
         except Exception as e:
             print(f"workflow-state bootstrap failed: {e}", file=sys.stderr)
             return exit_codes.ERROR
+        for w in v.warnings:
+            print(f"prd-lint warning: {w}")
         print(f"imported {src} → {prd} ({len(v.requirement_markers)} requirements)")
-        return exit_codes.OK
-    print("interactive PRD intake not bundled; use --from-file")
-    return exit_codes.ERROR
+
+    if requirement_arg:
+        # R10: requirement.md is the user's own core-requirements document —
+        # copied verbatim (no content validation) next to prd.md so any
+        # session's wrapper agent can find it later. Overwrite allowed.
+        # (req_src existence already validated above, before any write.)
+        req_bytes = req_src.read_bytes()
+        requirement = target / "requirement.md"
+        atomic_write(requirement, req_bytes)
+        from autodev.state.hashing import hash_bytes
+        from autodev.state.log import JsonlLog
+        JsonlLog(target / "log.jsonl").emit(
+            stage="orchestrator", event="requirement-imported", feature=args.feature,
+            detail={"source": str(req_src), "sha256": hash_bytes(req_bytes)},
+        )
+        print(f"imported {req_src} → {requirement}")
+
+    return exit_codes.OK
 
 
 def cmd_prd_lint(args) -> int:
@@ -232,6 +292,8 @@ def cmd_prd_lint(args) -> int:
     prd = fp.status_dir(status) / "prd.md"
     v = validate_prd_file(prd)
     if v.ok:
+        for w in v.warnings:
+            print(f"prd-lint warning: {w}")
         print(f"prd-lint ok: {len(v.requirement_markers)} requirements, "
               f"sections {v.sections_found!r}")
         return exit_codes.OK
@@ -302,11 +364,52 @@ def cmd_status(args) -> int:
                 for g in ALL_PANEL_GATES
             },
         }
+        # Human feedback (core R8, detail §3.3): only points that have a
+        # human-feedback-<point>.json -- fixed filenames only, never a
+        # glob, so an archived (renamed) file never shows up here.
+        from autodev import human_feedback as hf
+        human_feedback_report: dict = {}
+        for point in hf.REVIEW_POINTS:
+            fb = hf.load_feedback(active, point)
+            if fb is None:
+                continue
+            human_feedback_report[point] = {
+                "status": fb.status,
+                "written": fb.written,
+                "verdict": fb.verdict,
+                "finding_count": len(fb.findings),
+                "consumed_at": fb.consumed_at,
+                "consumed_into": fb.consumed_into,
+                "rejected_reason": fb.rejected_reason,
+            }
+        report["human_feedback"] = human_feedback_report
+        report["requirement"] = (active / "requirement.md").exists()
+        # PRD update-in-place R2: version count + most recent update summary,
+        # sourced from prd-history (independent of prd.md's own content).
+        from autodev.prd_history import history_dir, load_records
+        hist_records = load_records(history_dir(active))
+        last_update = None
+        if hist_records:
+            last = hist_records[-1]
+            last_update = {"ts": last.get("ts"), "summary": last.get("summary")}
+        report["prd_history"] = {
+            "versions": 1 + len(hist_records),
+            "last_update": last_update,
+        }
     if json_mode:
         print(json.dumps(report, indent=2, default=str))
     else:
         print(f"feature: {report['feature']}")
         print(f"status:  {report['status']}")
+        if report.get("prd_history"):
+            ph = report["prd_history"]
+            if ph["last_update"]:
+                print(
+                    f"prd:     version {ph['versions']}; last update "
+                    f"{ph['last_update']['ts']}: {ph['last_update']['summary']}"
+                )
+            else:
+                print(f"prd:     version {ph['versions']} (no recorded updates)")
         if report.get("paused"):
             print("paused:  yes (run `autodev resume`)")
         if report.get("build_blocking", {}).get("blocked"):
@@ -365,6 +468,14 @@ def cmd_status(args) -> int:
             print("recent events:")
             for ev in report["recent_events"]:
                 print(f"  [{ev.get('stage')}] {ev.get('event')}")
+        for point, info in report.get("human_feedback", {}).items():
+            print(
+                f"feedback: {point} {info['status']} "
+                f"({info['verdict']}, {info['finding_count']} findings, "
+                f"written {info['written']})"
+            )
+        if "requirement" in report:
+            print(f"requirement: {'present' if report['requirement'] else 'absent'}")
     return exit_codes.OK
 
 
@@ -888,15 +999,50 @@ def cmd_invalidate(args) -> int:
 
 
 def cmd_update(args) -> int:
-    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    repo_root = _repo_root(args)
+    fp = FeaturePaths(repo_root=repo_root, feature=args.feature)
     active = fp.active()
     prd = active / "prd.md"
     if not prd.exists():
         print("prd.md not found", file=sys.stderr)
         return exit_codes.ERROR
-    from datetime import date
-    stamped = f"\n\n## Amendment {date.today().isoformat()}\n\n{args.amendment.strip()}\n"
-    prd.write_text(prd.read_text(encoding="utf-8") + stamped, encoding="utf-8")
+    old_text = prd.read_text(encoding="utf-8")
+
+    src = Path(args.from_file)
+    if not src.exists():
+        print(f"source not found: {src}", file=sys.stderr)
+        return exit_codes.ERROR
+    new_text = src.read_text(encoding="utf-8")
+
+    from autodev.prd_intake import validate_prd_text
+    v = validate_prd_text(new_text)
+    if not v.ok:
+        print(f"prd-lint failed for {src}:", file=sys.stderr)
+        print(v.format_errors(), file=sys.stderr)
+        return exit_codes.ERROR
+
+    if new_text == old_text:
+        print("no changes: new PRD is identical to prd.md", file=sys.stderr)
+        return exit_codes.ERROR
+
+    from autodev.prd_history import (
+        check_r_stability, ever_used_numbers, history_dir, load_records,
+        write_update_record,
+    )
+    hist_dir = history_dir(active)
+    ever_used = ever_used_numbers(load_records(hist_dir))
+    stability_errors = check_r_stability(old_text, new_text, ever_used=ever_used)
+    if stability_errors:
+        print("requirement numbering check failed:", file=sys.stderr)
+        for e in stability_errors:
+            print(f"  - {e}", file=sys.stderr)
+        return exit_codes.ERROR
+
+    # Write history BEFORE prd.md itself (§10: if we crash mid-write, the
+    # old prd.md — not a half-written new one — stays authoritative).
+    record = write_update_record(active, old_text=old_text, new_text=new_text)
+    atomic_write(prd, new_text)
+
     ov.advance_cycle(active)
     from autodev.artifacts.revision_state import reset_on_amendment
     reset_on_amendment(active)
@@ -906,16 +1052,25 @@ def cmd_update(args) -> int:
     clear_history(active)
     (active / "diagnosis.json").unlink(missing_ok=True)
     (active / "rework-mode.json").unlink(missing_ok=True)
+
     # Emit a structured log event so the iteration-history manifest in
-    # downstream stage prompts shows the amendment as a clear cycle
-    # boundary. Anything in the manifest before this row was produced
-    # under the previous PRD.
+    # downstream stage prompts shows the update as a clear cycle boundary,
+    # with the R-change summary attached. Anything in the manifest before
+    # this row was produced under the previous PRD.
+    rel_hist_dir = hist_dir.relative_to(repo_root)
+    detail = {k: val for k, val in record.items() if k not in ("kind", "r_numbers")}
+    detail["history_dir"] = str(rel_hist_dir)
     from autodev.state.log import JsonlLog
     JsonlLog(active / "log.jsonl").emit(
         stage="orchestrator", event="prd-amended", feature=args.feature,
-        detail={"amendment_first_line": args.amendment.strip().splitlines()[0][:200]},
+        detail=detail,
     )
-    print(f"amended {prd}; cycle advanced; revision-state L reset to 0")
+    for w in v.warnings:
+        print(f"prd-lint warning: {w}")
+    print(
+        f"updated {prd} ({record['summary']}); cycle advanced; "
+        f"revision-state L reset to 0; history → {rel_hist_dir}"
+    )
     return exit_codes.OK
 
 
@@ -943,7 +1098,7 @@ def cmd_close(args) -> int:
             f"{CEILING_REFUSE_AT} for cycle {overrides.current_cycle}. "
             f"Likely systemic issue. Run `autodev escalate {args.feature}` "
             f"to snapshot for human review, OR `autodev update {args.feature} "
-            f"--amendment '...'` to advance the cycle (resets counters).",
+            f"--from-file <new-prd.md>` to advance the cycle (resets counters).",
             file=sys.stderr,
         )
         return exit_codes.ERROR
@@ -1017,7 +1172,7 @@ def cmd_skip_gate(args) -> int:
             f"WARNING: skip-gate weight for this cycle is now {weight} "
             f"(ceiling {CEILING_REFUSE_AT}). `autodev close` will REFUSE. "
             f"Run `autodev escalate {args.feature}` or advance the cycle via "
-            f"`autodev update {args.feature} --amendment '...'`.",
+            f"`autodev update {args.feature} --from-file <new-prd.md>`.",
             file=sys.stderr,
         )
     elif weight >= CEILING_WARNING_AT:
@@ -1146,8 +1301,8 @@ def cmd_escalate(args) -> int:
         f"\nEscalation snapshot written. This feature has hit the skip-gate "
         f"ceiling (weight={snapshot['active_skip_gate_weight']}).\n"
         f"Next steps — pick ONE:\n"
-        f"  (a) AMEND the PRD to enter a new cycle (resets counters):\n"
-        f"      autodev update {args.feature} --amendment '<what changed>'\n"
+        f"  (a) UPDATE the PRD to enter a new cycle (resets counters):\n"
+        f"      autodev update {args.feature} --from-file <new-prd.md>\n"
         f"  (b) CLOSE as deferred honestly:\n"
         f"      autodev close {args.feature} deferred --yes\n"
         f"  (c) DOWNGRADE one or more skip-gates to severity=low if they\n"
@@ -1175,6 +1330,127 @@ def cmd_acknowledge_dirty(args) -> int:
     return exit_codes.OK
 
 
+def _pending_feedback_message(active: Path, point: str) -> str:
+    """The stderr/stdout message to show when ``apply_pending`` returns
+    False for a reason other than rejection (detail §10, closing-review
+    pin): maps the reason ``human_feedback._is_current`` already computed
+    to the specific hints §2.1 calls out, rather than re-deriving them
+    here."""
+    from autodev import human_feedback as hf
+
+    _current, reason = hf._is_current(active, point)
+    gate = "close-approval" if point == "close-approval" else "design-review"
+    if reason == "skipped-verdict":
+        return f"verdict for gate {gate} is skipped; feedback stays pending"
+    if reason == "skip-gate-override":
+        return (
+            f"gate {gate} is covered by a skip-gate override; "
+            "feedback stays pending"
+        )
+    if reason == "pipeline-done":
+        return (
+            "pipeline already done; choose close-approval or "
+            "re-open with autodev update; feedback stays pending"
+        )
+    return f"pending; will merge when {point} next produces its output"
+
+
+def cmd_feedback(args) -> int:
+    """Inject human review feedback into one of the five review points
+    (core R4, detail §3.1). The ONLY way a human-feedback-<point>.json
+    file is ever written -- SKILL.md's "never write artifact files
+    directly" ban covers it too."""
+    from autodev import human_feedback as hf
+    from autodev.errors import SchemaError
+
+    # Preconditions, in order, each exit 1 with a clear stderr line
+    # (detail §3.1).
+    if args.review_point not in hf.REVIEW_POINTS:
+        print(
+            f"unknown review point {args.review_point!r}; must be one of "
+            f"{hf.REVIEW_POINTS!r}",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+
+    fp = FeaturePaths(repo_root=_repo_root(args), feature=args.feature)
+    active = fp.active()
+    if not active.is_dir():
+        print(f"{args.feature} not active", file=sys.stderr)
+        return exit_codes.ERROR
+
+    if not (active / ".pause").exists():
+        print(
+            "feature must be paused before injecting human feedback; "
+            f"run `autodev pause {args.feature}` first",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+
+    if read_owner(active) is not None:
+        print(
+            "another autodev process holds the lock; wait for it to exit",
+            file=sys.stderr,
+        )
+        return exit_codes.ERROR
+
+    if args.from_file:
+        src = Path(args.from_file)
+        if not src.exists():
+            print(f"source not found: {src}", file=sys.stderr)
+            return exit_codes.ERROR
+        raw_text = src.read_text(encoding="utf-8")
+    else:
+        raw_text = args.text
+
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        print(f"malformed JSON: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+
+    try:
+        fb = hf.validate_feedback(active, args.review_point, payload)
+    except SchemaError as exc:
+        print(f"human feedback rejected: {exc}", file=sys.stderr)
+        return exit_codes.ERROR
+
+    existing = hf.load_feedback(active, args.review_point)
+    overwrote_pending = existing is not None and existing.status == "pending"
+
+    path = hf.write_feedback(active, fb)
+
+    logger = JsonlLog(active / "log.jsonl")
+    logger.emit(
+        stage="human-feedback", event="human-feedback-written",
+        feature=args.feature,
+        detail={
+            "review_point": args.review_point,
+            "feedback_id": fb.feedback_id,
+            "verdict": fb.verdict,
+            "finding_count": len(fb.findings),
+            "path": str(path),
+            "overwrote_pending": overwrote_pending,
+        },
+    )
+    if overwrote_pending:
+        print(f"overwrote previous pending feedback for {args.review_point}")
+
+    merged = hf.apply_pending(
+        active, args.review_point, log=logger, check_current=True,
+    )
+    fb_after = hf.load_feedback(active, args.review_point)
+    if merged:
+        into = fb_after.consumed_into if fb_after is not None else None
+        print(f"merged into {into}")
+    elif fb_after is not None and fb_after.status == "rejected":
+        print(f"rejected: {fb_after.rejected_reason}", file=sys.stderr)
+        return exit_codes.ERROR
+    else:
+        print(_pending_feedback_message(active, args.review_point))
+    return exit_codes.OK
+
+
 _DISPATCH = {
     "prd": cmd_prd,
     "prd-lint": cmd_prd_lint,
@@ -1196,6 +1472,7 @@ _DISPATCH = {
     "skip-gate": cmd_skip_gate,
     "acknowledge-dirty": cmd_acknowledge_dirty,
     "escalate": cmd_escalate,
+    "feedback": cmd_feedback,
 }
 
 

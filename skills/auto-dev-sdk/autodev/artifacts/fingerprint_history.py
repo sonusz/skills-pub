@@ -18,7 +18,7 @@ it is — NOT as recurrence; otherwise the cached, byte-identical
 reviewer outputs would incorrectly force broad rework after zero fix attempts.
 Rounds persisted before source_hash existed contribute no recurrence evidence.
 
-The file is reset alongside L[*] on ``autodev update --amendment``.
+The file is reset alongside L[*] on ``autodev update``.
 """
 from __future__ import annotations
 

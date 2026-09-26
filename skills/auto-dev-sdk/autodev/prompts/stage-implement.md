@@ -22,6 +22,16 @@ is the requirement authority; the accepted design package (`design.md`,
 Previous Ralph findings are required corrections. Never modify protected
 inputs, including the PRD or accepted design package.
 
+**Requirement (read-only, optional).** `<FEATURE_ACTIVE>/requirement.md`,
+when present, is the user's own statement of intent from which the PRD was
+derived. Read it only to check that your output does not drift from the
+user's direction. It does NOT replace the PRD as the requirement anchor:
+coverage, `prd_ref`, evidence and every `R<N>` reference still point at
+`prd.md`. If you find the PRD and the requirement disagree, do not
+silently follow the requirement — report the disagreement in your output
+(review stages: as a finding; producer stages: in your artifact's notes
+section) and otherwise follow the PRD. Never modify this file.
+
 ## Work
 
 Implement as much runnable accepted work as fits this invocation. Do not limit
@@ -47,6 +57,24 @@ findings with category `redundant` that target build output. If a finding
 proves the accepted design itself cannot satisfy the PRD, or its remedy needs a
 design change, use the blocking-deviation route with
 `diagnosis.defective_layer="design"`; never edit protected design files.
+
+When writing new code, do not introduce a rule, check, or hard stop that
+traces to no PRD/design/trace requirement and no real failure mode, and that
+would make the system less robust: rejecting valid input or state,
+hard-failing where degrading is safe, demanding an exact match or ordering
+nothing requires, failing closed on a transient or optional dependency, or
+aborting healthy work with a retry/limit/timeout nothing requires. Handle
+input and output per the robustness principle (Postel's law): accept
+liberally from callers and peers — tolerate unknown fields, harmless
+reordering or format differences, optional-field absence, benign version
+skew — and send strictly — well-formed, spec-exact output. The binding
+limit: never silently accept input that is ambiguous, security-relevant, or
+would be misread downstream; there, reject strictly with a clear error —
+that is correct, not a defect. When a prior Ralph or panel finding names a
+brittle rule under the redundancy correction rules above, apply the same
+fix discipline: implement the correct, more tolerant or more strict
+handling for the concrete input/state named, rather than relaxing
+validation broadly.
 
 Run only tests covering changed code and direct dependants. Run a full suite
 only for a cross-cutting change, an explicit test-plan requirement, or final

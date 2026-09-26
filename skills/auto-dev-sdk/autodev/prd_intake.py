@@ -45,6 +45,9 @@ class PrdIntakeResult:
     # For tooling that wants to display the parsed structure.
     sections_found: list[str] = field(default_factory=list)
     requirement_markers: list[str] = field(default_factory=list)
+    # Non-blocking advisories (`ok` is unaffected by these). Currently just
+    # the back-compat "## Amendment" section nudge (PRD update-in-place R3).
+    warnings: list[str] = field(default_factory=list)
 
     def format_errors(self) -> str:
         return "\n".join(f"  - {e}" for e in self.errors)
@@ -96,10 +99,13 @@ def _requirement_declaration_bodies(
 ) -> list[str]:
     """Bodies allowed to introduce addressable requirements.
 
-    The original Requirements section and append-only, date-stamped Amendment
-    sections are authoritative. This makes ``autodev update --amendment`` able
-    to add a requirement without rewriting the PRD, while unrelated headings
-    and fenced examples remain non-authoritative.
+    The original Requirements section and any date-stamped Amendment
+    sections are authoritative. Amendment sections are back-compat only —
+    `autodev update` now replaces `prd.md` wholesale via `--from-file`
+    rather than appending one — but PRDs already carrying old Amendment
+    sections must keep parsing the same way, so their requirement
+    markers remain authoritative here too. Unrelated headings and fenced
+    examples remain non-authoritative.
     """
     lines = text.splitlines()
     bodies: list[str] = []
@@ -114,6 +120,8 @@ def _requirement_declaration_bodies(
 
 
 def _unfenced_lines(body: str):
+    """Yield every line of ``body`` not inside a fenced code block (``` or
+    ``~~~``)."""
     fence: str | None = None
     for line in body.splitlines():
         stripped = line.lstrip()
@@ -179,11 +187,28 @@ def validate_prd_text(text: str) -> PrdIntakeResult:
     _, assurance_errors = parse_assurance(text, known_rs=set(markers_found))
     errors.extend(assurance_errors)
 
+    # Back-compat nudge (PRD update-in-place R3): `## Amendment` sections
+    # are still parsed (requirement markers + Assurance/Depth/Release
+    # threshold overrides) but are no longer how `prd.md` gets modified —
+    # `autodev update --from-file` replaces the whole file instead. Warn,
+    # don't block, so old features keep passing lint.
+    warnings: list[str] = []
+    amendment_count = sum(
+        1 for name in sections_found
+        if re.fullmatch(r"amendment(?:\s+\d{4}-\d{2}-\d{2})?", name)
+    )
+    if amendment_count >= 1:
+        warnings.append(
+            f'PRD has {amendment_count} "## Amendment" section(s); fold them '
+            'into the body on the next "autodev update --from-file"'
+        )
+
     return PrdIntakeResult(
         ok=not errors,
         errors=errors,
         sections_found=sections_found,
         requirement_markers=markers_found,
+        warnings=warnings,
     )
 
 

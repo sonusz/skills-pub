@@ -49,7 +49,9 @@ Three invariants hold for the entire run:
   agents — never `fork` (a fork inherits the conversation and defeats the
   purpose). They receive only what their prompt template inlines: the two
   documents, the diff, the repo root. They may read the repo; they must not
-  see the conversation.
+  see the conversation — including any guidance the user gives in chat
+  mid-run, which reaches a review only as findings merged into its reply
+  (§6).
 
 Prompt templates live in `prompts/`; substitute every `<variable>` before
 dispatch (placeholders are documented at the top of each template).
@@ -106,7 +108,9 @@ reader who has none of your context.
    the core doc and the detail doc**: places where the detail doc drifts
    from, contradicts, or silently extends the core requirements.
    **It must not execute anything.**
-2. Compare that reply against the intended direction. Four failure kinds:
+2. Compare that reply against the intended direction — together with any
+   user feedback attached to this round (§6), classified into the same
+   four kinds. Four failure kinds:
    - **Drift** — the plan does things the documents never meant, or misses
      things they require.
    - **Invention** — the plan fills gaps with its own guesses.
@@ -114,7 +118,9 @@ reader who has none of your context.
      the detail doc no longer faithfully elaborates the core doc.
    - **Excess or redundancy** — the subagent identifies a specific mechanism
      that can be removed, reused, or simplified while preserving all core
-     requirements and constraints.
+     requirements and constraints, or an unmotivated strict rule that makes
+     the design less robust (robustness principle; ambiguous/security-relevant
+     rejections excepted).
 3. On any failure: **edit only the detail document** to close the specific
    gap — the core document is off-limits here — then tell the user in one
    short message what changed and why (*do not wait for a reply*), and loop
@@ -176,9 +182,12 @@ The reviewer answers five questions:
    core requirements is a divergence finding, not a pass.
 5. **Proportionality** — can a specific changed-code or affected-design
    mechanism be removed, replaced with an existing mechanism, or simplified
-   while preserving every affected requirement and constraint?
+   while preserving every affected requirement and constraint, or does an
+   unmotivated rule, check, or hard stop make the system less robust per the
+   robustness principle (ambiguous/security-relevant rejections excepted)?
 
-Route the findings:
+Route the findings — the reviewer's and any user feedback attached to this
+round (§6), classified into the same five kinds:
 
 - Conformance/completeness defects → dispatch fix subagents (doc-bound, same
   rules), then re-review the fixed area.
@@ -222,6 +231,47 @@ the updated pair through a quick Stage 2 check before resuming.
 This is the one place the pipeline blocks on the user. Detail-doc edits in
 Stage 2 notify without waiting; core-doc changes and scope decisions always
 wait.
+
+## §6 — User feedback at review points
+
+Design guidance the user gives in chat mid-run ("use X instead of Y",
+"that's over-engineered", "you missed Z") is not ignored, not improvised
+on, and not written into a document outside the rules below. It enters the
+pipeline as **one more reviewer's findings** at a review point: a Stage 2
+dry-run reply or a Stage 4 stage/closing review reply.
+
+1. **Output, never input.** The review subagent's prompt and inputs stay
+   exactly what the template inlines. The user's feedback is not added to
+   the prompt, the documents, the diff, or the scope for that review; the
+   reviewer must not see or react to it.
+2. **Same vocabulary.** When the reply returns, express each feedback item
+   as a finding of that review point — Stage 2: drift, invention,
+   divergence, or excess/redundancy; Stage 4: conformance, completeness,
+   overreach, fidelity, or proportionality, with the same evidence pointer
+   (file, document section) as far as the feedback supplies one. An item
+   that fits no kind is a doc gap and routes as one (§5).
+3. **Conflict check before merging.** Only once the reply is back — never
+   before dispatch, or the reviewer would see the feedback through an
+   edited document — read each item against the two documents in their
+   existing roles:
+   - Conflicts with the **core document** → do not merge. This is §5:
+     quote the core-doc sentence and the feedback side by side; the user
+     decides which one changes.
+   - Conflicts only with the **detail document** → the detail doc misread
+     the core doc. Fix the detail doc (the normal Stage 2 power: notify,
+     don't wait), then merge.
+   - No conflict → merge.
+4. **Same routing.** Merged findings go through the routing that review
+   point already has — Stage 2 steps 3–5, Stage 4 "Route the findings". No
+   weighting, no veto: the user is one reviewer, and a fix subagent
+   receives a user-originated finding exactly as it would any other.
+5. **Timing.** Feedback that arrives while a review round is in flight is
+   held and merged when that round's reply returns. Feedback that arrives
+   between rounds — including while dev or fix subagents are running —
+   attaches to the next review round dispatched (for running dev work, the
+   stage review or re-review that follows it). Tell the user which round it
+   attached to. A finding is consumed by exactly one round: once routed, it
+   is not merged again.
 
 ## What this skill is not
 

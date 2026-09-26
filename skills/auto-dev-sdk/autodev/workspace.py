@@ -42,6 +42,8 @@ _HARNESS_IGNORE_PATTERNS = (
     "docs/features/*/active/panel-*.json",
     "docs/features/*/active/panel-*-raw",
     "docs/features/*/active/panel-*-raw/*",
+    "docs/features/*/active/prd-history",
+    "docs/features/*/active/prd-history/*",
 )
 
 
@@ -460,6 +462,17 @@ def detect_out_of_scope_writes(
             if _is_under(path, protected)
         ]
         if matching_protected:
+            if any(protected.is_dir() for protected in matching_protected):
+                # A directory-shaped protected path (e.g. prd-history/)
+                # can't rely on the has_direct_baseline / content_changed
+                # fingerprint check below: the directory's own fingerprint
+                # ignores mtime, so a stage adding a new file inside it
+                # typically leaves the directory's fingerprint unchanged.
+                # Harness code never writes here during a stage run, so any
+                # porcelain entry under a directory protected path is a
+                # stage write and always counts as an escape.
+                escapes.append(entry)
+                continue
             watched_keys = [
                 _repo_relative_key(repo_root, protected)
                 for protected in matching_protected

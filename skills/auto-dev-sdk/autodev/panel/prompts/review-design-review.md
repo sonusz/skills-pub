@@ -142,8 +142,25 @@ remain the author of every reported finding.
   item covering it; OR a design commitment has no corresponding
   scope item; OR a required design.md section is absent.
 - **INVENTED** — a scope item's `prd_ref` or `design_ref`
-  doesn't resolve; OR an item's description imposes obligations
-  the PRD does not state.
+  doesn't resolve; OR an item's description, or a design.md
+  commitment, imposes obligations the PRD does not state —
+  including a rule, check, or hard stop
+  that traces to no PRD requirement and no real failure mode, and
+  makes the system less robust: it rejects valid inputs or states,
+  hard-fails where degrading is safe, demands an exact match or
+  ordering the PRD does not require, fails closed on a transient or
+  optional dependency, or aborts healthy work via a
+  retry/limit/timeout nothing in the PRD asks for. Judge these by
+  the robustness principle (Postel's law): accept liberally —
+  tolerate unknown fields, harmless reordering or format
+  differences, optional-field absence, benign version skew — and
+  send strictly — well-formed, spec-exact output. The binding
+  limit: liberal acceptance must never silently accept input that
+  is ambiguous, security-relevant, or would be misread downstream;
+  strict rejection with a clear error there is correct, not a
+  finding. Name the concrete input or state that trips the rule and
+  the correct, more tolerant or more strict handling; "this would
+  have been written more leniently" alone is not a finding.
 - **AMBIGUOUS** — a PRD requirement is under-specified such
   that two incompatible design decompositions would both be
   valid; OR design.md commits to a primitive described by two

@@ -451,7 +451,7 @@ def route_to_layer(
             kind=DecisionKind.HALT_FOR_HUMAN, layer=layer, state=s,
             reason=(
                 f"L[{gate}]={l} already at L_MAX={L_MAX}; cannot route to "
-                f"{layer}; require `autodev update --amendment`"
+                f"{layer}; require `autodev update --from-file <new-prd.md>`"
             ),
         )
 

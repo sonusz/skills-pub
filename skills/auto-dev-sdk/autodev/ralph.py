@@ -21,7 +21,7 @@ Module contract:
 - ``RalphState`` — persisted in ``ralph-state.json`` (not in the main
   artifact cascade). Fields: iter count, per-iter Fully sets, regression
   log, started_at / last_iter_at. Cleared on close; cleared on
-  ``autodev update --amendment`` (rescheduled against new scope.json);
+  ``autodev update`` (rescheduled against new scope.json);
   cleared on any g-24 route (upstream changed).
 - ``parse_review_statuses(review_md_path)`` — return dict[scope_id, status].
 - ``active_scope_ids(scope_json_path)`` — return set[str] of active items.

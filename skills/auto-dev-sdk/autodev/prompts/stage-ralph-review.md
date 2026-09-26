@@ -84,15 +84,32 @@ method open. Do not invent new requirements or offer optional improvements.
 
 Also record a finding when changed or feature code satisfies its trace and the
 accepted design but concrete evidence shows it duplicates existing work or
-mechanisms, or uses an unnecessary wrapper or abstraction. A redundancy
-finding must name affected active scope IDs, cite code locations and the
-accepted-design constraint, identify the exact duplicate or unnecessary
-mechanism, give a concrete deletion/reuse/simplification, and explain why that
-change preserves required behavior, safety, compatibility, performance, and
-design constraints. Do not force findings, search unrelated whole-repo code,
-or report speculative, style-only, or line-count preferences. Necessary
-safeguards are not redundancy. A mechanism mandated by the accepted design is
-not removable here; genuine design problems use the existing design rerun path.
+mechanisms, uses an unnecessary wrapper or abstraction, or applies a rule,
+check, or hard stop that traces to no trace row, no accepted-design
+constraint, and no real failure mode, and makes the system less robust: it
+rejects valid input or state, hard-fails where degrading is safe, demands an
+exact match or ordering the trace/design does not require, fails closed on a
+transient or optional dependency, or aborts healthy work via a
+retry/limit/timeout the trace/design never asked for. Judge the last kind by
+the robustness principle (Postel's law): accept liberally from callers and
+peers — tolerate unknown fields, harmless reordering or format differences,
+optional-field absence, benign version skew — and send strictly — well-formed,
+spec-exact output. The binding limit: liberal acceptance must never silently
+accept input that is ambiguous, security-relevant, or would be misread
+downstream; strict rejection with a clear error there is correct, not a
+finding. A finding must name affected active scope IDs, cite code locations
+and the accepted-design constraint, and either identify the exact duplicate or
+unnecessary mechanism and give a concrete deletion/reuse/simplification
+(duplication/wrapper), or name the concrete input or state that trips the rule
+and give the correct, more tolerant or more strict handling (brittle rule) —
+in both cases explaining why the change preserves required behavior, safety,
+compatibility, performance, and design constraints. Do not force findings,
+search unrelated whole-repo code, or report speculative, style-only, or
+line-count preferences; "this would have been written more leniently" alone is
+not a finding. Necessary safeguards are not redundancy, and strict rejection
+of ambiguous or security-relevant input is not redundancy either. A mechanism
+mandated by the accepted design is not removable here; genuine design
+problems use the existing design rerun path.
 
 Every finding uses the existing `design_conformance.findings` shape: `difference`
 explains either design drift or evidenced redundancy and `correction` gives the

@@ -87,6 +87,9 @@ class HistoryEntry:
 def _label_for(stage: str, event: str, detail: dict) -> str:
     """Render a one-line summary for a (stage, event) tuple."""
     if (stage, event) == ("orchestrator", "prd-amended"):
+        summary = detail.get("summary")
+        if summary:
+            return f"prd.md UPDATED via `autodev update`: {summary}"
         return "prd.md AMENDED via `autodev update --amendment`"
     if (stage, event) == ("orchestrator", "pipeline-done"):
         return "pipeline reached `done`"

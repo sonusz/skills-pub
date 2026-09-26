@@ -55,14 +55,21 @@ Before invoking `autodev prd <feature> --from-file ...`, check whether the user 
 
 - If they hand over a structured `prd.md` aligned with the v2 schema (`## Problem / Users / Architectural principles / Requirements / Constraints / Success Criteria / Out of Scope`), skip drafting and continue to the mandatory semantic-intent check below before import.
 - If they only have an idea, a screenshot, a PDF, a reference document, or a draft `prd.md` that has not passed `autodev prd-lint`, drive PRD authoring first by following [references/prd-authoring.md](references/prd-authoring.md). That guide bundles the canonical schema, the interrogation checklist that surfaces gaps (concurrency floor / ceiling, failure modes, recovery, operator surface, implementation discipline, library reuse, platform compat), the bullet-classification rubric, the lessons-learned carryover, the design-stage POC clause (when a design premise needs proof beyond code/docs/measurements), and a worked example. Do NOT invent a PRD silently; walk the checklist with the user so gaps surface explicitly.
+- If the user also holds a separate requirement document — their own core-intent document that the PRD was derived from, not the PRD itself — import it at cold start with `autodev prd <feature> --requirement PATH` (alongside `--from-file`, or on its own against an already-imported PRD). The harness copies it read-only next to `prd.md` (`planned/` before activation, `active/` after); it becomes the conflict baseline used in "Human feedback into a review point" below.
 
 ### Mandatory semantic-intent check
 
 Before `autodev prd`, spawn a fresh read-only subagent. Give it only the PRD and its source references; ask it to restate the requirements and flag plausible alternate readings. Do not supply the intended interpretation or prior conclusions.
 
-Compare its independent reading with the user's confirmed intent. If they differ materially, surface the mismatch, make only the smallest user-approved clarification, and repeat with a fresh pass until they align. Do not proceed merely because the subagent says the PRD is acceptable, and do not let it invent requirements or replace user approval. Apply the same check after a material PRD amendment and before resuming the pipeline; clarify an active PRD only through `autodev update`.
+Compare its independent reading with the user's confirmed intent. If they differ materially, surface the mismatch, make only the smallest user-approved clarification, and repeat with a fresh pass until they align. Do not proceed merely because the subagent says the PRD is acceptable, and do not let it invent requirements or replace user approval. Apply the same check after every `autodev update` and before resuming the pipeline; clarify an active PRD only through `autodev update`.
 
-Trigger the pre-flight when the user says "write a PRD", "draft requirements", "spec out a new feature", or hands over an unstructured idea and asks to start auto-dev. For `update`, skip only the cold-start authoring steps; a material amendment still requires the semantic-intent check before resume. Skip the full pre-flight for `close`, `pause`, `resume`, `abort`, `retry`, `invalidate`, `grant-rerun`, `skip-gate`, and `acknowledge-dirty`.
+Trigger the pre-flight when the user says "write a PRD", "draft requirements", "spec out a new feature", or hands over an unstructured idea and asks to start auto-dev. For `update`, skip only the cold-start authoring steps; every `autodev update` requires the semantic-intent check before resume. Skip the full pre-flight for `close`, `pause`, `resume`, `abort`, `retry`, `invalidate`, `grant-rerun`, `skip-gate`, and `acknowledge-dirty`.
+
+### PRD update flow
+
+`autodev update <f> --from-file PATH` is the only way to change an imported `prd.md`: it replaces the file in place and starts a new cycle. The flow: run `autodev status <f>` to see the feature is in a state that accepts an update; read the current `prd.md`; write the full new PRD to a scratch directory outside the repo (e.g. `mktemp -d`) — never edit `prd.md` in place; show the user the old-vs-new unified diff (`diff -u`, not just prose about what changed); get the user's confirmation; run `autodev update <f> --from-file <scratch>/prd.md`; relay the harness's output verbatim (the `R` change summary and any `prd-lint` warning); and run the semantic-intent check on the new PRD (always, after every update).
+
+Numbering never gets rearranged after import: a deleted `R<N>` retires that number, and a new requirement takes a number higher than any `R<N>` that has ever appeared in this PRD's history.
 
 ## CLI install check
 
@@ -77,11 +84,13 @@ I may only invoke these:
 | Verb | Purpose |
 |---|---|
 | `autodev prd <f> [--from-file PATH]` | Create/import PRD |
+| `autodev prd <f> --requirement PATH` | Copy a requirement document (read-only) next to `prd.md` (`planned/` before activation, `active/` after) |
 | `autodev status <f>` | Read state |
 | `autodev run <f> [--watch] [--until design\|build\|spec]` | Advance pipeline through all reachable stages. `--until design` runs the whole design phase (including the design-review gate and any in-design revision reruns) then stops before build; `--until build` stops before spec; omit (or `--until spec`) to run to completion. |
 | `autodev next <f> [--watch]` | Advance exactly one stage |
 | `autodev pause <f>` | Write `.pause` sentinel |
 | `autodev resume <f>` | Remove `.pause` sentinel |
+| `autodev feedback <f> <point> --from-file PATH \| --text JSON` | Inject one human feedback (one or more findings) into a paused review point (`arch-review`\|`design-review`\|`trace-review`\|`close-approval`\|`ralph-review`) |
 | `autodev quota-resume <f>` | Conditionally resume a quota-paused feature (auto-continues only if still quota-paused, resume_at reached, quota recovered, and repo unchanged; else no-op) |
 | `autodev grant-rerun <f> <gate> --reason "..."` | After a gate exhausts `L_MAX`, authorize one auditable producer correction. This neither passes nor skips the gate; the next blocking verdict halts again. |
 | `autodev skip-gate <f> <gate> --reason "..."` | Override a mandatory gate |
@@ -91,7 +100,7 @@ I may only invoke these:
 | `autodev restore-design <f> [--package package-NNN]` | Restore a paused feature's latest (or named) hash-verified design-package snapshot after an interrupted or mistaken invalidation. |
 | `autodev retry <f>` | Retry last failed stage |
 | `autodev invalidate <f> <stage>` | Rollback a stage artifact |
-| `autodev update <f> --amendment "..."` | Amend PRD; start new cycle |
+| `autodev update <f> --from-file PATH` | Replace prd.md with a full new PRD (the only way to change it); start new cycle |
 | `autodev close <f> <reason> [--yes]` | Close feature |
 | `autodev explain <f>` | Human-readable state |
 | `autodev prd-lint <f>` | Validate the imported PRD against the v2 schema |
@@ -154,7 +163,7 @@ Mirror the harness R5 contract:
 
 1. Track the latest `<feature>` arg as current feature across turns.
 2. Before each user turn in an active auto-dev session, run `autodev status <current-feature>` and surface state changes.
-3. Before any write-like verb (`grant-rerun`, `skip-gate`, `acknowledge-dirty`, `abort`, `reset-session`, `restore-design`, `invalidate`, `update`, `close`), rerun `autodev status`.
+3. Before any write-like verb (`grant-rerun`, `skip-gate`, `acknowledge-dirty`, `abort`, `reset-session`, `restore-design`, `invalidate`, `update`, `close`, `feedback`), rerun `autodev status`.
 4. For every background `run`/`next`, use `--watch` and attach one generic Monitor that implements [references/watch.md](references/watch.md). Do not invent shell sleep loops, cron polling, or per-feature heartbeat logic.
    - Treat `started` as the advertised heartbeat contract and reset the silence deadline on every watch marker.
    - Heartbeats are health signals; do not relay routine ones to the user.
@@ -165,6 +174,25 @@ Mirror the harness R5 contract:
 ### Push alerts via `--watch`
 
 `autodev run <feature> --watch` emits transition alerts plus harness-owned heartbeat and terminal markers. Run it in the background and attach the required generic Monitor; do not add a second polling loop. Full protocol in [references/watch.md](references/watch.md).
+
+## Human feedback into a review point
+
+Use this when the user gives feedback mid-pipeline that should count as an independent reviewer's finding at one of the five review points: `arch-review`, `design-review`, `trace-review`, `close-approval`, `ralph-review`.
+
+1. **Read the anchors.** Read `active/requirement.md` (the user's own core-intent document the PRD was derived from) and `active/prd.md`. If `requirement.md` is missing, ask the user for the requirement document's path and import it with `autodev prd <f> --requirement PATH` before continuing — never use the PRD alone as the conflict baseline.
+2. **Three-way conflict check**, in this order:
+   - Feedback **conflicts with the requirement** → do not inject. Quote the requirement text and the feedback text side by side, name the conflict, and let the user decide whether to change the feedback or the requirement. If the requirement changes, re-import it (`autodev prd <f> --requirement PATH`) and sync the PRD with `autodev update`. Whichever changed — feedback or requirement — return to the top of this check and recheck the latest feedback against the current requirement; repeat until there is no conflict.
+   - Feedback is **consistent with the requirement but conflicts with a PRD `### R<N>:`, a constraint, or an Out of Scope line** → the PRD misread the requirement, not the feedback. Fix the PRD with `autodev update`, show the user the diff, then continue.
+   - **No conflict** → continue.
+   - After changing the PRD via `autodev update` in either bullet above, run the semantic-intent check before continuing.
+3. **Choose the review point.** Run `autodev status <f>` and match the feedback's subject to the review point that is closest ahead and will still execute: architecture/component split → `arch-review` (if the arch-design loop hasn't passed yet) or `design-review`; design behavior enumeration/test plan → `trace-review`; code vs. accepted design → `ralph-review`; final delivery vs. PRD → `close-approval`. Tell the user which point and why; don't wait for confirmation, but honor a veto.
+4. **Format the feedback** as that point's own finding structure — the same JSON shape its response/synthesis package already uses (panel `PanelFinding` fields for `design-review`/`trace-review`/`close-approval`; `arch-review.json`'s `category`/`prd_ref`/`evidence`/`problem`/`correction` for `arch-review`; `design_conformance.findings[]`'s `scope_ids`/`design_ref`/`evidence`/`difference`/`correction` for `ralph-review`) plus an overall `verdict`. Keep the user's own words in `summary`/`problem`/`difference`. Never adjust severity or priority yourself; ask the user when a field (severity, priority, targets, scope_ids) is unclear. Put the JSON in a scratch file (or pass it inline with `--text`).
+5. **Pause, inject, confirm, resume:**
+   - `autodev pause <f>`; wait for the orchestrator to actually stop — the `run --watch` terminal marker appears and `.lock/` is released. If no `run` is active, skip straight to the next step.
+   - `autodev feedback <f> <point> --from-file PATH` (or `--text`). Read its output: `merged into <file>` (injected now); `overwrote previous pending feedback for <point>` (a prior pending feedback for that point was replaced); one of three pending messages when the point's package isn't current yet — the generic `pending; will merge when <point> next produces its output`, `gate <gate> is covered by a skip-gate override; feedback stays pending` when a skip-gate override is active, or `pipeline already done; choose close-approval or re-open with autodev update; feedback stays pending` when the pipeline has finished; or `rejected: <reason>` to stderr with exit 1 — fix the feedback and re-inject.
+   - `autodev status <f>` and confirm the point shows `pending` or `consumed` — both count as success. If it shows `rejected` (with a reason), the injection didn't take; fix the cause and call `autodev feedback` again.
+   - Any failure along the way: relay the harness's stderr verbatim to the user; never edit files to work around it.
+   - `autodev resume <f>`, then continue `run`/`next` as usual.
 
 ## Confirmation gate
 
@@ -182,8 +210,9 @@ If the request touches a path covered by `docs/features/<X>/` in any status, rou
 ## Never
 
 - Never commit or push.
-- Never rewrite `prd.md`; use append-only `autodev update`.
+- Never edit `prd.md` by hand; the only way to change it is `autodev update --from-file`.
 - Never write `.lock/`, `.gates/`, `overrides.json`, `panel-*.json`, or artifact files directly.
+- Never write `human-feedback-*.json` or `requirement.md` directly.
 - Never skip the pre-turn status poll.
 - Never claim a stage is complete from memory; read filesystem state.
 - Never inject custom prompts into panel-review invocations.

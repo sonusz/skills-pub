@@ -65,6 +65,14 @@ Rules:
   requirements and constraints still hold so the orchestrator can correct
   the detail document and rerun comprehension. Do not remove complexity that
   the core document explicitly requires.
+- Do not introduce a rule, check, or hard stop that traces to no requirement
+  and no real failure mode — it makes the system less robust. Follow the
+  robustness principle: be liberal in what you accept (tolerate unknown
+  fields, harmless reordering or format variation, optional-field absence,
+  benign version skew) and conservative in what you emit (well-formed,
+  spec-exact output) — except where input is ambiguous, security-relevant,
+  or would be misread downstream, where strict rejection with a clear error
+  is correct.
 - Verify your work with the repo's existing test/build commands where they
   exist; write tests when the documents or task scope call for them.
 

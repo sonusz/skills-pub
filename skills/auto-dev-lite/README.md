@@ -71,6 +71,7 @@ What you will be asked:
 
 - If you did not provide a document, or it is thin or stale: the goal and why, what is in and out of scope, expected behavior and interfaces, constraints (compatibility, performance, style), and what "done" looks like. You then approve the draft.
 - During Stage 1 and 2: nothing that blocks. You get short notices of detail-document edits and can reply if you disagree.
+- Any time mid-run: optional design feedback in chat ("use X instead of Y", "that's over-engineered"). It is merged as one more reviewer's findings into the next Stage 2 or Stage 4 review round, after checking it against the core document; you are told which round it joined.
 - At any stop-and-discuss point: a decision between amending the core document, ruling the item out of scope, or rethinking the approach. The pipeline waits.
 - At the end: nothing. You receive the section-by-section report.
 

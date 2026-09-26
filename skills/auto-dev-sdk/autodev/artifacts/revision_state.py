@@ -46,7 +46,7 @@ Budget semantics:
   - At L_MAX, an explicit human ``grant-rerun`` may authorize one more
     producer rerun without passing the gate or changing the PRD. The next
     blocking verdict halts again unless another human grant is made.
-  - L and unconsumed credits reset on ``autodev update --amendment``.
+  - L and unconsumed credits reset on ``autodev update``.
 """
 from __future__ import annotations
 
@@ -300,7 +300,7 @@ def clear_state(feature_active: Path) -> None:
 
 
 def reset_on_amendment(feature_active: Path) -> RevisionState:
-    """v3-core R4: `autodev update --amendment` resets L[*] and
+    """v3-core R4: `autodev update` resets L[*] and
     pending_feedback."""
     s = load_state(feature_active)
     s.L = {g: 0 for g in ALL_PANEL_GATES}

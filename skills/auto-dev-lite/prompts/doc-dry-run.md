@@ -56,7 +56,16 @@ Reply with:
    constraints still hold. A mechanism may be redundant even when it traces
    to a requirement. Do not force a finding or search exhaustively; future
    flexibility, stylistic preference, and fewer lines alone are not evidence.
-   If no such mechanism is supported by concrete evidence, say so.
+   Also flag any rule, check, or hard stop the design imposes that traces to
+   no requirement and no real failure mode, and would make the system less
+   robust — rejecting valid inputs or states, hard-failing where degrading is
+   safe, or demanding exact matches where the requirements tolerate variation
+   (a robustness-principle violation: liberal in what the design accepts,
+   conservative in what it emits). For each, name the concrete input or state
+   that would trip it and the more tolerant handling that still satisfies
+   every requirement. Strictly rejecting input that is ambiguous,
+   security-relevant, or would be misread downstream is correct, not a
+   finding. If no such mechanism is supported by concrete evidence, say so.
 5. **Out of scope** — what you would deliberately NOT do, per your reading
    of the documents.
 

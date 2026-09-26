@@ -76,15 +76,31 @@ creates PRD conflict, safety risk, or unreviewed product surface.
 
 Also inspect changed code and affected mechanisms for evidenced redundancy,
 even when every PRD coverage row is satisfied. Report code that duplicates
-existing work or mechanisms, or an unnecessary wrapper or abstraction, only
-when you can cite code locations, the governing PRD/design constraints, a
-concrete sufficient deletion/reuse/simplification, and why it preserves
-required behavior, safety, compatibility, performance, and PRD constraints.
-If only an accepted-design mechanism choice prevents the simplification, route
-that proposal to design; never silently bypass the accepted design in build.
+existing work or mechanisms, an unnecessary wrapper or abstraction, or a
+rule, check, or hard stop that traces to no PRD/design requirement and no
+real failure mode, and makes the system less robust: it rejects valid input
+or state, hard-fails where degrading is safe, demands an exact match or
+ordering the PRD/design does not require, fails closed on a transient or
+optional dependency, or aborts healthy work via a retry/limit/timeout nothing
+requires. Judge the last kind by the robustness principle (Postel's law):
+accept liberally — tolerate unknown fields, harmless reordering or format
+differences, optional-field absence, benign version skew — and send strictly
+— well-formed, spec-exact output. The binding limit: liberal acceptance must
+never silently accept input that is ambiguous, security-relevant, or would be
+misread downstream; strict rejection with a clear error there is correct, not
+a finding. Report only when you can cite code locations, the governing
+PRD/design constraints, and either a concrete sufficient
+deletion/reuse/simplification (duplication/unnecessary mechanism), or the
+concrete input or state that trips the rule and the correct, more tolerant or
+more strict handling (brittle rule) — in both cases why it preserves required
+behavior, safety, compatibility, performance, and PRD constraints; "this would
+have been written more leniently" alone is not a finding. If only an
+accepted-design mechanism choice prevents the simplification, route that
+proposal to design; never silently bypass the accepted design in build.
 Do not search unrelated whole-repo code or report cosmetic, speculative,
-style-only, or line-count preferences. Necessary safeguards are not redundant.
-Never propose a cut that violates a core PRD requirement.
+style-only, or line-count preferences. Necessary safeguards are not redundant,
+and strict rejection of ambiguous or security-relevant input is not redundant
+either. Never propose a cut that violates a core PRD requirement.
 
 Design conformance is separate from PRD satisfaction. If implementation
 deviates from accepted design but still satisfies PRD, record that as an
@@ -115,7 +131,15 @@ remain the author of every reported finding.
   a meaningfully different way.
 - **UNDELIVERED** -- implemented-spec contradicts a PRD requirement.
 - **REDUNDANT** -- actual feature code contains evidenced removable duplication
-  or an unnecessary mechanism despite satisfying PRD/design behavior.
+  or an unnecessary mechanism despite satisfying PRD/design behavior; or a
+  rule, check, or hard stop that traces to no PRD/design requirement and no
+  real failure mode and makes the system less robust (rejects valid input or
+  state, hard-fails where degrading is safe, demands an exact match or
+  ordering nothing requires, fails closed on a transient or optional
+  dependency, aborts healthy work via an unrequired retry/limit/timeout),
+  judged by the robustness principle (Postel's law) with its binding limit:
+  strict rejection of ambiguous or security-relevant input is correct, not a
+  finding.
 
 ## Severity
 

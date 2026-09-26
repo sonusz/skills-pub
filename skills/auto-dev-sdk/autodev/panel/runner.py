@@ -1930,6 +1930,35 @@ def _validate_design_review_targets(findings: list[PanelFinding]) -> None:
                 )
 
 
+def override_pass_decision(
+    decision: ReviewDecision, release_threshold: str, *, reason: str,
+) -> tuple[ReviewDecision, dict]:
+    """Downgrade a canonical ``pass`` design-review decision to
+    ``retry_design`` because blocking findings survive the release
+    threshold.
+
+    Pure — does not write logs or mutate its argument. Shared by this
+    runner's own finding_override branch and, per detail §1.4, by
+    ``autodev.human_feedback.merge_into_panel_verdict`` when a human
+    finding overrides a pass decision after the fact. Callers own
+    emitting ``release-policy-decision-override`` themselves so the
+    event's ``detail`` can carry caller-specific context (e.g. the
+    human-feedback module's ``source`` key).
+    """
+    original = decision.to_dict()
+    decision_overridden_by_policy = {
+        **original,
+        "release_threshold": release_threshold,
+        "reason": reason,
+    }
+    new_decision = ReviewDecision(
+        node=decision.node, outcome="retry_design", blocking=False,
+        severity=decision.severity, summary=decision.summary,
+        prd_targeted=decision.prd_targeted,
+    )
+    return new_decision, decision_overridden_by_policy
+
+
 def _normalize_design_review_decision(
     *,
     feature_active: Path,
@@ -2231,16 +2260,9 @@ def _synthesize_and_build_verdict(
         )
         finding_override = blocks and decision.outcome == "pass"
         if finding_override:
-            original = decision.to_dict()
-            decision_overridden_by_policy = {
-                **original,
-                "release_threshold": release_threshold,
-                "reason": "blocking findings override pass decision",
-            }
-            decision = ReviewDecision(
-                node=decision.node, outcome="retry_design", blocking=False,
-                severity=decision.severity, summary=decision.summary,
-                prd_targeted=decision.prd_targeted,
+            decision, decision_overridden_by_policy = override_pass_decision(
+                decision, release_threshold,
+                reason="blocking findings override pass decision",
             )
             verdict_str = _decision_outcome_to_legacy_verdict("retry_design")
             feature_log.emit(
