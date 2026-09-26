@@ -19,7 +19,7 @@ from autodev.prompts_loader import PROMPTS_DIR, render_stage_prompt
 from autodev.state.cascade import StalenessCascade
 from autodev.workspace import detect_out_of_scope_writes, snapshot
 
-from tests.v2.test_cascade_full_chain import _seed_all_ten
+from .test_cascade_full_chain import _seed_all_ten
 
 STAGE_NAMES = ("design", "build", "ralph-review", "spec", "arch-design", "arch-review")
 

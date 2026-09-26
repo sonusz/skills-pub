@@ -30,7 +30,7 @@ from autodev.state.atomic import atomic_write, atomic_write_json
 from autodev.state.hashing import hash_file
 from autodev.state.log import JsonlLog
 
-from tests.v2.test_cascade_full_chain import _seed_all_ten
+from .test_cascade_full_chain import _seed_all_ten
 
 
 def _logger(active: Path) -> JsonlLog:

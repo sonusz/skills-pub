@@ -47,14 +47,14 @@ from autodev.vendors.config import (
     VendorsConfig,
 )
 
-from tests.v2.test_arch_design_loop_orchestrator import (
+from .test_arch_design_loop_orchestrator import (
     _commit,
     _count_events,
     _feature_dir,
     _log_events,
     _write_prd,
 )
-from tests.v2.test_cascade_full_chain import _seed_all_ten
+from .test_cascade_full_chain import _seed_all_ten
 
 FAKE_VENDOR = Path(__file__).resolve().parent / "fakes" / "fake_vendor_cli_auto.py"
 FAKE_PANEL = Path(__file__).resolve().parent / "fakes" / "fake_panel_invoker.sh"
