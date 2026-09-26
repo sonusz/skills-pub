@@ -6,6 +6,8 @@ and the HTTP getter so no network/creds are needed.
 """
 from __future__ import annotations
 
+import pytest
+
 import base64
 import json
 
@@ -249,3 +251,57 @@ def test_codex_missing_auth_is_unknown(monkeypatch):
     monkeypatch.setattr(codex, "read_json_file", lambda p: None)
     r = codex.fetch()
     assert r.remaining_pct is None and not r.ok
+
+
+
+def _clear_cursor_env(monkeypatch):
+    for env in ("AUTODEV_CURSOR_ACCESS_TOKEN", "MANA_CURSOR_ACCESS_TOKEN"):
+        monkeypatch.delenv(env, raising=False)
+
+
+def _write_auth(tmp_path, body):
+    (tmp_path / "cursor").mkdir(exist_ok=True)
+    (tmp_path / "cursor" / "auth.json").write_text(body)
+
+
+def test_cursor_token_linux_reads_auth_file(monkeypatch, tmp_path):
+    """linux: cursor-agent stores the JWT in $XDG_CONFIG_HOME/cursor/auth.json; no Keychain call."""
+    _clear_cursor_env(monkeypatch)
+    monkeypatch.setattr(cursor, "_host_os", lambda: "linux")
+    monkeypatch.setattr(cursor, "keychain_password", lambda *a, **k: pytest.fail("keychain on linux"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    _write_auth(tmp_path, '{"accessToken": " a.b.c ", "refreshToken": "x.y.z"}')
+    assert cursor._token() == "a.b.c"
+
+
+def test_cursor_token_darwin_reads_keychain_not_file(monkeypatch, tmp_path):
+    _clear_cursor_env(monkeypatch)
+    monkeypatch.setattr(cursor, "_host_os", lambda: "darwin")
+    monkeypatch.setattr(cursor, "keychain_password", lambda *a, **k: "kc.tok.en")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    _write_auth(tmp_path, '{"accessToken": "file.tok.en"}')
+    assert cursor._token() == "kc.tok.en"
+
+
+def test_cursor_token_env_wins_on_every_os(monkeypatch):
+    monkeypatch.setenv("AUTODEV_CURSOR_ACCESS_TOKEN", "env.tok.en")
+    for host in ("linux", "darwin", "win32"):
+        monkeypatch.setattr(cursor, "_host_os", lambda h=host: h)
+        assert cursor._token() == "env.tok.en"
+
+
+def test_cursor_token_other_os_is_env_only(monkeypatch):
+    _clear_cursor_env(monkeypatch)
+    monkeypatch.setattr(cursor, "_host_os", lambda: "win32")
+    assert cursor._token() is None
+
+
+def test_cursor_token_linux_missing_or_malformed_auth_file(monkeypatch, tmp_path):
+    _clear_cursor_env(monkeypatch)
+    monkeypatch.setattr(cursor, "_host_os", lambda: "linux")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert cursor._token() is None                      # no file
+    _write_auth(tmp_path, "not json")
+    assert cursor._token() is None                      # unreadable
+    _write_auth(tmp_path, '{"accessToken": 5}')
+    assert cursor._token() is None                      # wrong type

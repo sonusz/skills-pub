@@ -1,14 +1,22 @@
 """Cursor remaining-quota fetcher.
 
-Ported from Mana's CursorClient.swift: a session JWT (Keychain or env) becomes a
+Ported from Mana's CursorClient.swift: a session JWT becomes a
 ``WorkosCursorSessionToken`` cookie; GET the usage-summary endpoint and take the
 most-constrained of the plan / on-demand buckets. Cursor has no token refresh.
+
+Token source: the env overrides win on every OS; otherwise the caller branches
+on the host OS (``_host_os``, the one shared/os definition) and reads that OS's
+store — darwin: the Keychain item the Cursor apps write; linux: the file
+``cursor-agent login`` writes, ``$XDG_CONFIG_HOME/cursor/auth.json`` (default
+``~/.config/cursor/auth.json``), key ``accessToken``. Any other OS: env only.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+
+from pathlib import Path
 
 from autodev.vendors.quota.base import (
     QuotaResult,
@@ -17,11 +25,28 @@ from autodev.vendors.quota.base import (
     min_remaining,
     now_utc,
     parse_iso8601,
+    read_json_file,
 )
+from autodev.state.hostos import _host_os
 
 USAGE_URL = "https://cursor.com/api/usage-summary"
 KEYCHAIN_SERVICE = "cursor-access-token"
 KEYCHAIN_ACCOUNT = "cursor-user"
+
+
+def _linux_auth_file() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return Path(base) / "cursor" / "auth.json"
+
+
+def _darwin_token() -> str | None:
+    return keychain_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+
+
+def _linux_token() -> str | None:
+    obj = read_json_file(_linux_auth_file())
+    val = obj.get("accessToken") if obj else None
+    return val.strip() if isinstance(val, str) and val.strip() else None
 
 
 def _token() -> str | None:
@@ -29,7 +54,12 @@ def _token() -> str | None:
         val = os.environ.get(env)
         if val and val.strip():
             return val.strip()
-    return keychain_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    host = _host_os()
+    if host == "darwin":
+        return _darwin_token()
+    if host == "linux":
+        return _linux_token()
+    return None
 
 
 def _jwt_sub(jwt: str) -> str | None:
