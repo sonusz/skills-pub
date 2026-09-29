@@ -10,6 +10,7 @@
 #                                          "**修复 commit**" on the body line that carries it
 #                                          (appends "- <marker> <v>" when absent)
 #   issue.sh close <n> [completed|not_planned]
+#   issue.sh reopen <n>
 #   issue.sh list [open|closed|all]        "<number>\t<state>\t<title>" per line
 #
 # No `gh`. `git` itself cannot create issues (they are not in the repository), but the
@@ -47,8 +48,20 @@ PY
   get)
     _auth_curl "$API/issues/${1:?n}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["title"]); print([l["name"] for l in d["labels"]], d["state"]); print(d["body"] or "")';;
   comments)
-    _auth_curl "$API/issues/${1:?n}/comments?per_page=100" | python3 -c 'import json,sys
-for c in json.load(sys.stdin): print("-----", c["created_at"], c["user"]["login"]); print(c["body"])';;
+    # Paged like list: an issue that collects evidence comments can pass 100.
+    page=1
+    while :; do
+      _auth_curl "$API/issues/${1:?n}/comments?per_page=100&page=$page" > "$T/cm.json"
+      python3 - "$T/cm.json" "$T/cm.count" <<'PY'
+import json,sys
+items=json.load(open(sys.argv[1]))
+for c in items:
+    print("-----", c["created_at"], c["user"]["login"]); print(c["body"])
+open(sys.argv[2],"w").write(str(len(items)))
+PY
+      [ "$(cat "$T/cm.count")" -lt 100 ] && break
+      page=$((page + 1))
+    done;;
   comment)
     python3 -c 'import json,sys; print(json.dumps({"body":open(sys.argv[1]).read()}))' "${2:?file}" > "$T/c.json"
     _auth_curl -o /dev/null -w 'POST %{http_code}\n' -X POST "$API/issues/${1:?n}/comments" --data-binary @"$T/c.json";;
@@ -73,14 +86,25 @@ PY
   close)
     reason="${2:-completed}"
     _auth_curl -o /dev/null -w 'PATCH %{http_code}\n' -X PATCH "$API/issues/${1:?n}" --data-binary "{\"state\":\"closed\",\"state_reason\":\"$reason\"}";;
+  reopen)
+    _auth_curl -o /dev/null -w 'PATCH %{http_code}\n' -X PATCH "$API/issues/${1:?n}" --data-binary '{"state":"open","state_reason":"reopened"}';;
   list)
-    _auth_curl "$API/issues?state=${1:-open}&per_page=100" > "$T/list.json"
-    python3 - "$T/list.json" <<'PY'
+    # Paged: the API returns at most 100 items per page, and pull requests share
+    # the issues endpoint, so keep going until a page comes back short.
+    page=1
+    while :; do
+      _auth_curl "$API/issues?state=${1:-open}&per_page=100&page=$page" > "$T/list.json"
+      python3 - "$T/list.json" "$T/list.count" <<'PY'
 import json,sys
-for i in json.load(open(sys.argv[1])):
+items=json.load(open(sys.argv[1]))
+for i in items:
     if "pull_request" in i: continue
     print("%d\t%s\t%s" % (i["number"], i["state"], i["title"]))
+open(sys.argv[2],"w").write(str(len(items)))
 PY
+      [ "$(cat "$T/list.count")" -lt 100 ] && break
+      page=$((page + 1))
+    done
     ;;
   *) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 2;;
 esac

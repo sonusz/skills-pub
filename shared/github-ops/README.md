@@ -42,12 +42,13 @@ scripts from inside the repository you mean.
 | create ONE issue from a file (`title` on line 1, body after) | `issue.sh create <file> [label,label]` → prints `<number> <url>` |
 | create MANY issues from one markdown file (`## ` per issue), idempotent by title | `create-issues.sh <file> [--label L] [--dry-run]` |
 | read an issue (title, labels, state, body) | `issue.sh get <n>` |
-| read its comments | `issue.sh comments <n>` |
+| read its comments (all pages) | `issue.sh comments <n>` |
 | post a comment from a file | `issue.sh comment <n> <file>` |
 | replace the body | `issue.sh body <n> <file>` |
 | rewrite one bold-marker line in the body, e.g. `**修复 commit**` | `issue.sh setline <n> "**修复 commit**" "\`abc1234\`"` |
 | close (completed / not_planned) | `issue.sh close <n> [not_planned]` |
-| list issues | `issue.sh list [open\|closed\|all]` |
+| reopen | `issue.sh reopen <n>` |
+| list issues (all pages; pull requests skipped) | `issue.sh list [open\|closed\|all]` |
 | another repository than the checkout's | prefix any verb with `--repo owner/repo` |
 
 Write the body in a file and pass the file — never inline JSON on the command
