@@ -28,7 +28,9 @@ BIN_DIR="$WORK/bin"
 RUN_DIR="$WORK/run"
 PROMPT_FILE="$WORK/prompt.txt"
 MARKER_PREFIX="$WORK/marker"
-mkdir -p "$BIN_DIR" "$RUN_DIR"
+EXTRA_PROTECTED="$WORK/extra-protected"
+mkdir -p "$BIN_DIR" "$RUN_DIR" "$EXTRA_PROTECTED"
+EXTRA_PROTECTED="$(cd "$EXTRA_PROTECTED" && pwd -P)"
 
 cat > "$PROMPT_FILE" <<'PROMPT'
 Review the local file at `SKILL.md` for ambiguity. Read it from the current
@@ -53,6 +55,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 prompt=$(cat)
+if [ -n "${PANEL_SMOKE_MARKERS:-}" ]; then
+  printf "%s" "$prompt" > "${PANEL_SMOKE_MARKERS}.codex.prompt"
+fi
 if printf "%s" "$prompt" | grep -qi 'single word READY'; then
   response="READY"
 elif printf "%s" "$prompt" | grep -qi 'Panel outputs:'; then
@@ -261,7 +266,21 @@ fi
 
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/doctor.sh" "$ROOT_DIR/sample-vendors.yaml" >/dev/null
 PATH="$BIN_DIR:$PATH" PANEL_SMOKE_MARKERS="$MARKER_PREFIX" \
-  "$SCRIPT_DIR/launch.sh" --cwd "$ROOT_DIR" "$PROMPT_FILE" "$ROOT_DIR/sample-vendors.yaml" "$RUN_DIR" >/dev/null
+  "$SCRIPT_DIR/launch.sh" --cwd "$ROOT_DIR" --protect "$EXTRA_PROTECTED" "$PROMPT_FILE" "$ROOT_DIR/sample-vendors.yaml" "$RUN_DIR" >/dev/null
+
+# Every reviewer gets the read-only preamble, naming the reviewed git root and
+# each --protect path, ahead of the caller's own prompt.
+REVIEWED_ROOT="$(cd "$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$ROOT_DIR")" && pwd -P)"
+received="$MARKER_PREFIX.codex.prompt"
+if [ ! -s "$received" ] \
+    || ! grep -q '^This is a read-only review\.' "$received" \
+    || ! grep -qxF -- "- $REVIEWED_ROOT" "$received" \
+    || ! grep -qxF -- "- $EXTRA_PROTECTED" "$received" \
+    || ! grep -q 'Print your complete answer to stdout' "$received" \
+    || ! grep -q 'Review the local file at `SKILL.md`' "$received"; then
+  printf "FAIL: expected reviewer prompt to start with the read-only preamble listing %s and %s, followed by the caller prompt\n" "$REVIEWED_ROOT" "$EXTRA_PROTECTED" >&2
+  exit 1
+fi
 PATH="$BIN_DIR:$PATH" "$SCRIPT_DIR/synthesize.sh" "$PROMPT_FILE" "$ROOT_DIR/sample-vendors.yaml" "$RUN_DIR" >/dev/null
 
 for vendor in codex claude agy cursor; do

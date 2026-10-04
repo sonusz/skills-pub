@@ -140,6 +140,13 @@ maps that access per vendor: Codex gets
 `--trust` plus `--yolo`. `--cwd` is honored by Codex via `--cd`, by Grok via
 native `--cwd`, and by Claude/Agy/Cursor through the wrapper's cwd execution.
 
+Reviewers are told not to write: `launch.sh` puts a fixed read-only preamble
+ahead of your prompt for every panel call. It names the reviewed root (the git
+worktree of `--cwd`, else `--cwd`) plus each `--protect DIR` (repeatable;
+`PANEL_PROTECT_PATHS` adds more, colon-separated), and asks for the answer on
+stdout rather than in a saved file. Callers do not need to repeat this in their
+prompts; pass `--protect` for any other directory that must stay untouched.
+
 Keep `$RUN_DIR` outside the reviewed git worktree. `launch.sh`
 rejects in-worktree output dirs, then records git status/diff snapshots under
 `$RUN_DIR/.repo-state` before and after panel calls. Any tracked, staged, or
@@ -152,7 +159,7 @@ Each call writes `$RUN_DIR/<id>/out`, `$RUN_DIR/<id>/log`, `$RUN_DIR/<id>/status
 RUN_DIR=$(mktemp -d /tmp/panel-review.XXXXXX)
 echo "RUN_DIR=$RUN_DIR"   # echo so the agent captures the path for §5
 REVIEW_CWD=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-scripts/launch.sh --cwd "$REVIEW_CWD" <prompt_file> vendors.yaml "$RUN_DIR"
+scripts/launch.sh --cwd "$REVIEW_CWD" [--protect DIR]... <prompt_file> vendors.yaml "$RUN_DIR"
 # §5 runs the configured synthesis call next.
 # Clean up with `rm -rf "$RUN_DIR"` after synthesis — don't `trap ... EXIT`,
 # the trap fires when the shell that ran launch.sh exits and some runtimes

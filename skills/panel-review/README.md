@@ -118,7 +118,7 @@ output directory must be outside the reviewed git worktree.
 ```bash
 RUN_DIR=$(mktemp -d /tmp/panel-review.XXXXXX)
 REVIEW_CWD=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-scripts/launch.sh --cwd "$REVIEW_CWD" prompt.txt vendors.yaml "$RUN_DIR"
+scripts/launch.sh --cwd "$REVIEW_CWD" [--protect DIR]... prompt.txt vendors.yaml "$RUN_DIR"
 scripts/synthesize.sh prompt.txt vendors.yaml "$RUN_DIR"
 cat "$RUN_DIR/synthesis/out"
 rm -rf "$RUN_DIR"
@@ -126,7 +126,10 @@ rm -rf "$RUN_DIR"
 
 `--cwd` is mandatory (`PANEL_REVIEW_CWD` in the environment is the accepted
 alternative; the flag wins). `--repo` is accepted as a no-op for old callers;
-there is no inline mode, so `--inline` is rejected. Pass
+there is no inline mode, so `--inline` is rejected. `--protect DIR`
+(repeatable) adds a directory reviewers must not write to, on top of the
+reviewed root, which is always protected; `PANEL_PROTECT_PATHS` adds more,
+colon-separated. Pass
 `sample-vendors.yaml` in place of `vendors.yaml` to try every vendor.
 
 Environment knobs: `PANEL_CALL_TIMEOUT` (default 300 seconds per panel call),
@@ -147,6 +150,10 @@ call is extended or killed.
    `shared/vendors/scripts/call.sh` with the entry's vendor, effort, and
    model, plus `--cwd`, `--yolo`, the timeout flags, and `--prompt-file`.
    The shared module maps `--yolo` to each CLI's permission-bypass flag.
+   The prompt each reviewer receives is your prompt with a fixed read-only
+   preamble in front: do not create, modify or delete anything under the
+   reviewed root or any `--protect` path, use a temp directory outside them
+   for scratch, and print the answer to stdout instead of saving it.
 3. Every call writes `$RUN_DIR/<id>/out` (the review), `log`, `call.log`,
    and a `status` file with `id`, `kind=panel`, `vendor`, `cwd`, `exit_code`,
    and file paths. A failed call is marked failed and never substituted.

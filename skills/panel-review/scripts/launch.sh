@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: launch.sh --cwd DIR <prompt_file> <vendors_yaml> <output_dir>
+# Usage: launch.sh --cwd DIR [--protect DIR]... <prompt_file> <vendors_yaml> <output_dir>
 #
 # Launches the configured panel calls in parallel through the shared vendors
 # module. Outputs: <output_dir>/<panel-id>/out plus log/status/call.log files.
@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/launch.sh --cwd DIR <prompt_file> <vendors_yaml> <output_dir>
+  scripts/launch.sh --cwd DIR [--protect DIR]... <prompt_file> <vendors_yaml> <output_dir>
 
 Panel calls always run in path-based discovery mode with --yolo and --cwd so
 each vendor reads the requested repo/source itself. Reviewed artifact bodies
@@ -22,6 +22,10 @@ Options:
   --cwd DIR   Required repo/source root for reviewer tool access.
               PANEL_REVIEW_CWD in the environment is an equivalent explicit
               setting; --cwd wins when both are given.
+  --protect DIR
+              Extra path reviewers must not write to (repeatable). The
+              reviewed root (the git worktree of --cwd, else --cwd) is always
+              protected. PANEL_PROTECT_PATHS adds more, colon-separated.
   --repo      No-op kept for callers written against the two-mode launcher;
               path-based discovery is the only mode.
   -h, --help  Show this help
@@ -45,6 +49,7 @@ require_value() {
 PANEL_REVIEW_CWD_VALUE="${PANEL_REVIEW_CWD:-}"
 PANEL_REVIEW_GIT_GUARD=0
 PANEL_REVIEW_GIT_ROOT=""
+PANEL_PROTECT_ARGS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -59,6 +64,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --cwd=*)
       PANEL_REVIEW_CWD_VALUE="${1#*=}"
+      shift
+      ;;
+    --protect)
+      [ "$#" -ge 2 ] || die "--protect requires a directory"
+      PANEL_PROTECT_ARGS+=("$2")
+      shift 2
+      ;;
+    --protect=*)
+      PANEL_PROTECT_ARGS+=("${1#*=}")
       shift
       ;;
     --repo)
@@ -131,6 +145,31 @@ if command -v git >/dev/null 2>&1 \
       ;;
   esac
 fi
+
+# Reviewers run with --yolo inside the reviewed root, so tell every one of
+# them, in the prompt itself, which paths are off-limits for writes. The
+# git-state check below stays as the backstop.
+PANEL_PROTECTED_PATHS=("${PANEL_REVIEW_GIT_ROOT:-$PANEL_REVIEW_CWD_VALUE}")
+if [ -n "${PANEL_PROTECT_PATHS:-}" ]; then
+  IFS=':' read -r -a _panel_env_protect <<< "$PANEL_PROTECT_PATHS"
+  PANEL_PROTECT_ARGS+=(${_panel_env_protect[@]+"${_panel_env_protect[@]}"})
+fi
+for _protect in ${PANEL_PROTECT_ARGS[@]+"${PANEL_PROTECT_ARGS[@]}"}; do
+  [ -n "$_protect" ] || continue
+  if [ -d "$_protect" ]; then
+    _protect="$(cd "$_protect" && pwd -P)"
+  fi
+  PANEL_PROTECTED_PATHS+=("$_protect")
+done
+
+REVIEW_PROMPT_FILE="$RUN_DIR/.reviewer-prompt.txt"
+{
+  printf '%s\n' "This is a read-only review. Do not create, modify, move, or delete anything under these paths, including scratch files, notes, test output, or a saved copy of your answer:"
+  printf -- '- %s\n' "${PANEL_PROTECTED_PATHS[@]}"
+  printf '%s\n' "If you need scratch space, make a temporary directory outside them (for example with mktemp -d). Print your complete answer to stdout; do not save it to a file and reply with only its path."
+  printf '\n'
+  cat "$PROMPT_FILE"
+} > "$REVIEW_PROMPT_FILE"
 
 repo_state_path() {
   local label="$1"
@@ -212,7 +251,7 @@ launch_one() {
     --timeout "$PANEL_CALL_TIMEOUT" \
     --timeout-extend "$PANEL_CALL_TIMEOUT_EXTEND" \
     ${PANEL_IDLE_PROBE_ARGS[@]+"${PANEL_IDLE_PROBE_ARGS[@]}"} \
-    --prompt-file "$PROMPT_FILE" \
+    --prompt-file "$REVIEW_PROMPT_FILE" \
     --output-dir "$RUN_DIR" \
     --min-success 1 > "$wrapper_log" 2>&1; then
     code=0
