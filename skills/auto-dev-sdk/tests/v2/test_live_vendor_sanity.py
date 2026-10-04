@@ -3,10 +3,11 @@
 @pytest.mark.live — deselected by default; run with:
     python3 -m pytest -m live tests/v2/test_live_vendor_sanity.py -v
 
-Not a full pipeline test. Just verifies:
-  1. Real claude CLI dispatched through shared/vendors writes
-     the target artifact within an aggressive timeout.
-  2. `stdout/stderr` log files receive observable output for debugging.
+Not a full pipeline test. Just verifies, for the first pipeline step
+(the arch-design -> arch-review loop):
+  1. Real claude CLI dispatched through shared/vendors writes each
+     stage's artifact within an aggressive timeout.
+  2. Each stage's `stdout/stderr` log files receive observable output.
 
 Uses the smallest possible PRD so even slow cold-starts land well
 under 60s.
@@ -54,9 +55,9 @@ def live_git_repo(tmp_path):
 
 
 @pytest.mark.live
-def test_live_scope_stage_completes_fast(live_git_repo):
-    """Single scope stage with real claude must finish in <60s and
-    must write observable activity to the log file (not buffered)."""
+def test_live_first_step_completes_fast(live_git_repo):
+    """The first step (arch-design then arch-review) with real claude must
+    finish quickly and write observable activity to each stage's logs."""
     from autodev import overrides_api as ov
 
     active = live_git_repo / "docs" / "features" / "live" / "active"
@@ -89,22 +90,25 @@ def test_live_scope_stage_completes_fast(live_git_repo):
     result = orch.advance_one("live")
     elapsed = time.monotonic() - start
 
-    # Must complete and produce scope.json.
+    # A fresh feature starts with the architecture loop: arch-design writes
+    # arch-design.md, then arch-review judges it. Observed ~60s for both.
     assert result.success, (
-        f"scope stage failed: {result.detail or result.stage_name}"
+        f"first step failed at {result.stage_name}: {result.detail}"
     )
-    scope_json = active / "scope.json"
-    assert scope_json.exists(), "scope.json not written"
+    assert result.stage_name == "arch_review", result.stage_name
+    for artifact in ("arch-design.md", "arch-review.json"):
+        assert (active / artifact).exists(), f"{artifact} not written"
 
-    assert elapsed < 120, (
-        f"scope stage took {elapsed:.1f}s — even generous budget "
+    assert elapsed < 240, (
+        f"first step took {elapsed:.1f}s — even generous budget "
         f"exceeded; vendor dispatch path is broken"
     )
 
-    stdout_log = active / ".scope.stdout.log"
-    stderr_log = active / ".scope.stderr.log"
-    assert stdout_log.exists() and stderr_log.exists()
-    total_bytes = stdout_log.stat().st_size + stderr_log.stat().st_size
-    assert total_bytes > 0, (
-        "shared-vendors dispatch produced zero bytes of logs"
-    )
+    for stage in ("arch-design", "arch-review"):
+        stdout_log = active / f".{stage}.stdout.log"
+        stderr_log = active / f".{stage}.stderr.log"
+        assert stdout_log.exists() and stderr_log.exists(), stage
+        total_bytes = stdout_log.stat().st_size + stderr_log.stat().st_size
+        assert total_bytes > 0, (
+            f"shared-vendors dispatch for {stage} produced zero bytes of logs"
+        )
