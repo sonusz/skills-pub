@@ -144,16 +144,55 @@ def test_agy_transient_login_state_does_not_override_quota_api(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(agy, "_AgyPTYProcess", lambda binary: FakeProcess())
+    tokens = {"launch": None, "requests": set()}
+
+    def fake_process(binary, csrf_token):
+        tokens["launch"] = csrf_token
+        return FakeProcess()
+
+    def fake_loopback(port, method, csrf_token):
+        tokens["requests"].add(csrf_token)
+        return next(responses)
+
+    monkeypatch.setattr(agy, "_AgyPTYProcess", fake_process)
     monkeypatch.setattr(agy, "_lsof_ports", lambda pid: [64440])
     responses = iter([
         (200, {"error": {"message": "Not logged into Antigravity"}}),
         (200, summary),
     ])
-    monkeypatch.setattr(agy, "_loopback_json", lambda port, method: next(responses))
+    monkeypatch.setattr(agy, "_loopback_json", fake_loopback)
     monkeypatch.setattr(agy.time, "sleep", lambda seconds: None)
 
     assert agy._fetch_local_summary("/fake/agy") == summary
+    assert tokens["launch"] and tokens["requests"] == {tokens["launch"]}
+
+
+def test_agy_csrf_token_reaches_launch_argv_and_request_header(tmp_path, monkeypatch):
+    # agy >= 1.3.0 rejects loopback calls whose x-codeium-csrf-token does not
+    # match the token it was launched with.
+    fake = tmp_path / "agy"
+    fake.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$0.argv"\nsleep 5\n')
+    fake.chmod(0o755)
+    process = agy._AgyPTYProcess(str(fake), "tok-123")
+    try:
+        argv_file = tmp_path / "agy.argv"
+        for _ in range(100):
+            if argv_file.exists() and argv_file.read_text():
+                break
+            agy.time.sleep(0.05)
+        assert argv_file.read_text().split() == ["--csrf_token", "tok-123"]
+    finally:
+        process.close()
+
+    seen = []
+
+    def fake_urlopen(request, timeout, context):
+        seen.append(request.get_header("X-codeium-csrf-token"))
+        raise agy.urllib.error.URLError("stub")
+
+    monkeypatch.setattr(agy.urllib.request, "urlopen", fake_urlopen)
+    assert agy._loopback_json(64440, agy.QUOTA_METHOD, "tok-123") == (None, None)
+    assert seen == ["tok-123"]
 
 
 def test_agy_missing_binary_is_unknown(monkeypatch):
